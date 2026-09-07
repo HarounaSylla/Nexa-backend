@@ -8,7 +8,7 @@ line, screenshot, or database check) in the Proof column.
 | P0 | Docker Compose stack starts cleanly | Passed | `docker compose ps` 2026-09-07: `backend-postgres-1` Up on `0.0.0.0:5433->5432`, `backend-redis-1` Up on `0.0.0.0:6380->6379`. Host 5432/6379 already taken by `shop-debt-*`; Nexa uses 5433/6380. |
 | P0 | `alembic upgrade head` runs on a fresh DB | Passed | 2026-09-07: `Running upgrade  -> 0001_enable_pgvector` then `Running upgrade 0001_enable_pgvector -> 0002_catalogue_tables`. `psql \d products` shows `embedding vector(1024)`, indexes `ix_products_merchant_id` and `ix_products_category`, no ivfflat/hnsw. |
 | P1 | RAG search relevance on French test queries | Passed | Seed 2026-09-07: `merchants=1`, `products=26`, `with_embedding=26`, `vector_dims=1024`, `merchant_id=37292228-b8f5-437d-b8e6-2ff81d4e249d`. Query pairs below. Out-of-catalogue still returns 5 nearest neighbors (no distance cutoff); names are unrelated, not construction materials. |
-| P0 | Concurrent order creation on last stock unit only succeeds once | Not started | — |
+| P0 | Concurrent order creation on last stock unit only succeeds once | Passed | `pytest -v` 2026-09-07: `tests/test_orders.py::test_concurrent_creer_commande_on_last_unit PASSED`. Full suite `9 passed in 2.11s` (catalogue 5 + orders 4). Two concurrent `creer_commande` on `stock_qty=1`: exactly one `Order`, one `InsufficientStockError`, final `stock_qty=0`. |
 | P1 | Dashboard renders on a real phone browser | Not started | — |
 
 ## RAG query / result pairs (2026-09-07, `voyage-4-lite`)

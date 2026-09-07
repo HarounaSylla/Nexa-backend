@@ -10,6 +10,7 @@ from alembic import context
 from app.catalogue import models as catalogue_models  # noqa: F401
 from app.core.config import settings
 from app.core.db import Base
+from app.orders import models as orders_models  # noqa: F401
 
 config = context.config
 config.set_main_option(

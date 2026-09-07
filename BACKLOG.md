@@ -16,4 +16,16 @@ unchecked items as optional.
 - [x] `trouver_produits_similaires`
 - [x] Manual relevance validation
 
-Jalon 2+ items get added only once that Jalon actually starts.
+## Jalon 2 — Orders, stock, delivery
+
+- [x] `deliverers` / `orders` / `order_items` / `stock_movements` schema and Postgres enums
+- [x] Alembic `0003_orders_stock_delivery`
+- [x] `obtenir_disponibilite`
+- [x] `creer_commande` with `SELECT ... FOR UPDATE` (sorted product ids, one transaction)
+- [x] `assigner_livreur`
+- [x] `confirmer_livraison` (finalize marker, `quantity_delta=0`)
+- [x] `annuler_commande` restocks under the same locking discipline
+- [x] Temporary `/orders` router for manual testing
+- [x] Concurrent last-unit order test against local Postgres
+
+Jalon 3+ items get added only once that Jalon actually starts.
