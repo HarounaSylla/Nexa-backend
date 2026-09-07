@@ -1,0 +1,32 @@
+---
+description: General project rules — apply to every change in this repo
+alwaysApply: true
+---
+
+# General rules
+
+- Write all code, comments, docstrings, and commit messages in English.
+- Keep changes narrowly scoped to what was asked. Never refactor, rename,
+  or "clean up" adjacent code that wasn't part of the request — propose it
+  separately instead.
+- Respect module boundaries (app/catalogue, app/agent, app/tiktok,
+  app/whatsapp, app/orders, app/delivery, app/workers). Cross-module calls
+  go through a module's public service functions, never by importing its
+  internal models or reaching into its DB layer directly.
+- Before considering any task done, re-run the full test suite — not just
+  the tests for the file you touched.
+- Never state a task is complete without concrete proof: paste the actual
+  test output, the relevant log line, or a direct database check. A status
+  summary alone is not proof.
+- For anything touching orders, stock decrement, payment method flagging,
+  or customer data: manual verification is required before marking it
+  done, even when automated tests pass. Concurrent stock decrement must go
+  through a row-level lock (SELECT ... FOR UPDATE) inside a transaction —
+  never a separate read then write.
+- Any feature with a real-world delay (e.g. hourly catalog sync, periodic
+  TikTok stats fetch) must ship with a manual trigger (debug endpoint or
+  script) in the same change — not added later once someone is blocked
+  waiting on the real delay.
+- If a report sounds technical and detailed but doesn't point to the
+  actual line of code or the actual root cause, treat that as a signal to
+  dig further, not as a resolution.

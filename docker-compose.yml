@@ -1,0 +1,21 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: nexa
+    ports:
+      # Host 5433 avoids colliding with other local Postgres instances on 5432.
+      - "5433:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      # Host 6380 avoids colliding with other local Redis instances on 6379.
+      - "6380:6379"
+
+volumes:
+  postgres_data:
