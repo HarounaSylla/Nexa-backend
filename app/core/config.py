@@ -15,6 +15,10 @@ class Settings(BaseSettings):
     redis_url: str
     anthropic_api_key: str = ""
     voyage_api_key: str = ""
+    # voyage-4-lite is the cost-efficient default for development; voyage-4
+    # or voyage-4-large are drop-in upgrades (same embedding space, same
+    # 1024-dim default) if search relevance needs it later.
+    voyage_model: str = "voyage-4-lite"
     whatsapp_access_token: str = ""
     whatsapp_phone_number_id: str = ""
     whatsapp_business_account_id: str = ""
