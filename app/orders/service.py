@@ -1,14 +1,16 @@
+import unicodedata
 import uuid
 from collections import defaultdict
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.catalogue.models import Product
 from app.orders.models import (
     Deliverer,
+    DeliveryZone,
     Order,
     OrderItem,
     OrderStatus,
@@ -45,6 +47,22 @@ class InvalidOrderStateError(ValueError):
         self.order_id = order_id
         self.status = status
         self.action = action
+
+
+class DeliveryNotAvailableError(Exception):
+    def __init__(self, city: str) -> None:
+        super().__init__(f"Delivery is not available in {city}")
+        self.city = city
+
+
+def normalize_city(city: str) -> str:
+    """Lowercase, strip accents, collapse extra whitespace."""
+    collapsed = " ".join(city.split())
+    decomposed = unicodedata.normalize("NFKD", collapsed)
+    without_accents = "".join(
+        char for char in decomposed if not unicodedata.combining(char)
+    )
+    return without_accents.casefold()
 
 
 def _aggregate_quantities(items: list[tuple[uuid.UUID, int]]) -> dict[uuid.UUID, int]:
@@ -101,6 +119,85 @@ async def obtenir_disponibilite(db: AsyncSession, product_id: uuid.UUID) -> int:
     return product.stock_qty
 
 
+async def obtenir_zone_livraison(
+    db: AsyncSession, merchant_id: uuid.UUID, city: str
+) -> DeliveryZone | None:
+    """Look up by normalized city name.
+
+    Return None if no zone is configured for this city at all — that
+    means "not covered", same as an explicit available=False row, but
+    the caller can tell the two apart if it wants to (no row vs.
+    explicitly disabled).
+    """
+    normalized = normalize_city(city)
+    if not normalized:
+        return None
+    result = await db.execute(
+        select(DeliveryZone).where(
+            DeliveryZone.merchant_id == merchant_id,
+            DeliveryZone.city_normalized == normalized,
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def creer_ou_maj_zone_livraison(
+    db: AsyncSession,
+    merchant_id: uuid.UUID,
+    city: str,
+    available: bool,
+    min_delivery_hours: int,
+    max_delivery_hours: int,
+) -> DeliveryZone:
+    """Upsert on (merchant_id, city_normalized)."""
+    display_city = " ".join(city.split())
+    normalized = normalize_city(city)
+    if not normalized:
+        raise ValueError("city must not be empty")
+    if max_delivery_hours < min_delivery_hours:
+        raise ValueError("max_delivery_hours must be >= min_delivery_hours")
+
+    zone = await obtenir_zone_livraison(db, merchant_id, city)
+    if zone is None:
+        zone = DeliveryZone(
+            merchant_id=merchant_id,
+            city=display_city,
+            city_normalized=normalized,
+            available=available,
+            min_delivery_hours=min_delivery_hours,
+            max_delivery_hours=max_delivery_hours,
+        )
+        db.add(zone)
+    else:
+        zone.city = display_city
+        zone.available = available
+        zone.min_delivery_hours = min_delivery_hours
+        zone.max_delivery_hours = max_delivery_hours
+    await db.commit()
+    await db.refresh(zone)
+    return zone
+
+
+async def lister_zones_livraison(
+    db: AsyncSession, merchant_id: uuid.UUID
+) -> list[DeliveryZone]:
+    result = await db.execute(
+        select(DeliveryZone)
+        .where(DeliveryZone.merchant_id == merchant_id)
+        .order_by(DeliveryZone.city)
+    )
+    return list(result.scalars().all())
+
+
+async def supprimer_zone_livraison(db: AsyncSession, zone_id: uuid.UUID) -> None:
+    result = await db.execute(
+        delete(DeliveryZone).where(DeliveryZone.id == zone_id)
+    )
+    if result.rowcount == 0:
+        raise NotFoundError(f"Delivery zone {zone_id} was not found")
+    await db.commit()
+
+
 async def creer_commande(
     db: AsyncSession,
     merchant_id: uuid.UUID,
@@ -108,6 +205,7 @@ async def creer_commande(
     items: list[tuple[uuid.UUID, int]],
     payment_method: PaymentMethod,
     delivery_address: str,
+    ville: str,
 ) -> Order:
     """Create an order and provisionally decrement stock, atomically.
 
@@ -115,10 +213,17 @@ async def creer_commande(
     order, rejects the whole order if any item is short, then decrements
     stock, writes stock_movements, and inserts the order + items in the
     same transaction.
+
+    `ville` is required separately from the free-text address. Delivery
+    coverage is checked before the stock lock; unserved cities raise
+    DeliveryNotAvailableError and create nothing.
     """
     quantities = _aggregate_quantities(items)
     product_ids = sorted(quantities)
     try:
+        zone = await obtenir_zone_livraison(db, merchant_id, ville)
+        if zone is None or not zone.available:
+            raise DeliveryNotAvailableError(ville)
         products = await _lock_products(db, product_ids)
         for product_id in product_ids:
             product = products[product_id]
@@ -139,6 +244,7 @@ async def creer_commande(
             payment_method=payment_method,
             payment_status=PaymentStatus.pending,
             delivery_address=delivery_address,
+            city=" ".join(ville.split()),
         )
         db.add(order)
         await db.flush()

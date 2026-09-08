@@ -8,6 +8,7 @@ from sqlalchemy import delete, func, select
 from app.catalogue.models import Merchant, Product
 from app.core.db import AsyncSessionLocal
 from app.orders.models import (
+    DeliveryZone,
     Order,
     OrderItem,
     OrderStatus,
@@ -15,12 +16,15 @@ from app.orders.models import (
     StockMovement,
 )
 from app.orders.service import (
+    DeliveryNotAvailableError,
     InsufficientStockError,
     InvalidOrderStateError,
     annuler_commande,
     confirmer_livraison,
     creer_commande,
     obtenir_disponibilite,
+    obtenir_zone_livraison,
+    normalize_city,
 )
 
 PHONE = "+221770000000"
@@ -41,6 +45,17 @@ async def _make_merchant_product(*, stock_qty: int, name: str) -> tuple[uuid.UUI
             stock_qty=stock_qty,
         )
         db.add(product)
+        await db.flush()
+        db.add(
+            DeliveryZone(
+                merchant_id=merchant.id,
+                city="Dakar",
+                city_normalized=normalize_city("Dakar"),
+                available=True,
+                min_delivery_hours=24,
+                max_delivery_hours=48,
+            )
+        )
         await db.commit()
         return merchant.id, product.id
 
@@ -58,6 +73,9 @@ async def _cleanup(merchant_id: uuid.UUID) -> None:
             )
             await db.execute(delete(OrderItem).where(OrderItem.order_id.in_(order_ids)))
             await db.execute(delete(Order).where(Order.id.in_(order_ids)))
+        await db.execute(
+            delete(DeliveryZone).where(DeliveryZone.merchant_id == merchant_id)
+        )
         await db.execute(delete(Product).where(Product.merchant_id == merchant_id))
         await db.execute(delete(Merchant).where(Merchant.id == merchant_id))
         await db.commit()
@@ -72,6 +90,7 @@ async def _place_order(merchant_id: uuid.UUID, product_id: uuid.UUID, quantity: 
             items=[(product_id, quantity)],
             payment_method=PaymentMethod.cash_on_delivery,
             delivery_address=ADDRESS,
+            ville="Dakar",
         )
 
 
@@ -178,5 +197,77 @@ async def test_confirmer_livraison_on_cancelled_order_raises() -> None:
             with pytest.raises(InvalidOrderStateError):
                 await confirmer_livraison(db, order.id)
             assert await obtenir_disponibilite(db, product_id) == 2
+    finally:
+        await _cleanup(merchant_id)
+
+
+@pytest.mark.asyncio
+async def test_creer_commande_unserved_city_creates_nothing() -> None:
+    merchant_id, product_id = await _make_merchant_product(
+        stock_qty=3,
+        name=f"pytest-unserved-city-{uuid.uuid4()}",
+    )
+    try:
+        async with AsyncSessionLocal() as db:
+            with pytest.raises(DeliveryNotAvailableError) as raised:
+                await creer_commande(
+                    db,
+                    merchant_id=merchant_id,
+                    customer_phone=PHONE,
+                    items=[(product_id, 1)],
+                    payment_method=PaymentMethod.cash_on_delivery,
+                    delivery_address="Marché Ocass, Touba",
+                    ville="Touba",
+                )
+            assert raised.value.city == "Touba"
+            stock = await obtenir_disponibilite(db, product_id)
+            order_count = (
+                await db.execute(
+                    select(func.count()).select_from(Order).where(
+                        Order.merchant_id == merchant_id
+                    )
+                )
+            ).scalar_one()
+            movements = (
+                await db.execute(
+                    select(func.count()).select_from(StockMovement).where(
+                        StockMovement.product_id == product_id
+                    )
+                )
+            ).scalar_one()
+        assert stock == 3
+        assert order_count == 0
+        assert movements == 0
+    finally:
+        await _cleanup(merchant_id)
+
+
+@pytest.mark.asyncio
+async def test_obtenir_zone_livraison_normalizes_city_name() -> None:
+    merchant_id, _product_id = await _make_merchant_product(
+        stock_qty=1,
+        name=f"pytest-zone-norm-{uuid.uuid4()}",
+    )
+    try:
+        async with AsyncSessionLocal() as db:
+            db.add(
+                DeliveryZone(
+                    merchant_id=merchant_id,
+                    city="Thiès",
+                    city_normalized=normalize_city("Thiès"),
+                    available=True,
+                    min_delivery_hours=48,
+                    max_delivery_hours=72,
+                )
+            )
+            await db.commit()
+            matches = []
+            for query in ("Thiès", "thies", "THIÈS", "  Thiès  ", "Thies"):
+                zone = await obtenir_zone_livraison(db, merchant_id, query)
+                assert zone is not None, f"no match for {query!r}"
+                matches.append(zone.id)
+            assert len(set(matches)) == 1
+            missing = await obtenir_zone_livraison(db, merchant_id, "Kaolack")
+            assert missing is None
     finally:
         await _cleanup(merchant_id)

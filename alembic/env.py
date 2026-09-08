@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from alembic import context
 
+from app.agent import models as agent_models  # noqa: F401
 from app.catalogue import models as catalogue_models  # noqa: F401
 from app.core.config import settings
 from app.core.db import Base

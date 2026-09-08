@@ -13,6 +13,7 @@ from sqlalchemy import (
     Numeric,
     String,
     Text,
+    UniqueConstraint,
     func,
     text,
 )
@@ -116,6 +117,7 @@ class Order(Base):
     )
     payment_link: Mapped[str | None] = mapped_column(String, nullable=True)
     delivery_address: Mapped[str] = mapped_column(Text, nullable=False)
+    city: Mapped[str | None] = mapped_column(String, nullable=True)
     deliverer_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("deliverers.id"),
@@ -202,3 +204,59 @@ class StockMovement(Base):
     )
 
     order: Mapped[Order | None] = relationship(back_populates="stock_movements")
+
+
+class DeliveryZone(Base):
+    """Merchant-configured delivery coverage for a city.
+
+    `city` is the display spelling. Lookups compare `city_normalized`
+    (lowercase, accents stripped, collapsed whitespace) so "Dakar",
+    "dakar", and "DAKAR " share one row.
+    """
+
+    __tablename__ = "delivery_zones"
+    __table_args__ = (
+        UniqueConstraint(
+            "merchant_id",
+            "city_normalized",
+            name="uq_delivery_zones_merchant_city",
+        ),
+        CheckConstraint(
+            "max_delivery_hours >= min_delivery_hours",
+            name="ck_delivery_zones_hours",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=text("gen_random_uuid()"),
+    )
+    merchant_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("merchants.id"),
+        nullable=False,
+        index=True,
+    )
+    city: Mapped[str] = mapped_column(String, nullable=False)
+    city_normalized: Mapped[str] = mapped_column(String, nullable=False)
+    available: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=True,
+        server_default=text("true"),
+    )
+    min_delivery_hours: Mapped[int] = mapped_column(Integer, nullable=False)
+    max_delivery_hours: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        onupdate=func.now(),
+        nullable=False,
+    )

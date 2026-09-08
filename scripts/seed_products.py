@@ -5,8 +5,8 @@ Run once against a fresh DB (after `alembic upgrade head`):
     python scripts/seed_products.py
 
 Requires VOYAGE_API_KEY in `.env`. If merchant "Boutique Awa" already exists,
-the script indexes any products that still have a null embedding and exits
-without duplicating rows.
+the script upserts delivery zones, indexes any products that still have a
+null embedding, and exits without duplicating product rows.
 
 Unpaid Voyage accounts are limited to 3 RPM. Pending rows are embedded in
 one `embed_documents()` call (same function `index_product` uses) so a
@@ -24,8 +24,32 @@ from app.catalogue.embeddings import embed_documents, product_index_text
 from app.catalogue.models import Merchant, Product
 from app.core.config import settings
 from app.core.db import AsyncSessionLocal
+from app.orders.service import creer_ou_maj_zone_livraison
 
 MERCHANT_NAME = "Boutique Awa"
+
+# Demo delivery coverage for Boutique Awa. Touba is explicitly disabled so
+# the agent can be tested on an honest decline, not only a missing row.
+DELIVERY_ZONES: list[dict[str, object]] = [
+    {
+        "city": "Dakar",
+        "available": True,
+        "min_delivery_hours": 24,
+        "max_delivery_hours": 48,
+    },
+    {
+        "city": "Thiès",
+        "available": True,
+        "min_delivery_hours": 48,
+        "max_delivery_hours": 72,
+    },
+    {
+        "city": "Touba",
+        "available": False,
+        "min_delivery_hours": 24,
+        "max_delivery_hours": 48,
+    },
+]
 
 # Realistic catalogue for a Dakar TikTok / WhatsApp seller. Near-duplicates
 # (two evening dresses, two iPhone cases) are intentional so similarity
@@ -315,9 +339,25 @@ async def seed() -> None:
         )
     async with AsyncSessionLocal() as db:
         merchant = await _ensure_merchant(db)
+        merchant_id = merchant.id
+        for zone_row in DELIVERY_ZONES:
+            zone = await creer_ou_maj_zone_livraison(
+                db,
+                merchant_id=merchant_id,
+                city=str(zone_row["city"]),
+                available=bool(zone_row["available"]),
+                min_delivery_hours=int(zone_row["min_delivery_hours"]),
+                max_delivery_hours=int(zone_row["max_delivery_hours"]),
+            )
+            print(
+                f"delivery_zone {zone.city}: available={zone.available} "
+                f"{zone.min_delivery_hours}-{zone.max_delivery_hours}h "
+                f"({zone.id})"
+            )
+
         existing = await db.execute(
             select(func.count()).select_from(Product).where(
-                Product.merchant_id == merchant.id
+                Product.merchant_id == merchant_id
             )
         )
         product_count = existing.scalar_one()
@@ -325,7 +365,7 @@ async def seed() -> None:
             for row in PRODUCTS:
                 db.add(
                     Product(
-                        merchant_id=merchant.id,
+                        merchant_id=merchant_id,
                         name=str(row["name"]),
                         description=str(row["description"]),
                         category=str(row["category"]),
@@ -343,7 +383,7 @@ async def seed() -> None:
             )
 
         result = await db.execute(
-            select(Product).where(Product.merchant_id == merchant.id)
+            select(Product).where(Product.merchant_id == merchant_id)
         )
         products = list(result.scalars().all())
         pending = [product for product in products if product.embedding is None]
@@ -360,7 +400,7 @@ async def seed() -> None:
 
         with_embedding = sum(1 for product in products if product.embedding is not None)
         print("---")
-        print(f"merchant_id={merchant.id}")
+        print(f"merchant_id={merchant_id}")
         print(f"products={len(products)}")
         print(f"with_embedding={with_embedding}")
         print(f"indexed_this_run={indexed}")

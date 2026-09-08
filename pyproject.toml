@@ -16,6 +16,8 @@ dependencies = [
     "redis",
     "celery",
     "anthropic",
+    "openai",
+    "langgraph",
     "voyageai",
     "pydantic-settings",
     "httpx",

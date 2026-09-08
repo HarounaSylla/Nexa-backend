@@ -9,6 +9,7 @@ from app.catalogue.models import Product
 from app.catalogue.service import (
     ProductNotFoundError,
     ProductNotIndexedError,
+    lister_produits_populaires,
     rechercher_produits,
     trouver_produits_similaires,
 )
@@ -24,6 +25,15 @@ class ProductSearchItem(BaseModel):
     name: str
     category: str | None
     price: Decimal | None
+
+
+class PopularProductOut(BaseModel):
+    product_id: uuid.UUID
+    name: str
+    price: Decimal | None
+    category: str | None
+    stock_qty: int
+    order_count: int
 
 
 def _to_item(product: Product) -> ProductSearchItem:
@@ -77,3 +87,12 @@ async def similar_products(
     except ProductNotIndexedError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return [_to_item(item) for item in products]
+
+
+@router.get("/popular-products", response_model=list[PopularProductOut])
+async def popular_products(
+    merchant_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+) -> list[PopularProductOut]:
+    rows = await lister_produits_populaires(db, merchant_id, limit=10)
+    return [PopularProductOut.model_validate(row) for row in rows]
