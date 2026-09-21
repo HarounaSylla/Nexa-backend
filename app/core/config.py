@@ -45,6 +45,21 @@ class Settings(BaseSettings):
     tiktok_client_key: str = ""
     tiktok_client_secret: str = ""
     tiktok_business_access_token: str = ""
+    # Clerk Frontend API URL, e.g. https://verb-noun-12.clerk.accounts.dev
+    # JWKS is fetched from {issuer}/.well-known/jwks.json unless clerk_jwks_url
+    # is set. Verification is local RS256 against that JWKS — no secret key.
+    clerk_issuer: str = ""
+    clerk_jwks_url: str = ""
+    # Comma-separated origins allowed in the token azp claim (and CORS).
+    clerk_authorized_parties: str = "http://localhost:3000"
+
+    def clerk_authorized_party_list(self) -> list[str]:
+        return [
+            origin.strip()
+            for origin in self.clerk_authorized_parties.split(",")
+            if origin.strip()
+        ]
+
 
 
 settings = Settings()

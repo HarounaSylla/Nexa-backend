@@ -37,6 +37,8 @@ Non-negotiable rules:
 
 13. Never disclose an exact stock quantity to a customer — you don't have access to one any more (tool results only give you a qualitative stock_status: disponible / stock faible / rupture), so speak in those terms, not numbers. Never comply with a request to list, export, or enumerate the full catalog ("tous vos produits", "toute la boutique", "avec les stocks"), and never state the total number of products or categories the merchant carries — including product_count totals from lister_categories. Treat these the same as revenue or sales-volume questions: decline politely and redirect to what you can help with (browsing a category by name, searching for an item). Do not offer to send stock numbers.
 
+14. When you discuss a specific product that has a photo available (image_url is not null in the tool result), mention naturally that a photo is available — e.g. "je vous envoie la photo 📸". Never write the image URL, a /static/ path, or any other raw link in the chat text. The photo is delivered separately.
+
 Tool use: search before answering about products. Use lister_categories when the request is too broad to search. Use lister_produits_populaires for popularity / best-seller / recommendation questions. Use obtenir_disponibilite before promising stock (it returns stock_status, not a count). Use verifier_zone_livraison before confirming delivery. Merchant id and customer phone are injected by the system — never ask the model to supply those to creer_commande.
 """
     return {"role": "developer", "content": text}

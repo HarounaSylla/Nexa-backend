@@ -49,7 +49,16 @@ TikTok comment classifier (Jalon 7) remains a separate model decision.
 - [x] Temporary `POST /agent/simulate` and message history endpoint
 - [x] Deterministic unit tests (no live OpenAI)
 - [x] Agent tool JSON never exposes exact `stock_qty` (`stock_status` only)
+- [x] Merchant-uploaded product photos in agent tool JSON + `/agent/simulate` `images` (dogfooding point 5 closed; URL never pasted into chat text)
 - [ ] WhatsApp Cloud API webhook (`app/whatsapp`) — blocked on access approval
-- [ ] Photos and voice — deferred to Jalon 3 part 2
+- [ ] WhatsApp media send / voice — still Jalon 3 part 2 (structured `images` is the input that step will consume)
 
 Jalon 3 part 2+ items get added only once that work actually starts.
+
+## Jalon 4 — Dashboard
+
+- [x] Clerk session JWT verification (JWKS); `merchants.clerk_user_id`; onboarding + `/merchants/me` + temp `link-demo`
+- [x] Merchant catalogue management (authenticated): product CRUD, photo upload to `/static` + `product_images` upsert, dashboard category list (no stock filter), category rename. No new `categories` table.
+- [x] Merchant order management (authenticated): list/detail, deliverers list+create, assign/confirm/cancel scoped to the caller, payment-link on `online` orders only (`payment_status` stays `pending`/`paid` — no new enum). Temp `POST /orders`, availability, and delivery-zones routes left in place.
+- [x] Merchant conversation handoff (authenticated): list (escalated first), thread, human reply (`turn_role=merchant`, no agent loop), return-to-agent (409 if not escalated). Temp `POST /agent/simulate` and `GET /agent/conversations/{id}/messages` left in place; dashboard lives on `/conversations`.
+- [x] Merchant notifications (authenticated): `notifications` table (Alembic `0008`), emitted on successful `creer_commande` (`new_order`; `product_out_of_stock` only when that path zeroes stock) and `escalader_vers_humain` (`conversation_escalated`). Raw `data` JSON, no French copy. `GET /notifications`, `POST /notifications/{id}/read`, `POST /notifications/read-all`. Catalogue stock edits do not notify.

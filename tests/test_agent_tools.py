@@ -8,16 +8,21 @@ import pytest
 
 from app.agent.models import Conversation, Message
 from app.agent.service import escalader_vers_humain
+from app.agent.router import extract_product_images
 from app.agent.tools import _stock_status, execute_tool
-from app.catalogue.models import Merchant, Product
+from app.catalogue.models import Merchant, Product, ProductImage
 from app.catalogue.service import lister_produits_populaires
 from app.core.db import AsyncSessionLocal
+from app.notifications.models import Notification
 from app.orders.models import DeliveryZone, Order, OrderItem, StockMovement
 from app.orders.service import normalize_city
 from sqlalchemy import delete, select
 
 
 async def _cleanup_merchant(db, merchant_id: uuid.UUID) -> None:
+    await db.execute(
+        delete(Notification).where(Notification.merchant_id == merchant_id)
+    )
     conversations = list(
         (
             await db.execute(
@@ -38,6 +43,15 @@ async def _cleanup_merchant(db, merchant_id: uuid.UUID) -> None:
         await db.execute(delete(OrderItem).where(OrderItem.order_id.in_(orders)))
         await db.execute(delete(Order).where(Order.id.in_(orders)))
     await db.execute(delete(DeliveryZone).where(DeliveryZone.merchant_id == merchant_id))
+    product_ids = list(
+        (
+            await db.execute(select(Product.id).where(Product.merchant_id == merchant_id))
+        ).scalars().all()
+    )
+    if product_ids:
+        await db.execute(
+            delete(ProductImage).where(ProductImage.product_id.in_(product_ids))
+        )
     await db.execute(delete(Product).where(Product.merchant_id == merchant_id))
     await db.execute(delete(Merchant).where(Merchant.id == merchant_id))
     await db.commit()
@@ -272,6 +286,8 @@ async def test_execute_tool_search_and_similar_omit_stock_qty() -> None:
             similar = json.loads(similar_raw)
             _assert_no_raw_stock(similar_raw, similar)
             assert similar["products"][0]["stock_status"] == "stock_faible"
+            assert "image_url" in search["products"][0]
+            assert "image_url" in similar["products"][0]
         finally:
             await _cleanup_merchant(db, merchant.id)
 
@@ -312,5 +328,122 @@ async def test_execute_tool_popular_omits_stock_qty_service_keeps_it() -> None:
             _assert_no_raw_stock(raw, payload)
             assert payload["products"][0]["stock_status"] == "stock_faible"
             assert "stock_qty" not in payload["products"][0]
+            assert payload["products"][0]["image_url"] is None
+        finally:
+            await _cleanup_merchant(db, merchant.id)
+
+
+def test_extract_product_images_skips_null_and_dedupes() -> None:
+    product_id = uuid.uuid4()
+    items = [
+        {
+            "type": "function_call_output",
+            "output": json.dumps(
+                {
+                    "products": [
+                        {
+                            "id": str(product_id),
+                            "image_url": "/static/product_images/a.jpg",
+                        },
+                        {"id": str(uuid.uuid4()), "image_url": None},
+                    ]
+                }
+            ),
+        },
+        {
+            "type": "function_call_output",
+            "output": json.dumps(
+                {
+                    "product_id": str(product_id),
+                    "image_url": "/static/product_images/a.jpg",
+                }
+            ),
+        },
+    ]
+    images = extract_product_images(items)
+    assert len(images) == 1
+    assert images[0].product_id == product_id
+    assert images[0].image_url == "/static/product_images/a.jpg"
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_includes_image_url_when_photo_exists() -> None:
+    query = _vector(0)
+    async with AsyncSessionLocal() as db:
+        merchant = Merchant(name=f"pytest-agent-image-{uuid.uuid4()}")
+        db.add(merchant)
+        await db.flush()
+        product = Product(
+            merchant_id=merchant.id,
+            name="Sac photo",
+            description="test",
+            category="accessoires",
+            price=Decimal("8000.00"),
+            stock_qty=6,
+            embedding=query,
+        )
+        conversation = Conversation(
+            merchant_id=merchant.id,
+            customer_phone="+221770009007",
+            status="active",
+        )
+        db.add_all([product, conversation])
+        await db.flush()
+        db.add(
+            ProductImage(
+                product_id=product.id,
+                url=f"/static/product_images/{product.id}.jpg",
+            )
+        )
+        await db.commit()
+        try:
+            with patch(
+                "app.catalogue.service.embed_query",
+                return_value=query,
+            ):
+                search_raw = await execute_tool(
+                    db,
+                    "rechercher_produits",
+                    {"requete": "sac", "categorie": None},
+                    merchant.id,
+                    conversation.id,
+                )
+            search = json.loads(search_raw)
+            assert search["products"][0]["image_url"] == (
+                f"/static/product_images/{product.id}.jpg"
+            )
+
+            similar_raw = await execute_tool(
+                db,
+                "trouver_produits_similaires",
+                {"produit_id": str(product.id)},
+                merchant.id,
+                conversation.id,
+            )
+            similar = json.loads(similar_raw)
+            assert "products" in similar
+
+            popular_raw = await execute_tool(
+                db,
+                "lister_produits_populaires",
+                {},
+                merchant.id,
+                conversation.id,
+            )
+            popular = json.loads(popular_raw)
+            assert popular["products"][0]["image_url"] == (
+                f"/static/product_images/{product.id}.jpg"
+            )
+
+            avail_raw = await execute_tool(
+                db,
+                "obtenir_disponibilite",
+                {"produit_id": str(product.id)},
+                merchant.id,
+                conversation.id,
+            )
+            avail = json.loads(avail_raw)
+            assert avail["image_url"] == f"/static/product_images/{product.id}.jpg"
+            assert avail["stock_status"] == "disponible"
         finally:
             await _cleanup_merchant(db, merchant.id)

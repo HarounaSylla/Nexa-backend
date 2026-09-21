@@ -104,7 +104,16 @@ def _send(url: str, merchant_id: str, phone: str, message: str) -> str:
         sys.exit(1)
 
     try:
-        return str(response.json()["reply"])
+        payload = response.json()
+        reply = str(payload["reply"])
+        images = payload.get("images") or []
+        if images:
+            refs = ", ".join(
+                f"{item.get('product_id')} -> {item.get('image_url')}"
+                for item in images
+            )
+            return f"{reply}\n[images: {refs}]"
+        return reply
     except (ValueError, KeyError, TypeError):
         print(f"Unexpected API response: {response.text}", file=sys.stderr)
         sys.exit(1)

@@ -21,6 +21,8 @@ dependencies = [
     "voyageai",
     "pydantic-settings",
     "httpx",
+    "PyJWT[crypto]",
+    "python-multipart>=0.0.32",
 ]
 
 [project.optional-dependencies]

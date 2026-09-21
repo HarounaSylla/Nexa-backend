@@ -10,6 +10,7 @@ from app.catalogue.service import (
     ProductNotIndexedError,
     index_product,
     lister_categories,
+    lister_categories_dashboard,
     lister_produits_populaires,
     rechercher_produits,
     trouver_produits_similaires,
@@ -317,6 +318,12 @@ async def test_lister_categories_counts_in_stock_and_stays_on_merchant() -> None
             rows = await lister_categories(db, merchant.id)
             assert rows == [
                 {"category": "cosmétiques", "product_count": 1},
+                {"category": "vêtements femme", "product_count": 2},
+            ]
+            dashboard = await lister_categories_dashboard(db, merchant.id)
+            assert dashboard == [
+                {"category": "cosmétiques", "product_count": 1},
+                {"category": "électronique", "product_count": 1},
                 {"category": "vêtements femme", "product_count": 2},
             ]
         finally:

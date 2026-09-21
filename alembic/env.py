@@ -11,6 +11,7 @@ from app.agent import models as agent_models  # noqa: F401
 from app.catalogue import models as catalogue_models  # noqa: F401
 from app.core.config import settings
 from app.core.db import Base
+from app.notifications import models as notifications_models  # noqa: F401
 from app.orders import models as orders_models  # noqa: F401
 
 config = context.config

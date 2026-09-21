@@ -20,6 +20,12 @@ class Merchant(Base):
         server_default=text("gen_random_uuid()"),
     )
     name: Mapped[str] = mapped_column(String, nullable=False)
+    clerk_user_id: Mapped[str | None] = mapped_column(
+        String,
+        unique=True,
+        nullable=True,
+        index=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),

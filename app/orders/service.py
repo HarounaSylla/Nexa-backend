@@ -8,6 +8,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.catalogue.models import Product
+from app.notifications.service import (
+    NotificationRelatedType,
+    NotificationType,
+    emit_notification,
+)
 from app.orders.models import (
     Deliverer,
     DeliveryZone,
@@ -249,10 +254,13 @@ async def creer_commande(
         db.add(order)
         await db.flush()
 
+        total = Decimal("0.00")
+        out_of_stock: list[Product] = []
         for product_id in product_ids:
             product = products[product_id]
             requested = quantities[product_id]
             product.stock_qty -= requested
+            total += Decimal(product.price) * requested
             db.add(
                 OrderItem(
                     order_id=order.id,
@@ -268,6 +276,29 @@ async def creer_commande(
                     movement_type=MOVEMENT_PROVISIONAL_DECREMENT,
                     quantity_delta=-requested,
                 )
+            )
+            if product.stock_qty == 0:
+                out_of_stock.append(product)
+
+        await emit_notification(
+            db,
+            merchant_id=merchant_id,
+            notification_type=NotificationType.new_order,
+            related_type=NotificationRelatedType.order,
+            related_id=order.id,
+            data={
+                "customer_phone": customer_phone,
+                "total": str(total),
+            },
+        )
+        for product in out_of_stock:
+            await emit_notification(
+                db,
+                merchant_id=merchant_id,
+                notification_type=NotificationType.product_out_of_stock,
+                related_type=NotificationRelatedType.product,
+                related_id=product.id,
+                data={"product_name": product.name},
             )
 
         await db.commit()
@@ -368,3 +399,135 @@ async def annuler_commande(
         select(Order).options(selectinload(Order.items)).where(Order.id == order.id)
     )
     return result.scalar_one()
+
+
+class PaymentLinkNotAllowedError(ValueError):
+    """Raised when a payment link is set on a cash-on-delivery order."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "A payment link can only be set on an online-payment order"
+        )
+
+
+def order_total(items: list[OrderItem]) -> Decimal:
+    return sum(
+        (item.unit_price * item.quantity for item in items),
+        Decimal("0.00"),
+    )
+
+
+async def _owned_order(
+    db: AsyncSession, merchant_id: uuid.UUID, order_id: uuid.UUID
+) -> Order:
+    order = await db.get(Order, order_id)
+    if order is None or order.merchant_id != merchant_id:
+        raise NotFoundError(f"Order {order_id} was not found")
+    return order
+
+
+async def lister_commandes_commercant(
+    db: AsyncSession, merchant_id: uuid.UUID
+) -> list[Order]:
+    """List this merchant's orders, newest first.
+
+    No pagination — fine for a few hundred rows; add a limit/offset
+    when order history grows past that.
+    """
+    result = await db.execute(
+        select(Order)
+        .options(selectinload(Order.items))
+        .where(Order.merchant_id == merchant_id)
+        .order_by(Order.created_at.desc(), Order.id.desc())
+    )
+    return list(result.scalars().unique().all())
+
+
+async def obtenir_commande_commercant(
+    db: AsyncSession, merchant_id: uuid.UUID, order_id: uuid.UUID
+) -> tuple[Order, dict[uuid.UUID, str]]:
+    result = await db.execute(
+        select(Order)
+        .options(selectinload(Order.items), selectinload(Order.deliverer))
+        .where(Order.id == order_id, Order.merchant_id == merchant_id)
+    )
+    order = result.unique().scalar_one_or_none()
+    if order is None:
+        raise NotFoundError(f"Order {order_id} was not found")
+    product_ids = [item.product_id for item in order.items]
+    names: dict[uuid.UUID, str] = {}
+    if product_ids:
+        products = await db.execute(
+            select(Product.id, Product.name).where(Product.id.in_(product_ids))
+        )
+        names = {row.id: row.name for row in products.all()}
+    return order, names
+
+
+async def assigner_livreur_commercant(
+    db: AsyncSession,
+    merchant_id: uuid.UUID,
+    order_id: uuid.UUID,
+    deliverer_id: uuid.UUID,
+) -> Order:
+    await _owned_order(db, merchant_id, order_id)
+    deliverer = await db.get(Deliverer, deliverer_id)
+    if deliverer is None or deliverer.merchant_id != merchant_id:
+        raise NotFoundError(f"Deliverer {deliverer_id} was not found")
+    return await assigner_livreur(db, order_id, deliverer_id)
+
+
+async def confirmer_livraison_commercant(
+    db: AsyncSession, merchant_id: uuid.UUID, order_id: uuid.UUID
+) -> Order:
+    await _owned_order(db, merchant_id, order_id)
+    return await confirmer_livraison(db, order_id)
+
+
+async def annuler_commande_commercant(
+    db: AsyncSession,
+    merchant_id: uuid.UUID,
+    order_id: uuid.UUID,
+    reason: str | None,
+) -> Order:
+    await _owned_order(db, merchant_id, order_id)
+    return await annuler_commande(db, order_id, reason)
+
+
+async def enregistrer_lien_paiement(
+    db: AsyncSession,
+    merchant_id: uuid.UUID,
+    order_id: uuid.UUID,
+    payment_link: str,
+) -> Order:
+    order = await _owned_order(db, merchant_id, order_id)
+    if order.payment_method != PaymentMethod.online:
+        raise PaymentLinkNotAllowedError()
+    order.payment_link = payment_link
+    await db.commit()
+    result = await db.execute(
+        select(Order).options(selectinload(Order.items)).where(Order.id == order.id)
+    )
+    return result.scalar_one()
+
+
+async def lister_livreurs(
+    db: AsyncSession, merchant_id: uuid.UUID
+) -> list[Deliverer]:
+    result = await db.execute(
+        select(Deliverer)
+        .where(Deliverer.merchant_id == merchant_id)
+        .order_by(Deliverer.name, Deliverer.created_at)
+    )
+    return list(result.scalars().all())
+
+
+async def creer_livreur(
+    db: AsyncSession, merchant_id: uuid.UUID, name: str, phone: str
+) -> Deliverer:
+    deliverer = Deliverer(merchant_id=merchant_id, name=name, phone=phone)
+    db.add(deliverer)
+    await db.commit()
+    await db.refresh(deliverer)
+    return deliverer
+

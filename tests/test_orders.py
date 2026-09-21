@@ -7,6 +7,7 @@ from sqlalchemy import delete, func, select
 
 from app.catalogue.models import Merchant, Product
 from app.core.db import AsyncSessionLocal
+from app.notifications.models import Notification
 from app.orders.models import (
     DeliveryZone,
     Order,
@@ -62,6 +63,9 @@ async def _make_merchant_product(*, stock_qty: int, name: str) -> tuple[uuid.UUI
 
 async def _cleanup(merchant_id: uuid.UUID) -> None:
     async with AsyncSessionLocal() as db:
+        await db.execute(
+            delete(Notification).where(Notification.merchant_id == merchant_id)
+        )
         order_ids = list(
             (
                 await db.execute(select(Order.id).where(Order.merchant_id == merchant_id))

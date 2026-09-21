@@ -19,6 +19,7 @@ from app.catalogue.models import Product
 from app.catalogue.service import (
     ProductNotFoundError,
     ProductNotIndexedError,
+    image_urls_for_products,
     lister_categories,
     lister_produits_populaires,
     rechercher_produits,
@@ -236,20 +237,24 @@ def _stock_status(stock_qty: int) -> str:
     return "disponible"
 
 
-def _product_payload(product: Product) -> dict[str, Any]:
+def _product_payload(product: Product, image_url: str | None = None) -> dict[str, Any]:
     return {
         "id": str(product.id),
         "name": product.name,
         "category": product.category,
         "price": str(product.price) if product.price is not None else None,
         "stock_status": _stock_status(product.stock_qty),
+        "image_url": image_url,
     }
 
 
-def _popular_product_payload(row: dict[str, Any]) -> dict[str, Any]:
+def _popular_product_payload(
+    row: dict[str, Any], image_url: str | None = None
+) -> dict[str, Any]:
     payload = dict(row)
     stock_qty = int(payload.pop("stock_qty"))
     payload["stock_status"] = _stock_status(stock_qty)
+    payload["image_url"] = image_url
     return payload
 
 
@@ -317,18 +322,26 @@ async def _dispatch(
             requete=str(tool_args["requete"]),
             categorie=tool_args.get("categorie"),
         )
-        return {"products": [_product_payload(product) for product in products]}
+        urls = await image_urls_for_products(db, [product.id for product in products])
+        return {
+            "products": [
+                _product_payload(product, urls.get(product.id))
+                for product in products
+            ]
+        }
 
     if tool_name == "lister_categories":
         return {"categories": await lister_categories(db, merchant_id)}
 
     if tool_name == "lister_produits_populaires":
+        rows = await lister_produits_populaires(db, merchant_id, limit=10)
+        urls = await image_urls_for_products(
+            db, [row["product_id"] for row in rows]
+        )
         return {
             "products": [
-                _popular_product_payload(row)
-                for row in await lister_produits_populaires(
-                    db, merchant_id, limit=10
-                )
+                _popular_product_payload(row, urls.get(row["product_id"]))
+                for row in rows
             ]
         }
 
@@ -337,14 +350,22 @@ async def _dispatch(
         products = await trouver_produits_similaires(
             db, merchant_id=merchant_id, produit_id=product_id
         )
-        return {"products": [_product_payload(product) for product in products]}
+        urls = await image_urls_for_products(db, [product.id for product in products])
+        return {
+            "products": [
+                _product_payload(product, urls.get(product.id))
+                for product in products
+            ]
+        }
 
     if tool_name == "obtenir_disponibilite":
         product_id = _parse_uuid(tool_args["produit_id"], "produit_id")
         stock_qty = await obtenir_disponibilite(db, product_id)
+        urls = await image_urls_for_products(db, [product_id])
         return {
             "product_id": str(product_id),
             "stock_status": _stock_status(stock_qty),
+            "image_url": urls.get(product_id),
         }
 
     if tool_name == "verifier_zone_livraison":
