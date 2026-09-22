@@ -32,6 +32,33 @@ class ConversationNotEscalatedError(ValueError):
         self.status = status
 
 
+async def obtenir_dernier_message_agent(
+    db: AsyncSession, merchant_id: uuid.UUID, customer_phone: str
+) -> Message | None:
+    """The latest agent turn for this merchant + phone (same lookup as simulate)."""
+    result = await db.execute(
+        select(Conversation)
+        .where(
+            Conversation.merchant_id == merchant_id,
+            Conversation.customer_phone == customer_phone,
+        )
+        .order_by(Conversation.updated_at.desc())
+    )
+    conversation = result.scalars().first()
+    if conversation is None:
+        return None
+    last_agent = await db.execute(
+        select(Message)
+        .where(
+            Message.conversation_id == conversation.id,
+            Message.turn_role == TURN_ROLE_AGENT,
+        )
+        .order_by(Message.created_at.desc())
+        .limit(1)
+    )
+    return last_agent.scalars().first()
+
+
 async def escalader_vers_humain(
     db: AsyncSession, conversation_id: uuid.UUID, raison: str
 ) -> Conversation:

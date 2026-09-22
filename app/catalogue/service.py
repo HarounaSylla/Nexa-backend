@@ -385,6 +385,14 @@ async def mettre_a_jour_produit(
     return product
 
 
+def chemin_photo_locale(product_id: uuid.UUID) -> Path | None:
+    """On-disk photo written by `enregistrer_photo_produit`, if any."""
+    if not PRODUCT_IMAGES_DIR.exists():
+        return None
+    matches = sorted(PRODUCT_IMAGES_DIR.glob(f"{product_id}.*"))
+    return matches[0] if matches else None
+
+
 async def _delete_product_files(product_id: uuid.UUID) -> None:
     if not PRODUCT_IMAGES_DIR.exists():
         return

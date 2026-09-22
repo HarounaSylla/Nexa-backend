@@ -29,7 +29,9 @@ line, screenshot, or database check) in the Proof column.
 | P1 | Merchant order list/detail + deliverer assign + payment link (Boutique Awa) | Passed | 2026-09-09. `GET /orders` returned 10 rows, newest first. `GET /orders/400ebac6-…` robe order total 25000 F. `POST /deliverers` Ibrahima Diop, assigned to `423bbb6d-…` → `deliverer_assigned`, then confirm → `delivered`. Payment link 409 on COD robe, 200 on online `a89ce2d8-…`. Cancel `36505d5f-…` restocked t-shirt 9→10. Proof below. |
 | P1 | Merchant conversation list/thread/human reply + return-to-agent | Passed | 2026-09-09. Simulate +221770001030 escalated `954f6656-…`, listed first as `escalated`. Thread: customer → `[escalade]` → agent. Merchant reply `turn_role=merchant`. Return-to-agent → `status=active`. 409 on a non-escalated conversation (unit-tested). Proof below. |
 | P1 | Merchant notifications: new order, escalation, out of stock | Passed | 2026-09-09. Agent t-shirt order `880a4d08-…` → `new_order` only (stock 3→2, no OOS). Agent escalation +221770001211 → `conversation_escalated`. Order zeroing throwaway `Notification test rupture` → `product_out_of_stock`. Mark one then read-all → unread 0. Proof below. |
-| P2 | WhatsApp media send / voice messages | Deferred | Product photos now exist and ride in `SimulateResponse.images`. Actual WhatsApp media messages still Jalon 3 part 2, blocked on Cloud API access. |
+| P1 | Real WhatsApp webhook: Meta verify + inbound text → agent reply on the phone | Not started | Code + unit tests landed 2026-09-21 (`GET` handshake, signature, enqueue, worker calls `traiter_message_entrant` once, fallback). Phone / Meta / ngrok screenshots still need a verified test recipient and `ngrok http 8000`. Steps in §26. |
+| P1 | Product photo backfill + WhatsApp image send (media_id) | Not started | Code + unit tests 2026-09-21. Backfill: `uv run python scripts/backfill_product_photos.py` (idempotent). Worker sends text then up to 3 Graph `image.id` messages. Phone proof still needed — §27. |
+| P2 | WhatsApp inbound media / voice | Deferred | Inbound non-text is still logged and skipped. Outbound product photos now use `/media` + `media_id`. |
 
 ## RAG query / result pairs (2026-09-07, `voyage-4-lite`)
 
@@ -610,6 +612,59 @@ all four rows have read_at set
 ```
 
 `data` has no pre-written French. Full pytest after the feature: `49 passed in 11.25s`.
+
+### 26. Real WhatsApp webhook (2026-09-21)
+
+Pipe only: `POST /whatsapp/webhook` enqueues an RQ job; the worker calls
+`traiter_message_entrant` exactly once (same function as `/agent/simulate`)
+then `POST graph.facebook.com/{WHATSAPP_API_VERSION}/{phone_number_id}/messages`.
+No agent/tool/prompt changes. Queue is **RQ** (Celery was already in
+`pyproject.toml` but unused). Redis is `REDIS_URL` (Compose host **6380**).
+Dedupe is Redis `SETNX whatsapp:seen:{message_id}` (48h), not a new column.
+Alembic `0009_merchant_whatsapp_phone`. Boutique Awa is linked with
+`uv run python scripts/link_whatsapp_merchant.py`.
+
+If `WHATSAPP_APP_SECRET` is empty the API logs
+`webhook signature verification disabled — set WHATSAPP_APP_SECRET before the pilot`
+and still accepts POSTs.
+
+**How to finish the phone proof** (needs the verified test recipient + ngrok):
+
+1. `docker compose up -d` then `uv run uvicorn app.main:app --reload`
+2. `uv run python scripts/run_whatsapp_worker.py`
+3. `ngrok http 8000` → Callback URL `https://<host>/whatsapp/webhook`,
+   verify token = `WHATSAPP_WEBHOOK_VERIFY_TOKEN`, subscribe `messages`
+4. From the test WhatsApp, send "vous avez des robes ?" then a follow-up
+5. Screenshot: Meta green verify, WhatsApp thread (two turns), ngrok 4040
+   POSTs with 200
+
+Until those screenshots exist this row stays **Not started**. Unit tests
+cover handshake / signature / unknown merchant / worker once / fallback.
+Full pytest after the pipe: `56 passed in 8.90s`.
+
+### 27. Product photo backfill + WhatsApp image send (2026-09-21)
+
+`extract_product_images` moved to `app/agent/images.py`. `/agent/simulate`
+`images` is still `[{product_id, image_url}]` only. After the text reply
+the worker uploads each local file via
+`POST /{version}/{phone_number_id}/media` and sends `type=image` with
+`image.id` (not a public `link`). Cap 3 per turn; caption is the product
+`name` already in the tool JSON.
+
+Backfill: `uv run python scripts/backfill_product_photos.py` — skips any
+product that already has a `product_images` row, writes via
+`enregistrer_photo_produit`. gpt-image-1 paced at 15s (Tier 1 = 5 IPM).
+
+Backfill 2026-09-21: Boutique Awa had 32 products / 3 photos. First run
+generated 29 via `enregistrer_photo_produit` (gpt-image-1, 15s pace).
+After: `products=32 with_photo=32`. Second run:
+`32 with a photo, 0 to generate` / `Nothing to do (idempotent).`
+
+**Phone proof still needed:** "vous avez des robes ?" → text then real
+image bubbles; a >3-product turn sends at most 3 photos.
+
+Full pytest after this change: `59 passed in 9.07s`. `/agent/simulate`
+`images` items still only have `product_id` and `image_url`.
 
 
 

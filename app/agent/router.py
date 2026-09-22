@@ -1,7 +1,5 @@
-import json
 import uuid
 from datetime import datetime
-from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
@@ -10,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.models import Conversation, Message
 from app.agent.orchestrator import traiter_message_entrant
+from app.agent.images import ProductImageRef, extract_product_images
 from app.agent.service import (
     ConversationNotEscalatedError,
     lister_conversations_commercant,
@@ -38,53 +37,10 @@ class SimulateRequest(BaseModel):
     message: str
 
 
-class ProductImageRef(BaseModel):
-    product_id: uuid.UUID
-    image_url: str
-
-
 class SimulateResponse(BaseModel):
     conversation_id: uuid.UUID
     reply: str
     images: list[ProductImageRef] = []
-
-
-def extract_product_images(items: list[Any] | None) -> list[ProductImageRef]:
-    """Collect {product_id, image_url} from tool outputs in an agent turn.
-
-    The chat text must not contain URLs; WhatsApp media send (Jalon 3
-    part 2) will consume this list later.
-    """
-    seen: dict[str, str] = {}
-    for item in items or []:
-        if not isinstance(item, dict):
-            continue
-        if item.get("type") != "function_call_output":
-            continue
-        raw = item.get("output")
-        payload: Any = raw
-        if isinstance(raw, str):
-            try:
-                payload = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-        if not isinstance(payload, dict):
-            continue
-        for product in payload.get("products") or []:
-            if not isinstance(product, dict):
-                continue
-            product_id = product.get("id") or product.get("product_id")
-            image_url = product.get("image_url")
-            if product_id and image_url:
-                seen[str(product_id)] = str(image_url)
-        product_id = payload.get("product_id")
-        image_url = payload.get("image_url")
-        if product_id and image_url:
-            seen[str(product_id)] = str(image_url)
-    return [
-        ProductImageRef(product_id=uuid.UUID(product_id), image_url=image_url)
-        for product_id, image_url in seen.items()
-    ]
 
 
 class MessageOut(BaseModel):

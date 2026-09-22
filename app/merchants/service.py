@@ -21,6 +21,41 @@ class DemoMerchantNotFoundError(LookupError):
         super().__init__(f"Demo merchant {DEMO_MERCHANT_NAME!r} was not found")
 
 
+async def get_merchant_by_whatsapp_phone_number_id(
+    db: AsyncSession, phone_number_id: str
+) -> Merchant | None:
+    if not phone_number_id:
+        return None
+    result = await db.execute(
+        select(Merchant).where(
+            Merchant.whatsapp_phone_number_id == phone_number_id
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+async def link_demo_whatsapp_phone_number(
+    db: AsyncSession, phone_number_id: str
+) -> Merchant:
+    """Attach the Cloud API phone number id to the seeded Boutique Awa shop."""
+    number = phone_number_id.strip()
+    if not number:
+        raise ValueError("whatsapp_phone_number_id must not be empty")
+    result = await db.execute(
+        select(Merchant)
+        .where(Merchant.name == DEMO_MERCHANT_NAME)
+        .order_by(Merchant.created_at)
+        .limit(1)
+    )
+    demo = result.scalar_one_or_none()
+    if demo is None:
+        raise DemoMerchantNotFoundError()
+    demo.whatsapp_phone_number_id = number
+    await db.commit()
+    await db.refresh(demo)
+    return demo
+
+
 async def get_merchant_by_clerk_user_id(
     db: AsyncSession, clerk_user_id: str
 ) -> Merchant | None:

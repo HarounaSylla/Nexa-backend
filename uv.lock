@@ -639,6 +639,18 @@ wheels = [
 ]
 
 [[package]]
+name = "croniter"
+version = "6.2.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "python-dateutil" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/37/57/2e2a65aee2a70483cb28e2b7e15a072d00a523207593b44400d4717bb100/croniter-6.2.4.tar.gz", hash = "sha256:fc124f751b1b04805c2a04b061898b436b45ab2320b045e1e052ea895de65189", size = 166267, upload-time = "2026-07-10T09:52:59.955Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/cd/ba/d678e5bd329646ca51d3c92addbc77804e86d21f4b6b6a027218e6abb010/croniter-6.2.4-py3-none-any.whl", hash = "sha256:8ef3d544107a5c05a150a2d78f8bf5a8eb9c5c4d93405a736b824109574e3f4d", size = 46677, upload-time = "2026-07-10T09:52:58.425Z" },
+]
+
+[[package]]
 name = "cryptography"
 version = "50.0.1"
 source = { registry = "https://pypi.org/simple" }
@@ -1567,6 +1579,7 @@ dependencies = [
     { name = "pyjwt", extra = ["crypto"] },
     { name = "python-multipart" },
     { name = "redis" },
+    { name = "rq" },
     { name = "sqlalchemy" },
     { name = "uvicorn", extra = ["standard"] },
     { name = "voyageai" },
@@ -1596,6 +1609,7 @@ requires-dist = [
     { name = "pytest-asyncio", marker = "extra == 'dev'" },
     { name = "python-multipart", specifier = ">=0.0.32" },
     { name = "redis" },
+    { name = "rq" },
     { name = "ruff", marker = "extra == 'dev'" },
     { name = "sqlalchemy", specifier = ">=2.0" },
     { name = "uvicorn", extras = ["standard"] },
@@ -2440,6 +2454,20 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/f3/61/d7545dafb7ac2230c70d38d31cbfe4cc64f7144dc41f6e4e4b78ecd9f5bb/requests-toolbelt-1.0.0.tar.gz", hash = "sha256:7681a0a3d047012b5bdc0ee37d7f8f07ebe76ab08caeccfc3921ce23c88d5bc6", size = 206888, upload-time = "2023-05-01T04:11:33.229Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/3f/51/d4db610ef29373b879047326cbf6fa98b6c1969d6f6dc423279de2b1be2c/requests_toolbelt-1.0.0-py2.py3-none-any.whl", hash = "sha256:cccfdd665f0a24fcf4726e690f65639d272bb0637b9b92dfd91a5568ccf6bd06", size = 54481, upload-time = "2023-05-01T04:11:28.427Z" },
+]
+
+[[package]]
+name = "rq"
+version = "2.12.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "click" },
+    { name = "croniter" },
+    { name = "redis" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/a2/81/dacb94c8f67606b233cb7836dd67042daf9a61f7b585dcec65113f1e71f7/rq-2.12.0.tar.gz", hash = "sha256:78116d0c860f6285817b52d7d6d0b16a726372073ce8ea1d229732ce74ef9378", size = 760892, upload-time = "2026-08-30T12:05:25.048Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a4/c2/995863e88669133a058c2a6a912b62d18a64fa7baaf78eb66aaa4350b48d/rq-2.12.0-py3-none-any.whl", hash = "sha256:97e349a00e9f2a18962102b3dca156cb5ce315d3ef38145e24ba9cabd16a9361", size = 127957, upload-time = "2026-08-30T12:05:23.131Z" },
 ]
 
 [[package]]

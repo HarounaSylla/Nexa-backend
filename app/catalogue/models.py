@@ -26,6 +26,12 @@ class Merchant(Base):
         nullable=True,
         index=True,
     )
+    whatsapp_phone_number_id: Mapped[str | None] = mapped_column(
+        String,
+        unique=True,
+        nullable=True,
+        index=True,
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),

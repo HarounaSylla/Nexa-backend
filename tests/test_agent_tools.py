@@ -8,7 +8,7 @@ import pytest
 
 from app.agent.models import Conversation, Message
 from app.agent.service import escalader_vers_humain
-from app.agent.router import extract_product_images
+from app.agent.images import extract_product_images, product_names_from_items
 from app.agent.tools import _stock_status, execute_tool
 from app.catalogue.models import Merchant, Product, ProductImage
 from app.catalogue.service import lister_produits_populaires
@@ -364,6 +364,11 @@ def test_extract_product_images_skips_null_and_dedupes() -> None:
     assert len(images) == 1
     assert images[0].product_id == product_id
     assert images[0].image_url == "/static/product_images/a.jpg"
+    assert images[0].model_dump() == {
+        "product_id": product_id,
+        "image_url": "/static/product_images/a.jpg",
+    }
+    assert product_names_from_items(items) == {}
 
 
 @pytest.mark.asyncio

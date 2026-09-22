@@ -50,8 +50,9 @@ TikTok comment classifier (Jalon 7) remains a separate model decision.
 - [x] Deterministic unit tests (no live OpenAI)
 - [x] Agent tool JSON never exposes exact `stock_qty` (`stock_status` only)
 - [x] Merchant-uploaded product photos in agent tool JSON + `/agent/simulate` `images` (dogfooding point 5 closed; URL never pasted into chat text)
-- [ ] WhatsApp Cloud API webhook (`app/whatsapp`) — blocked on access approval
-- [ ] WhatsApp media send / voice — still Jalon 3 part 2 (structured `images` is the input that step will consume)
+- [x] WhatsApp Cloud API webhook (`GET`/`POST /whatsapp/webhook`) — RQ job on Redis, worker calls `traiter_message_entrant` once then Graph API send. Merchant routed by `merchants.whatsapp_phone_number_id` (Alembic `0009`). `POST /agent/simulate` unchanged.
+- [x] WhatsApp outbound product photos: worker uploads local files via Graph `/media` then sends `type=image` with `media_id` (not a public `link`). Cap 3 per turn. `extract_product_images` lives in `app/agent/images.py` (simulate unchanged).
+- [ ] WhatsApp inbound media / voice — non-text inbound is still logged and skipped.
 
 Jalon 3 part 2+ items get added only once that work actually starts.
 

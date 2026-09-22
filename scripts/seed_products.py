@@ -339,6 +339,12 @@ async def seed() -> None:
         )
     async with AsyncSessionLocal() as db:
         merchant = await _ensure_merchant(db)
+        if (
+            settings.whatsapp_phone_number_id
+            and not merchant.whatsapp_phone_number_id
+        ):
+            merchant.whatsapp_phone_number_id = settings.whatsapp_phone_number_id
+            await db.flush()
         merchant_id = merchant.id
         for zone_row in DELIVERY_ZONES:
             zone = await creer_ou_maj_zone_livraison(

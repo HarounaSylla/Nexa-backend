@@ -42,6 +42,10 @@ class Settings(BaseSettings):
     whatsapp_phone_number_id: str = ""
     whatsapp_business_account_id: str = ""
     whatsapp_webhook_verify_token: str = ""
+    # Optional. If unset, webhook POSTs are accepted without HMAC checks —
+    # log a startup warning and set this before the pilot.
+    whatsapp_app_secret: str | None = None
+    whatsapp_api_version: str = "v21.0"
     tiktok_client_key: str = ""
     tiktok_client_secret: str = ""
     tiktok_business_access_token: str = ""

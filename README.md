@@ -6,7 +6,7 @@ FastAPI backend for Nexa.
 
 - FastAPI
 - Postgres + pgvector
-- Redis + Celery
+- Redis + RQ (WhatsApp webhook jobs; Celery is unused)
 - Voyage AI embeddings
 - Claude API (Anthropic)
 - Alembic
@@ -22,7 +22,7 @@ FastAPI backend for Nexa.
 | `app.tiktok` | TikTok publishing and comment classifier (optional; other modules must not depend on it) |
 | `app.orders` | Orders, order items, stock movements, payment-method flagging |
 | `app.delivery` | Deliverers and delivery status tracking |
-| `app.workers` | Redis/Celery background tasks (webhook queue, periodic syncs) |
+| `app.workers` | RQ jobs (WhatsApp inbound); Redis on Compose port 6380 |
 
 ## Which environment am I on?
 
@@ -41,11 +41,32 @@ python scripts/seed_products.py
 uvicorn app.main:app --reload
 ```
 
+WhatsApp Cloud API (after Meta access + `.env` tokens):
+
+```bash
+alembic upgrade head
+python scripts/link_whatsapp_merchant.py
+# terminal 1
+uvicorn app.main:app --reload
+# terminal 2 — RQ worker (uses REDIS_URL, host port 6380)
+python scripts/run_whatsapp_worker.py
+# terminal 3
+ngrok http 8000
+```
+
+Callback URL: `https://<ngrok-host>/whatsapp/webhook`. Verify token is
+`WHATSAPP_WEBHOOK_VERIFY_TOKEN`. Subscribe to the `messages` field.
+
+Placeholder photos for products that have none (skips existing rows):
+
+```bash
+python scripts/backfill_product_photos.py
+```
+
 Copy `.env.example` to `.env` before starting the app. Compose publishes
 Postgres on **5433** and Redis on **6380** so they do not collide with
 other local stacks using 5432/6379. Set `VOYAGE_API_KEY` before seeding
-or searching. Leave WhatsApp and TikTok credentials blank until access
-is approved.
+or searching. Leave TikTok credentials blank until access is approved.
 
 ## Working conventions
 
