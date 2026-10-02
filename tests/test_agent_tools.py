@@ -452,3 +452,177 @@ async def test_execute_tool_includes_image_url_when_photo_exists() -> None:
             assert avail["stock_status"] == "disponible"
         finally:
             await _cleanup_merchant(db, merchant.id)
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_creer_commande_returns_order_number_and_links_conversation() -> None:
+    async with AsyncSessionLocal() as db:
+        merchant = Merchant(name=f"pytest-agent-ordernum-{uuid.uuid4()}")
+        db.add(merchant)
+        await db.flush()
+        product = Product(
+            merchant_id=merchant.id,
+            name="Article agent commande",
+            description="test",
+            category="tests",
+            price=Decimal("1000.00"),
+            stock_qty=4,
+        )
+        conversation = Conversation(
+            merchant_id=merchant.id,
+            customer_phone="+221770009101",
+            status="active",
+        )
+        db.add_all(
+            [
+                product,
+                conversation,
+                DeliveryZone(
+                    merchant_id=merchant.id,
+                    city="Dakar",
+                    city_normalized=normalize_city("Dakar"),
+                    available=True,
+                    min_delivery_hours=24,
+                    max_delivery_hours=48,
+                ),
+            ]
+        )
+        await db.commit()
+        try:
+            raw = await execute_tool(
+                db,
+                tool_name="creer_commande",
+                tool_args={
+                    "items": [{"product_id": str(product.id), "quantity": 1}],
+                    "mode_paiement": "cash_on_delivery",
+                    "adresse_livraison": "Sacré-Cœur",
+                    "ville": "Dakar",
+                },
+                merchant_id=merchant.id,
+                conversation_id=conversation.id,
+            )
+            payload = json.loads(raw)
+            assert "error" not in payload
+            assert payload["order_number"] == 1
+            assert payload["order_id"]
+            stored = (
+                await db.execute(
+                    select(Order).where(Order.id == uuid.UUID(payload["order_id"]))
+                )
+            ).scalar_one()
+            assert stored.conversation_id == conversation.id
+            assert stored.order_number == 1
+        finally:
+            await _cleanup_merchant(db, merchant.id)
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_consulter_commande_hides_other_customers_and_internal_ids() -> None:
+    async with AsyncSessionLocal() as db:
+        merchant = Merchant(name=f"pytest-agent-consulter-{uuid.uuid4()}")
+        db.add(merchant)
+        await db.flush()
+        product = Product(
+            merchant_id=merchant.id,
+            name="Article lookup",
+            description="test",
+            category="tests",
+            price=Decimal("2000.00"),
+            stock_qty=6,
+        )
+        owner_conversation = Conversation(
+            merchant_id=merchant.id,
+            customer_phone="+221770009201",
+            status="active",
+        )
+        other_conversation = Conversation(
+            merchant_id=merchant.id,
+            customer_phone="+221770009202",
+            status="active",
+        )
+        db.add_all(
+            [
+                product,
+                owner_conversation,
+                other_conversation,
+                DeliveryZone(
+                    merchant_id=merchant.id,
+                    city="Dakar",
+                    city_normalized=normalize_city("Dakar"),
+                    available=True,
+                    min_delivery_hours=24,
+                    max_delivery_hours=48,
+                ),
+            ]
+        )
+        await db.commit()
+        try:
+            created = json.loads(
+                await execute_tool(
+                    db,
+                    "creer_commande",
+                    {
+                        "items": [{"product_id": str(product.id), "quantity": 1}],
+                        "mode_paiement": "cash_on_delivery",
+                        "adresse_livraison": "Plateau",
+                        "ville": "Dakar",
+                    },
+                    merchant.id,
+                    owner_conversation.id,
+                )
+            )
+            order_number = created["order_number"]
+
+            own = json.loads(
+                await execute_tool(
+                    db,
+                    "consulter_commande",
+                    {"numero_commande": order_number},
+                    merchant.id,
+                    owner_conversation.id,
+                )
+            )
+            assert own["found"] is True
+            assert own["order_number"] == order_number
+            assert own["status"] == "created"
+            assert own["deliverer_assigned"] is False
+            assert "order_id" not in own
+            assert "deliverer" not in own
+            dumped = json.dumps(own)
+            assert created["order_id"] not in dumped
+
+            stolen = json.loads(
+                await execute_tool(
+                    db,
+                    "consulter_commande",
+                    {"numero_commande": order_number},
+                    merchant.id,
+                    other_conversation.id,
+                )
+            )
+            assert stolen == {"found": False}
+
+            missing = json.loads(
+                await execute_tool(
+                    db,
+                    "consulter_commande",
+                    {"numero_commande": 999999},
+                    merchant.id,
+                    owner_conversation.id,
+                )
+            )
+            assert missing == {"found": False}
+
+            latest = json.loads(
+                await execute_tool(
+                    db,
+                    "consulter_commande",
+                    {"numero_commande": None},
+                    merchant.id,
+                    owner_conversation.id,
+                )
+            )
+            assert latest["found"] is True
+            assert latest["order_number"] == order_number
+        finally:
+            await _cleanup_merchant(db, merchant.id)

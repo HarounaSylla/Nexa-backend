@@ -1,9 +1,9 @@
 """OpenAI Responses API function-tool schemas and dispatcher.
 
-Eight socle tools: rechercher_produits, lister_categories,
+Nine socle tools: rechercher_produits, lister_categories,
 lister_produits_populaires, trouver_produits_similaires,
 obtenir_disponibilite, verifier_zone_livraison, creer_commande,
-escalader_vers_humain.
+escalader_vers_humain, consulter_commande.
 """
 
 from __future__ import annotations
@@ -12,7 +12,7 @@ import json
 import uuid
 from typing import Any
 
-
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.catalogue.models import Product
@@ -31,6 +31,7 @@ from app.orders.service import (
     InsufficientStockError,
     InvalidOrderStateError,
     NotFoundError,
+    consulter_commande,
     creer_commande,
     obtenir_disponibilite,
     obtenir_zone_livraison,
@@ -221,6 +222,27 @@ TOOLS: list[dict[str, Any]] = [
         },
         "strict": True,
     },
+    {
+        "type": "function",
+        "name": "consulter_commande",
+        "description": (
+            "Look up the status of one of the customer's own past orders. "
+            "Pass numero_commande if the customer gave one; otherwise pass "
+            "null to get their most recent order with this merchant."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "numero_commande": {
+                    "type": ["integer", "null"],
+                    "description": "The order number the customer gave, or null.",
+                },
+            },
+            "required": ["numero_commande"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
 ]
 
 
@@ -402,9 +424,11 @@ async def _dispatch(
             payment_method=_payment_method(str(tool_args["mode_paiement"])),
             delivery_address=str(tool_args["adresse_livraison"]),
             ville=str(tool_args["ville"]),
+            conversation_id=conversation_id,
         )
         return {
             "order_id": str(order.id),
+            "order_number": order.order_number,
             "status": order.status.value,
             "payment_method": order.payment_method.value,
             "city": order.city,
@@ -413,6 +437,41 @@ async def _dispatch(
                     "product_id": str(item.product_id),
                     "quantity": item.quantity,
                     "unit_price": str(item.unit_price),
+                }
+                for item in order.items
+            ],
+        }
+
+    if tool_name == "consulter_commande":
+        from app.agent.models import Conversation
+
+        conversation = await db.get(Conversation, conversation_id)
+        if conversation is None:
+            raise NotFoundError(f"Conversation {conversation_id} was not found")
+        raw_number = tool_args.get("numero_commande")
+        order_number = int(raw_number) if raw_number is not None else None
+        order = await consulter_commande(
+            db, merchant_id, conversation.customer_phone, order_number
+        )
+        if order is None:
+            return {"found": False}
+        product_ids = [item.product_id for item in order.items]
+        names: dict[uuid.UUID, str] = {}
+        if product_ids:
+            rows = await db.execute(
+                select(Product.id, Product.name).where(Product.id.in_(product_ids))
+            )
+            names = {row.id: row.name for row in rows.all()}
+        return {
+            "found": True,
+            "order_number": order.order_number,
+            "status": order.status.value,
+            "city": order.city,
+            "deliverer_assigned": order.deliverer_id is not None,
+            "items": [
+                {
+                    "product_name": names.get(item.product_id, "?"),
+                    "quantity": item.quantity,
                 }
                 for item in order.items
             ],

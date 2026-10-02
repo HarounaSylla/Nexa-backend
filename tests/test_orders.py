@@ -22,6 +22,7 @@ from app.orders.service import (
     InvalidOrderStateError,
     annuler_commande,
     confirmer_livraison,
+    consulter_commande,
     creer_commande,
     obtenir_disponibilite,
     obtenir_zone_livraison,
@@ -273,5 +274,85 @@ async def test_obtenir_zone_livraison_normalizes_city_name() -> None:
             assert len(set(matches)) == 1
             missing = await obtenir_zone_livraison(db, merchant_id, "Kaolack")
             assert missing is None
+    finally:
+        await _cleanup(merchant_id)
+
+
+@pytest.mark.asyncio
+async def test_creer_commande_assigns_sequential_order_numbers() -> None:
+    merchant_id, product_id = await _make_merchant_product(
+        stock_qty=5,
+        name=f"pytest-order-numbers-{uuid.uuid4()}",
+    )
+    try:
+        first = await _place_order(merchant_id, product_id)
+        second = await _place_order(merchant_id, product_id)
+        assert first.order_number == 1
+        assert second.order_number == 2
+        async with AsyncSessionLocal() as db:
+            merchant = await db.get(Merchant, merchant_id)
+            assert merchant is not None
+            assert merchant.next_order_number == 3
+    finally:
+        await _cleanup(merchant_id)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_creer_commande_gets_distinct_order_numbers() -> None:
+    merchant_id, product_id = await _make_merchant_product(
+        stock_qty=5,
+        name=f"pytest-order-num-concurrent-{uuid.uuid4()}",
+    )
+    try:
+        results = await asyncio.gather(
+            _place_order(merchant_id, product_id),
+            _place_order(merchant_id, product_id),
+            return_exceptions=True,
+        )
+        others = [item for item in results if not isinstance(item, Order)]
+        assert others == [], f"unexpected concurrent results: {others!r}"
+        numbers = sorted(order.order_number for order in results)
+        assert numbers == [1, 2]
+        assert results[0].id != results[1].id
+    finally:
+        await _cleanup(merchant_id)
+
+
+@pytest.mark.asyncio
+async def test_consulter_commande_is_scoped_to_customer_phone() -> None:
+    merchant_id, product_id = await _make_merchant_product(
+        stock_qty=5,
+        name=f"pytest-consulter-{uuid.uuid4()}",
+    )
+    other_phone = "+221770000099"
+    try:
+        owner_order = await _place_order(merchant_id, product_id)
+        async with AsyncSessionLocal() as db:
+            other_order = await creer_commande(
+                db,
+                merchant_id=merchant_id,
+                customer_phone=other_phone,
+                items=[(product_id, 1)],
+                payment_method=PaymentMethod.cash_on_delivery,
+                delivery_address=ADDRESS,
+                ville="Dakar",
+            )
+        async with AsyncSessionLocal() as db:
+            stolen = await consulter_commande(
+                db, merchant_id, other_phone, owner_order.order_number
+            )
+            assert stolen is None
+            own = await consulter_commande(
+                db, merchant_id, PHONE, owner_order.order_number
+            )
+            assert own is not None
+            assert own.id == owner_order.id
+            missing = await consulter_commande(db, merchant_id, PHONE, 999999)
+            assert missing is None
+            latest_other = await consulter_commande(
+                db, merchant_id, other_phone, None
+            )
+            assert latest_other is not None
+            assert latest_other.id == other_order.id
     finally:
         await _cleanup(merchant_id)

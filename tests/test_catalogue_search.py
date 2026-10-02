@@ -356,8 +356,13 @@ async def _add_order(
     *,
     status: OrderStatus = OrderStatus.created,
 ) -> Order:
+    merchant = await db.get(Merchant, merchant_id)
+    assert merchant is not None
+    order_number = merchant.next_order_number
+    merchant.next_order_number = order_number + 1
     order = Order(
         merchant_id=merchant_id,
+        order_number=order_number,
         customer_phone="+221770000000",
         status=status,
         payment_method=PaymentMethod.cash_on_delivery,

@@ -38,13 +38,9 @@ from app.orders.service import (
     supprimer_zone_livraison,
 )
 
-# Temporary scaffolding to exercise stock/order flows by hand before the
-# WhatsApp agent exists (Jalon 3). Not the final API surface; no auth.
-# Authenticated merchant list/detail/actions below are the dashboard API.
-# Assign/confirm/cancel share paths with the old temp routes, so those
-# three now require a merchant session (create / availability / delivery
-# zones stay unauthenticated). Retiring the rest is tracked as pre-pilot
-# cleanup, not this change.
+# Authenticated merchant dashboard API. Availability and delivery-zones
+# routes stay unauthenticated (pre-pilot cleanup). POST /orders is
+# merchant-scoped via get_current_merchant — no merchant_id in the body.
 router = APIRouter(prefix="/orders", tags=["orders"])
 deliverers_router = APIRouter(prefix="/deliverers", tags=["deliverers"])
 
@@ -55,7 +51,6 @@ class OrderItemIn(BaseModel):
 
 
 class CreateOrderRequest(BaseModel):
-    merchant_id: uuid.UUID
     customer_phone: str
     items: list[OrderItemIn]
     payment_method: PaymentMethod
@@ -81,6 +76,7 @@ class OrderItemOut(BaseModel):
 class OrderOut(BaseModel):
     id: uuid.UUID
     merchant_id: uuid.UUID
+    order_number: int
     customer_phone: str
     status: OrderStatus
     payment_method: PaymentMethod
@@ -116,6 +112,7 @@ class AvailabilityOut(BaseModel):
 
 class MerchantOrderListItem(BaseModel):
     id: uuid.UUID
+    order_number: int
     customer_phone: str
     city: str | None
     status: OrderStatus
@@ -164,6 +161,7 @@ def _to_order_out(order: Order) -> OrderOut:
     return OrderOut(
         id=order.id,
         merchant_id=order.merchant_id,
+        order_number=order.order_number,
         customer_phone=order.customer_phone,
         status=order.status,
         payment_method=order.payment_method,
@@ -188,6 +186,7 @@ def _to_list_item(order: Order) -> MerchantOrderListItem:
     items = list(order.items)
     return MerchantOrderListItem(
         id=order.id,
+        order_number=order.order_number,
         customer_phone=order.customer_phone,
         city=order.city,
         status=order.status,
@@ -348,12 +347,13 @@ async def set_merchant_payment_link(
 @router.post("", response_model=OrderOut)
 async def create_order(
     body: CreateOrderRequest,
+    merchant: Merchant = Depends(get_current_merchant),
     db: AsyncSession = Depends(get_db),
 ) -> OrderOut:
     try:
         order = await creer_commande(
             db,
-            merchant_id=body.merchant_id,
+            merchant_id=merchant.id,
             customer_phone=body.customer_phone,
             items=[(item.product_id, item.quantity) for item in body.items],
             payment_method=body.payment_method,

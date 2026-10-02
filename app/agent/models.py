@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import DateTime, ForeignKey, String, Text, func, text
+from sqlalchemy import DateTime, ForeignKey, String, Text, UniqueConstraint, func, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -75,3 +75,37 @@ class Message(Base):
     )
 
     conversation: Mapped[Conversation] = relationship(back_populates="messages")
+
+
+class SentProductImage(Base):
+    __tablename__ = "sent_product_images"
+    __table_args__ = (
+        UniqueConstraint(
+            "conversation_id",
+            "product_id",
+            name="uq_sent_product_images_conversation_product",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=text("gen_random_uuid()"),
+    )
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("conversations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    product_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("products.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    sent_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )

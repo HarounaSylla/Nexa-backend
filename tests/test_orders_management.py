@@ -350,3 +350,53 @@ async def test_deliverers_are_merchant_scoped() -> None:
                 assert other_list.json() == []
     finally:
         await _cleanup(owner.id, other.id)
+
+
+@pytest.mark.asyncio
+async def test_authenticated_create_order_is_scoped_to_session_merchant() -> None:
+    owner_clerk = f"user_ord_create_{uuid.uuid4()}"
+    other_clerk = f"user_ord_create_other_{uuid.uuid4()}"
+    owner, owner_product = await _seed_shop(
+        name=f"pytest-ord-create-{uuid.uuid4()}",
+        clerk_user_id=owner_clerk,
+        stock_qty=6,
+    )
+    other, other_product = await _seed_shop(
+        name=f"pytest-ord-create-other-{uuid.uuid4()}",
+        clerk_user_id=other_clerk,
+        stock_qty=6,
+    )
+    payload = {
+        "customer_phone": "+221770000040",
+        "items": [{"product_id": str(owner_product.id), "quantity": 1}],
+        "payment_method": PaymentMethod.cash_on_delivery.value,
+        "delivery_address": "Sacré-Cœur, Dakar",
+        "ville": "Dakar",
+        "merchant_id": str(other.id),
+    }
+    try:
+        async with await _client() as client:
+            unauth = await client.post("/orders", json=payload)
+            assert unauth.status_code == 401
+
+        with _auth(owner_clerk):
+            async with await _client() as client:
+                created = await client.post(
+                    "/orders", headers=_headers(), json=payload
+                )
+                assert created.status_code == 200, created.text
+                body = created.json()
+                assert body["merchant_id"] == str(owner.id)
+                assert body["customer_phone"] == "+221770000040"
+
+        async with AsyncSessionLocal() as db:
+            stored = (
+                await db.execute(select(Order).where(Order.id == body["id"]))
+            ).scalar_one()
+            assert stored.merchant_id == owner.id
+            assert stored.conversation_id is None
+            assert stored.order_number == 1
+            other_stock = await obtenir_disponibilite(db, other_product.id)
+        assert other_stock == 6
+    finally:
+        await _cleanup(owner.id, other.id)

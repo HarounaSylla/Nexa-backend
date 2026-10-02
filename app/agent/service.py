@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from sqlalchemy import case, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agent.models import Conversation, Message
+from app.agent.models import Conversation, Message, SentProductImage
 from app.notifications.service import (
     NotificationRelatedType,
     NotificationType,
@@ -57,6 +57,30 @@ async def obtenir_dernier_message_agent(
         .limit(1)
     )
     return last_agent.scalars().first()
+
+
+async def already_sent_product_ids(
+    db: AsyncSession, conversation_id: uuid.UUID, product_ids: list[uuid.UUID]
+) -> set[uuid.UUID]:
+    """Which of these products already had their photo sent in this conversation."""
+    if not product_ids:
+        return set()
+    result = await db.execute(
+        select(SentProductImage.product_id).where(
+            SentProductImage.conversation_id == conversation_id,
+            SentProductImage.product_id.in_(product_ids),
+        )
+    )
+    return {row[0] for row in result.all()}
+
+
+async def record_sent_product_image(
+    db: AsyncSession, conversation_id: uuid.UUID, product_id: uuid.UUID
+) -> None:
+    db.add(
+        SentProductImage(conversation_id=conversation_id, product_id=product_id)
+    )
+    await db.commit()
 
 
 async def escalader_vers_humain(

@@ -84,6 +84,13 @@ class Deliverer(Base):
 
 class Order(Base):
     __tablename__ = "orders"
+    __table_args__ = (
+        UniqueConstraint(
+            "merchant_id",
+            "order_number",
+            name="uq_orders_merchant_order_number",
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
@@ -95,6 +102,13 @@ class Order(Base):
         UUID(as_uuid=True),
         ForeignKey("merchants.id"),
         nullable=False,
+        index=True,
+    )
+    order_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    conversation_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("conversations.id", ondelete="SET NULL"),
+        nullable=True,
         index=True,
     )
     customer_phone: Mapped[str] = mapped_column(String, nullable=False, index=True)

@@ -7,7 +7,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.catalogue.models import Product
+from app.catalogue.models import Merchant, Product
 from app.notifications.service import (
     NotificationRelatedType,
     NotificationType,
@@ -81,6 +81,21 @@ def _aggregate_quantities(items: list[tuple[uuid.UUID, int]]) -> dict[uuid.UUID,
             )
         quantities[product_id] += quantity
     return dict(quantities)
+
+
+async def _lock_merchant(db: AsyncSession, merchant_id: uuid.UUID) -> Merchant:
+    """Lock the merchant row so order_number assignment cannot collide.
+
+    Callers that also lock products must take this merchant lock first,
+    then product rows ordered by product.id — never the reverse.
+    """
+    result = await db.execute(
+        select(Merchant).where(Merchant.id == merchant_id).with_for_update()
+    )
+    merchant = result.scalar_one_or_none()
+    if merchant is None:
+        raise NotFoundError(f"Merchant {merchant_id} was not found")
+    return merchant
 
 
 async def _lock_products(
@@ -211,17 +226,24 @@ async def creer_commande(
     payment_method: PaymentMethod,
     delivery_address: str,
     ville: str,
+    conversation_id: uuid.UUID | None = None,
 ) -> Order:
     """Create an order and provisionally decrement stock, atomically.
 
-    Locks every involved product with SELECT ... FOR UPDATE in product_id
-    order, rejects the whole order if any item is short, then decrements
-    stock, writes stock_movements, and inserts the order + items in the
-    same transaction.
+    Locks the merchant row first (`SELECT ... FOR UPDATE`) to assign a
+    unique per-merchant `order_number`, then locks every involved product
+    with `SELECT ... FOR UPDATE` in product_id order. Rejects the whole
+    order if any item is short, then decrements stock, writes
+    stock_movements, and inserts the order + items in the same
+    transaction. Other writers that need both locks must use this same
+    order (merchant, then products) to avoid deadlocks.
 
     `ville` is required separately from the free-text address. Delivery
-    coverage is checked before the stock lock; unserved cities raise
+    coverage is checked before any lock; unserved cities raise
     DeliveryNotAvailableError and create nothing.
+
+    `conversation_id` is stored when the order came from a WhatsApp
+    thread; merchant-created orders leave it None.
     """
     quantities = _aggregate_quantities(items)
     product_ids = sorted(quantities)
@@ -229,6 +251,7 @@ async def creer_commande(
         zone = await obtenir_zone_livraison(db, merchant_id, ville)
         if zone is None or not zone.available:
             raise DeliveryNotAvailableError(ville)
+        merchant = await _lock_merchant(db, merchant_id)
         products = await _lock_products(db, product_ids)
         for product_id in product_ids:
             product = products[product_id]
@@ -242,8 +265,12 @@ async def creer_commande(
                     f"Product {product_id} has no price; cannot snapshot unit_price"
                 )
 
+        order_number = merchant.next_order_number
+        merchant.next_order_number = order_number + 1
         order = Order(
             merchant_id=merchant_id,
+            order_number=order_number,
+            conversation_id=conversation_id,
             customer_phone=customer_phone,
             status=OrderStatus.created,
             payment_method=payment_method,
@@ -310,6 +337,35 @@ async def creer_commande(
         select(Order).options(selectinload(Order.items)).where(Order.id == order.id)
     )
     return result.scalar_one()
+
+
+async def consulter_commande(
+    db: AsyncSession,
+    merchant_id: uuid.UUID,
+    customer_phone: str,
+    order_number: int | None = None,
+) -> Order | None:
+    """Look up one order for this specific customer.
+
+    Scoped by BOTH merchant_id and customer_phone — never just
+    order_number — so a customer can never retrieve another customer's
+    order by guessing a number. If order_number is None, return the most
+    recent order for this phone at this merchant.
+    """
+    query = (
+        select(Order)
+        .options(selectinload(Order.items), selectinload(Order.deliverer))
+        .where(
+            Order.merchant_id == merchant_id,
+            Order.customer_phone == customer_phone,
+        )
+    )
+    if order_number is not None:
+        query = query.where(Order.order_number == order_number)
+    else:
+        query = query.order_by(Order.created_at.desc()).limit(1)
+    result = await db.execute(query)
+    return result.unique().scalars().first()
 
 
 async def assigner_livreur(

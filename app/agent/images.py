@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from decimal import Decimal
 from typing import Any
 
 from pydantic import BaseModel
@@ -79,3 +80,46 @@ def product_names_from_items(items: list[Any] | None) -> dict[uuid.UUID, str]:
         if raw_id and name:
             names[uuid.UUID(str(raw_id))] = str(name)
     return names
+
+
+def _format_price_fcfa(price: Any) -> str:
+    value = int(Decimal(str(price)))
+    return f"{value:,}".replace(",", " ") + " FCFA"
+
+
+def product_descriptions_from_items(items: list[Any] | None) -> dict[uuid.UUID, str]:
+    """'<name> — <price> FCFA' per product, built from the same tool output
+    data already used for extract_product_images / product_names_from_items
+    — no extra query, and the price always matches what the model saw.
+    """
+    descriptions: dict[uuid.UUID, str] = {}
+    for item in items or []:
+        if not isinstance(item, dict) or item.get("type") != "function_call_output":
+            continue
+        raw = item.get("output")
+        payload: Any = raw
+        if isinstance(raw, str):
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+        if not isinstance(payload, dict):
+            continue
+        for product in payload.get("products") or []:
+            if not isinstance(product, dict):
+                continue
+            raw_id = product.get("id") or product.get("product_id")
+            name = product.get("name")
+            price = product.get("price")
+            if raw_id and name and price is not None:
+                descriptions[uuid.UUID(str(raw_id))] = (
+                    f"{name} — {_format_price_fcfa(price)}"
+                )
+        raw_id = payload.get("product_id")
+        name = payload.get("name")
+        price = payload.get("price")
+        if raw_id and name and price is not None:
+            descriptions[uuid.UUID(str(raw_id))] = (
+                f"{name} — {_format_price_fcfa(price)}"
+            )
+    return descriptions

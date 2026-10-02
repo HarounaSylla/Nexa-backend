@@ -191,6 +191,7 @@ async def test_delete_blocked_when_order_items_exist() -> None:
             await db.flush()
             order = Order(
                 merchant_id=merchant.id,
+                order_number=1,
                 customer_phone="+221770000001",
                 status=OrderStatus.created,
                 payment_method=PaymentMethod.cash_on_delivery,

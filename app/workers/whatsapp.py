@@ -8,10 +8,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import uuid
 
-from app.agent.images import extract_product_images, product_names_from_items
+from app.agent.images import (
+    extract_product_images,
+    product_descriptions_from_items,
+    product_names_from_items,
+)
 from app.agent.orchestrator import traiter_message_entrant
-from app.agent.service import obtenir_dernier_message_agent
+from app.agent.service import (
+    already_sent_product_ids,
+    obtenir_dernier_message_agent,
+    record_sent_product_image,
+)
 from app.core.db import AsyncSessionLocal, engine
 from app.merchants.service import get_merchant_by_whatsapp_phone_number_id
 from app.whatsapp.service import (
@@ -103,6 +112,9 @@ async def process_inbound_whatsapp_text_async(
 
         images = []
         names = {}
+        descriptions = {}
+        conversation_id = None
+        already_sent: set[uuid.UUID] = set()
         async with AsyncSessionLocal() as db:
             last = await obtenir_dernier_message_agent(
                 db, merchant_id, customer_phone
@@ -110,19 +122,60 @@ async def process_inbound_whatsapp_text_async(
             if last is not None:
                 images = extract_product_images(last.items)
                 names = product_names_from_items(last.items)
-        if len(images) > MAX_WHATSAPP_IMAGES:
-            logger.info(
-                "Capping WhatsApp images from %s to %s message_id=%s",
-                len(images),
-                MAX_WHATSAPP_IMAGES,
-                message_id,
-            )
-        for image in images[:MAX_WHATSAPP_IMAGES]:
-            await envoyer_image_whatsapp(
-                customer_phone,
-                image.product_id,
-                phone_number_id,
-                caption=names.get(image.product_id),
-            )
+                descriptions = product_descriptions_from_items(last.items)
+                conversation_id = last.conversation_id
+                already_sent = await already_sent_product_ids(
+                    db,
+                    conversation_id,
+                    [image.product_id for image in images],
+                )
+
+        multi_mode = len(images) > 1
+        if multi_mode:
+            photos_sent = 0
+            cap_logged = False
+            for image in images:
+                description = descriptions.get(image.product_id)
+                if description:
+                    await envoyer_texte_whatsapp(
+                        customer_phone, description, phone_number_id
+                    )
+                if image.product_id in already_sent:
+                    continue
+                if photos_sent >= MAX_WHATSAPP_IMAGES:
+                    if not cap_logged:
+                        logger.info(
+                            "Capping WhatsApp images from %s to %s message_id=%s",
+                            len(images),
+                            MAX_WHATSAPP_IMAGES,
+                            message_id,
+                        )
+                        cap_logged = True
+                    continue
+                await envoyer_image_whatsapp(
+                    customer_phone,
+                    image.product_id,
+                    phone_number_id,
+                )
+                photos_sent += 1
+                if conversation_id is not None:
+                    async with AsyncSessionLocal() as db:
+                        await record_sent_product_image(
+                            db, conversation_id, image.product_id
+                        )
+        elif len(images) == 1:
+            image = images[0]
+            if image.product_id not in already_sent:
+                await envoyer_image_whatsapp(
+                    customer_phone,
+                    image.product_id,
+                    phone_number_id,
+                    caption=names.get(image.product_id),
+                )
+                if conversation_id is not None:
+                    async with AsyncSessionLocal() as db:
+                        await record_sent_product_image(
+                            db, conversation_id, image.product_id
+                        )
     finally:
         await engine.dispose()

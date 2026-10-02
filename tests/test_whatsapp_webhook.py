@@ -1,7 +1,9 @@
 import hashlib
 import hmac
 import json
+import logging
 import uuid
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -10,7 +12,7 @@ import pytest
 from sqlalchemy import delete, select
 
 from app.agent.models import Conversation, Message
-from app.catalogue.models import Merchant
+from app.catalogue.models import Merchant, Product
 from app.core.config import settings
 from app.core.db import AsyncSessionLocal
 from app.main import app
@@ -33,6 +35,23 @@ async def _client() -> httpx.AsyncClient:
 
 async def _cleanup(*merchant_ids: uuid.UUID) -> None:
     async with AsyncSessionLocal() as db:
+        conversation_ids = list(
+            (
+                await db.execute(
+                    select(Conversation.id).where(
+                        Conversation.merchant_id.in_(merchant_ids)
+                    )
+                )
+            ).scalars().all()
+        )
+        if conversation_ids:
+            await db.execute(
+                delete(Message).where(Message.conversation_id.in_(conversation_ids))
+            )
+            await db.execute(
+                delete(Conversation).where(Conversation.id.in_(conversation_ids))
+            )
+        await db.execute(delete(Product).where(Product.merchant_id.in_(merchant_ids)))
         await db.execute(delete(Merchant).where(Merchant.id.in_(merchant_ids)))
         await db.commit()
 
@@ -415,7 +434,7 @@ async def test_envoyer_image_whatsapp_missing_file_does_not_raise() -> None:
 
 
 @pytest.mark.asyncio
-async def test_worker_sends_text_then_caps_images_at_three() -> None:
+async def test_worker_sends_text_then_caps_images_at_three(caplog: pytest.LogCaptureFixture) -> None:
     merchant = await _seed_linked_merchant()
     ids = [uuid.uuid4() for _ in range(4)]
     items = [
@@ -427,6 +446,7 @@ async def test_worker_sends_text_then_caps_images_at_three() -> None:
                         {
                             "id": str(product_id),
                             "name": f"Item {index}",
+                            "price": str((index + 1) * 10000),
                             "image_url": f"/static/product_images/{product_id}.png",
                         }
                         for index, product_id in enumerate(ids)
@@ -437,6 +457,18 @@ async def test_worker_sends_text_then_caps_images_at_three() -> None:
     ]
     try:
         async with AsyncSessionLocal() as db:
+            db.add_all(
+                [
+                    Product(
+                        id=product_id,
+                        merchant_id=merchant.id,
+                        name=f"Item {index}",
+                        price=Decimal((index + 1) * 10000),
+                        stock_qty=5,
+                    )
+                    for index, product_id in enumerate(ids)
+                ]
+            )
             conversation = Conversation(
                 merchant_id=merchant.id,
                 customer_phone="221770001307",
@@ -472,38 +504,249 @@ async def test_worker_sends_text_then_caps_images_at_three() -> None:
                 new_callable=AsyncMock,
             ) as send_image,
         ):
-            await process_inbound_whatsapp_text_async(
-                "wamid.images",
-                "221770001307",
-                "vous avez des robes ?",
-                merchant.whatsapp_phone_number_id or "",
-            )
-            send_text.assert_awaited_once()
+            with caplog.at_level(logging.INFO, logger="app.workers.whatsapp"):
+                await process_inbound_whatsapp_text_async(
+                    "wamid.images",
+                    "221770001307",
+                    "vous avez des robes ?",
+                    merchant.whatsapp_phone_number_id or "",
+                )
+            assert "Capping WhatsApp images from 4 to 3" in caplog.text
+            assert send_text.await_count == 5
+            bodies = [call.args[1] for call in send_text.await_args_list]
+            assert bodies[0] == "Voici quelques articles."
+            assert bodies[1:] == [
+                "Item 0 — 10 000 FCFA",
+                "Item 1 — 20 000 FCFA",
+                "Item 2 — 30 000 FCFA",
+                "Item 3 — 40 000 FCFA",
+            ]
             assert send_image.await_count == 3
             sent_ids = [call.args[1] for call in send_image.await_args_list]
             assert sent_ids == ids[:3]
-            assert send_image.await_args_list[0].kwargs["caption"] == "Item 0"
-    finally:
-        async with AsyncSessionLocal() as db:
-            conversation_ids = list(
-                (
-                    await db.execute(
-                        select(Conversation.id).where(
-                            Conversation.merchant_id == merchant.id
-                        )
-                    )
-                ).scalars().all()
+            assert all(
+                call.kwargs.get("caption") in (None, "")
+                or "caption" not in call.kwargs
+                for call in send_image.await_args_list
             )
-            if conversation_ids:
+    finally:
+        await _cleanup(merchant.id)
+
+
+@pytest.mark.asyncio
+async def test_worker_skips_already_sent_photos_but_still_sends_description() -> None:
+    from app.agent.models import SentProductImage
+
+    merchant = await _seed_linked_merchant()
+    ids = [uuid.uuid4() for _ in range(2)]
+    items = [
+        {
+            "type": "function_call_output",
+            "output": json.dumps(
+                {
+                    "products": [
+                        {
+                            "id": str(product_id),
+                            "name": f"Item {index}",
+                            "price": "25000",
+                            "image_url": f"/static/product_images/{product_id}.png",
+                        }
+                        for index, product_id in enumerate(ids)
+                    ]
+                }
+            ),
+        }
+    ]
+    try:
+        async with AsyncSessionLocal() as db:
+            db.add_all(
+                [
+                    Product(
+                        id=product_id,
+                        merchant_id=merchant.id,
+                        name=f"Item {index}",
+                        price=Decimal("25000"),
+                        stock_qty=5,
+                    )
+                    for index, product_id in enumerate(ids)
+                ]
+            )
+            conversation = Conversation(
+                merchant_id=merchant.id,
+                customer_phone="221770001308",
+                status="active",
+            )
+            db.add(conversation)
+            await db.flush()
+            db.add(
+                Message(
+                    conversation_id=conversation.id,
+                    turn_role="agent",
+                    display_text="Encore les mêmes.",
+                    items=items,
+                )
+            )
+            db.add_all(
+                [
+                    SentProductImage(
+                        conversation_id=conversation.id, product_id=product_id
+                    )
+                    for product_id in ids
+                ]
+            )
+            await db.commit()
+
+        with (
+            patch(
+                "app.workers.whatsapp.claim_inbound_message", return_value=True
+            ),
+            patch(
+                "app.workers.whatsapp.traiter_message_entrant",
+                new_callable=AsyncMock,
+                return_value="Encore les mêmes.",
+            ),
+            patch(
+                "app.workers.whatsapp.envoyer_texte_whatsapp",
+                new_callable=AsyncMock,
+            ) as send_text,
+            patch(
+                "app.workers.whatsapp.envoyer_image_whatsapp",
+                new_callable=AsyncMock,
+            ) as send_image,
+        ):
+            await process_inbound_whatsapp_text_async(
+                "wamid.images-repeat",
+                "221770001308",
+                "et les robes ?",
+                merchant.whatsapp_phone_number_id or "",
+            )
+            bodies = [call.args[1] for call in send_text.await_args_list]
+            assert bodies[0] == "Encore les mêmes."
+            assert bodies[1:] == [
+                "Item 0 — 25 000 FCFA",
+                "Item 1 — 25 000 FCFA",
+            ]
+            send_image.assert_not_awaited()
+    finally:
+        await _cleanup(merchant.id)
+
+
+@pytest.mark.asyncio
+async def test_worker_single_image_uses_caption_and_skips_resend() -> None:
+    from app.agent.models import SentProductImage
+
+    merchant = await _seed_linked_merchant()
+    product_id = uuid.uuid4()
+    items = [
+        {
+            "type": "function_call_output",
+            "output": json.dumps(
+                {
+                    "products": [
+                        {
+                            "id": str(product_id),
+                            "name": "Robe rouge",
+                            "price": "25000",
+                            "image_url": f"/static/product_images/{product_id}.png",
+                        }
+                    ]
+                }
+            ),
+        }
+    ]
+    try:
+        async with AsyncSessionLocal() as db:
+            db.add(
+                Product(
+                    id=product_id,
+                    merchant_id=merchant.id,
+                    name="Robe rouge",
+                    price=Decimal("25000"),
+                    stock_qty=5,
+                )
+            )
+            conversation = Conversation(
+                merchant_id=merchant.id,
+                customer_phone="221770001309",
+                status="active",
+            )
+            db.add(conversation)
+            await db.flush()
+            db.add(
+                Message(
+                    conversation_id=conversation.id,
+                    turn_role="agent",
+                    display_text="La robe rouge.",
+                    items=items,
+                )
+            )
+            await db.commit()
+
+        with (
+            patch(
+                "app.workers.whatsapp.claim_inbound_message", return_value=True
+            ),
+            patch(
+                "app.workers.whatsapp.traiter_message_entrant",
+                new_callable=AsyncMock,
+                return_value="La robe rouge.",
+            ),
+            patch(
+                "app.workers.whatsapp.envoyer_texte_whatsapp",
+                new_callable=AsyncMock,
+            ) as send_text,
+            patch(
+                "app.workers.whatsapp.envoyer_image_whatsapp",
+                new_callable=AsyncMock,
+            ) as send_image,
+        ):
+            await process_inbound_whatsapp_text_async(
+                "wamid.single-1",
+                "221770001309",
+                "la robe rouge ?",
+                merchant.whatsapp_phone_number_id or "",
+            )
+            send_text.assert_awaited_once()
+            send_image.assert_awaited_once()
+            assert send_image.await_args.kwargs["caption"] == "Robe rouge"
+
+        async with AsyncSessionLocal() as db:
+            recorded = (
                 await db.execute(
-                    delete(Message).where(
-                        Message.conversation_id.in_(conversation_ids)
+                    select(SentProductImage.product_id).where(
+                        SentProductImage.product_id == product_id
                     )
                 )
-                await db.execute(
-                    delete(Conversation).where(
-                        Conversation.id.in_(conversation_ids)
-                    )
-                )
-                await db.commit()
+            ).scalar_one()
+            assert recorded == product_id
+
+        send_image.reset_mock()
+        send_text.reset_mock()
+        with (
+            patch(
+                "app.workers.whatsapp.claim_inbound_message", return_value=True
+            ),
+            patch(
+                "app.workers.whatsapp.traiter_message_entrant",
+                new_callable=AsyncMock,
+                return_value="Toujours la robe rouge.",
+            ),
+            patch(
+                "app.workers.whatsapp.envoyer_texte_whatsapp",
+                new_callable=AsyncMock,
+            ) as send_text_again,
+            patch(
+                "app.workers.whatsapp.envoyer_image_whatsapp",
+                new_callable=AsyncMock,
+            ) as send_image_again,
+        ):
+            await process_inbound_whatsapp_text_async(
+                "wamid.single-2",
+                "221770001309",
+                "la robe rouge encore ?",
+                merchant.whatsapp_phone_number_id or "",
+            )
+            send_text_again.assert_awaited_once()
+            send_image_again.assert_not_awaited()
+    finally:
         await _cleanup(merchant.id)
