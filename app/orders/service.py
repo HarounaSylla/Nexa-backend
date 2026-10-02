@@ -410,6 +410,10 @@ async def confirmer_livraison(db: AsyncSession, order_id: uuid.UUID) -> Order:
                     quantity_delta=0,
                 )
             )
+        if order.conversation_id is not None:
+            from app.agent.service import fermer_conversation_si_active
+
+            await fermer_conversation_si_active(db, order.conversation_id)
         await db.commit()
     except Exception:
         await db.rollback()

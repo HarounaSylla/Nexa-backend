@@ -8,6 +8,8 @@ from sqlalchemy import delete, func, select
 from app.catalogue.models import Merchant, Product
 from app.core.db import AsyncSessionLocal
 from app.notifications.models import Notification
+from app.agent.models import Conversation, Message
+from app.agent.service import STATUS_ACTIVE, STATUS_CLOSED, STATUS_ESCALATED
 from app.orders.models import (
     DeliveryZone,
     Order,
@@ -78,6 +80,22 @@ async def _cleanup(merchant_id: uuid.UUID) -> None:
             )
             await db.execute(delete(OrderItem).where(OrderItem.order_id.in_(order_ids)))
             await db.execute(delete(Order).where(Order.id.in_(order_ids)))
+        conversation_ids = list(
+            (
+                await db.execute(
+                    select(Conversation.id).where(
+                        Conversation.merchant_id == merchant_id
+                    )
+                )
+            ).scalars().all()
+        )
+        if conversation_ids:
+            await db.execute(
+                delete(Message).where(Message.conversation_id.in_(conversation_ids))
+            )
+            await db.execute(
+                delete(Conversation).where(Conversation.id.in_(conversation_ids))
+            )
         await db.execute(
             delete(DeliveryZone).where(DeliveryZone.merchant_id == merchant_id)
         )
@@ -356,3 +374,99 @@ async def test_consulter_commande_is_scoped_to_customer_phone() -> None:
             assert latest_other.id == other_order.id
     finally:
         await _cleanup(merchant_id)
+
+
+@pytest.mark.asyncio
+async def test_confirmer_livraison_closes_active_conversation_only() -> None:
+    merchant_id, product_id = await _make_merchant_product(
+        stock_qty=5,
+        name=f"pytest-close-on-delivery-{uuid.uuid4()}",
+    )
+    try:
+        async with AsyncSessionLocal() as db:
+            linked = Conversation(
+                merchant_id=merchant_id,
+                customer_phone=PHONE,
+                status=STATUS_ACTIVE,
+            )
+            escalated = Conversation(
+                merchant_id=merchant_id,
+                customer_phone="+221770000001",
+                status=STATUS_ESCALATED,
+            )
+            already_closed = Conversation(
+                merchant_id=merchant_id,
+                customer_phone="+221770000002",
+                status=STATUS_CLOSED,
+            )
+            db.add_all([linked, escalated, already_closed])
+            await db.commit()
+            await db.refresh(linked)
+            await db.refresh(escalated)
+            await db.refresh(already_closed)
+            linked_id = linked.id
+            escalated_id = escalated.id
+            closed_id = already_closed.id
+
+        async with AsyncSessionLocal() as db:
+            from_confirm = await creer_commande(
+                db,
+                merchant_id=merchant_id,
+                customer_phone=PHONE,
+                items=[(product_id, 1)],
+                payment_method=PaymentMethod.cash_on_delivery,
+                delivery_address=ADDRESS,
+                ville="Dakar",
+                conversation_id=linked_id,
+            )
+            still_active = await db.get(Conversation, linked_id)
+            assert still_active is not None
+            assert still_active.status == STATUS_ACTIVE
+
+        async with AsyncSessionLocal() as db:
+            delivered = await confirmer_livraison(db, from_confirm.id)
+            assert delivered.status == OrderStatus.delivered
+            closed = await db.get(Conversation, linked_id)
+            assert closed is not None
+            assert closed.status == STATUS_CLOSED
+
+        async with AsyncSessionLocal() as db:
+            other_escalated = await creer_commande(
+                db,
+                merchant_id=merchant_id,
+                customer_phone="+221770000001",
+                items=[(product_id, 1)],
+                payment_method=PaymentMethod.cash_on_delivery,
+                delivery_address=ADDRESS,
+                ville="Dakar",
+                conversation_id=escalated_id,
+            )
+            other_closed = await creer_commande(
+                db,
+                merchant_id=merchant_id,
+                customer_phone="+221770000002",
+                items=[(product_id, 1)],
+                payment_method=PaymentMethod.cash_on_delivery,
+                delivery_address=ADDRESS,
+                ville="Dakar",
+                conversation_id=closed_id,
+            )
+            no_thread = await creer_commande(
+                db,
+                merchant_id=merchant_id,
+                customer_phone="+221770000003",
+                items=[(product_id, 1)],
+                payment_method=PaymentMethod.cash_on_delivery,
+                delivery_address=ADDRESS,
+                ville="Dakar",
+            )
+
+        async with AsyncSessionLocal() as db:
+            await confirmer_livraison(db, other_escalated.id)
+            await confirmer_livraison(db, other_closed.id)
+            await confirmer_livraison(db, no_thread.id)
+            assert (await db.get(Conversation, escalated_id)).status == STATUS_ESCALATED
+            assert (await db.get(Conversation, closed_id)).status == STATUS_CLOSED
+    finally:
+        await _cleanup(merchant_id)
+

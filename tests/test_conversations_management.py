@@ -7,7 +7,13 @@ import pytest
 from sqlalchemy import delete, select
 
 from app.agent.models import Conversation, Message
-from app.agent.service import STATUS_ACTIVE, STATUS_ESCALATED, TURN_ROLE_MERCHANT
+from app.agent.service import (
+    STATUS_ACTIVE,
+    STATUS_CLOSED,
+    STATUS_ESCALATED,
+    TURN_ROLE_MERCHANT,
+    reprendre_par_agent,
+)
 from app.catalogue.models import Merchant
 from app.core.db import AsyncSessionLocal
 from app.main import app
@@ -247,5 +253,105 @@ async def test_return_to_agent_clears_escalated_and_409_otherwise() -> None:
                 )
                 assert rejected.status_code == 409
                 assert "not escalated" in rejected.json()["detail"]
+    finally:
+        await _cleanup(merchant.id)
+
+
+@pytest.mark.asyncio
+async def test_get_or_create_closes_stale_reopens_recent_and_skips_escalated() -> None:
+    from app.agent.orchestrator import (
+        CONVERSATION_INACTIVITY_TIMEOUT,
+        CONVERSATION_REOPEN_GRACE_PERIOD,
+        _get_or_create_conversation,
+    )
+
+    clerk_user_id = f"user_conv_lookup_{uuid.uuid4()}"
+    merchant = await _seed_merchant(
+        f"pytest-conv-lookup-{uuid.uuid4()}", clerk_user_id
+    )
+    now = datetime.now(timezone.utc)
+    try:
+        fresh = await _add_conversation(
+            merchant.id,
+            "+221770001031",
+            status=STATUS_ACTIVE,
+            updated_at=now,
+        )
+        stale = await _add_conversation(
+            merchant.id,
+            "+221770001032",
+            status=STATUS_ACTIVE,
+            updated_at=now - CONVERSATION_INACTIVITY_TIMEOUT - timedelta(minutes=1),
+        )
+        just_closed = await _add_conversation(
+            merchant.id,
+            "+221770001033",
+            status=STATUS_CLOSED,
+            updated_at=now - timedelta(minutes=1),
+        )
+        closed_past_grace = await _add_conversation(
+            merchant.id,
+            "+221770001034",
+            status=STATUS_CLOSED,
+            updated_at=now - CONVERSATION_REOPEN_GRACE_PERIOD - timedelta(minutes=1),
+        )
+        escalated = await _add_conversation(
+            merchant.id,
+            "+221770001035",
+            status=STATUS_ESCALATED,
+            updated_at=now,
+        )
+
+        async with AsyncSessionLocal() as db:
+            reused = await _get_or_create_conversation(
+                db, merchant.id, fresh.customer_phone
+            )
+            await db.commit()
+            assert reused.id == fresh.id
+            assert reused.status == STATUS_ACTIVE
+
+        async with AsyncSessionLocal() as db:
+            replacement = await _get_or_create_conversation(
+                db, merchant.id, stale.customer_phone
+            )
+            await db.commit()
+            assert replacement.id != stale.id
+            assert replacement.status == STATUS_ACTIVE
+            old = await db.get(Conversation, stale.id)
+            assert old is not None
+            assert old.status == STATUS_CLOSED
+
+        async with AsyncSessionLocal() as db:
+            reopened = await _get_or_create_conversation(
+                db, merchant.id, just_closed.customer_phone
+            )
+            await db.commit()
+            assert reopened.id == just_closed.id
+            assert reopened.status == STATUS_ACTIVE
+
+        async with AsyncSessionLocal() as db:
+            after_grace = await _get_or_create_conversation(
+                db, merchant.id, closed_past_grace.customer_phone
+            )
+            await db.commit()
+            assert after_grace.id != closed_past_grace.id
+            leftover = await db.get(Conversation, closed_past_grace.id)
+            assert leftover is not None
+            assert leftover.status == STATUS_CLOSED
+
+        async with AsyncSessionLocal() as db:
+            beside_escalated = await _get_or_create_conversation(
+                db, merchant.id, escalated.customer_phone
+            )
+            await db.commit()
+            assert beside_escalated.id != escalated.id
+            assert beside_escalated.status == STATUS_ACTIVE
+            still_escalated = await db.get(Conversation, escalated.id)
+            assert still_escalated is not None
+            assert still_escalated.status == STATUS_ESCALATED
+
+        async with AsyncSessionLocal() as db:
+            returned = await reprendre_par_agent(db, merchant.id, escalated.id)
+            assert returned.status == STATUS_ACTIVE
     finally:
         await _cleanup(merchant.id)

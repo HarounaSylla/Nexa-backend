@@ -16,6 +16,7 @@ from app.orders.service import NotFoundError
 
 STATUS_ACTIVE = "active"
 STATUS_ESCALATED = "escalated"
+STATUS_CLOSED = "closed"
 TURN_ROLE_CUSTOMER = "customer"
 TURN_ROLE_AGENT = "agent"
 TURN_ROLE_MERCHANT = "merchant"
@@ -81,6 +82,17 @@ async def record_sent_product_image(
         SentProductImage(conversation_id=conversation_id, product_id=product_id)
     )
     await db.commit()
+
+
+async def fermer_conversation_si_active(
+    db: AsyncSession, conversation_id: uuid.UUID
+) -> None:
+    """Close an active conversation; no-op if missing, escalated, or already closed."""
+    conversation = await db.get(Conversation, conversation_id)
+    if conversation is None:
+        return
+    if conversation.status == STATUS_ACTIVE:
+        conversation.status = STATUS_CLOSED
 
 
 async def escalader_vers_humain(

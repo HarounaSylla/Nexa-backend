@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal, TypedDict
 
 from langgraph.graph import END, START, StateGraph
@@ -14,9 +14,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.models import Conversation, Message
 from app.agent.prompts import build_system_prompt
+from app.agent.service import STATUS_ACTIVE, STATUS_CLOSED
 from app.agent.tools import TOOLS, execute_tool
 from app.catalogue.models import Merchant
 from app.core.config import settings
+
+CONVERSATION_INACTIVITY_TIMEOUT = timedelta(hours=48)
+CONVERSATION_REOPEN_GRACE_PERIOD = timedelta(minutes=15)
 
 _client: AsyncOpenAI | None = None
 
@@ -184,19 +188,39 @@ async def _get_or_create_conversation(
     db: AsyncSession, merchant_id: uuid.UUID, customer_phone: str
 ) -> Conversation:
     result = await db.execute(
-        select(Conversation).where(
+        select(Conversation)
+        .where(
             Conversation.merchant_id == merchant_id,
             Conversation.customer_phone == customer_phone,
-            Conversation.status == "active",
+            Conversation.status.in_([STATUS_ACTIVE, STATUS_CLOSED]),
         )
+        .order_by(Conversation.updated_at.desc())
+        .limit(1)
     )
     conversation = result.scalar_one_or_none()
+    now = datetime.now(timezone.utc)
+
     if conversation is not None:
-        return conversation
+        age = now - conversation.updated_at
+        if conversation.status == STATUS_ACTIVE and age <= CONVERSATION_INACTIVITY_TIMEOUT:
+            return conversation
+        if conversation.status == STATUS_ACTIVE:
+            # Stale — close it instead of silently appending onto old context.
+            conversation.status = STATUS_CLOSED
+            await db.flush()
+        elif age <= CONVERSATION_REOPEN_GRACE_PERIOD:
+            # Just closed (e.g. delivery confirmed moments ago, "merci, bien
+            # reçu !") and the customer is still typing — reopen the same
+            # thread instead of wiping context they'd reasonably expect the
+            # agent to still have.
+            conversation.status = STATUS_ACTIVE
+            await db.flush()
+            return conversation
+
     conversation = Conversation(
         merchant_id=merchant_id,
         customer_phone=customer_phone,
-        status="active",
+        status=STATUS_ACTIVE,
     )
     db.add(conversation)
     await db.flush()
