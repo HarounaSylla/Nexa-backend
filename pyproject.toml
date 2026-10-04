@@ -24,6 +24,7 @@ dependencies = [
     "httpx",
     "PyJWT[crypto]",
     "python-multipart>=0.0.32",
+    "tzdata>=2026.3",
 ]
 
 [project.optional-dependencies]

@@ -1,11 +1,16 @@
-"""Merchant onboarding and demo-account linking."""
+"""Merchant onboarding, demo-account linking, and shop preferences."""
 
 from __future__ import annotations
+
+import uuid
+from dataclasses import dataclass
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.catalogue.models import Merchant
+from app.merchants.models import DEFAULT_SHOP_TIMEZONE, MerchantPreferences
+from app.orders.models import PaymentMethod
 
 DEMO_MERCHANT_NAME = "Boutique Awa"
 
@@ -100,3 +105,90 @@ async def link_demo_merchant(db: AsyncSession, clerk_user_id: str) -> Merchant:
     await db.commit()
     await db.refresh(demo)
     return demo
+
+
+@dataclass(frozen=True)
+class MerchantPreferencesData:
+    accepts_cash_on_delivery: bool = True
+    accepts_online_payment: bool = True
+    timezone: str = DEFAULT_SHOP_TIMEZONE
+    shop_address: str | None = None
+    opening_hours: str | None = None
+    return_policy: str | None = None
+    delivery_fee_note: str | None = None
+    extra_info: str | None = None
+
+
+class PaymentMethodNotAcceptedError(ValueError):
+    """Raised when the agent tries a payment method this shop does not take."""
+
+    def __init__(self, accepted: list[str]) -> None:
+        methods = ", ".join(accepted)
+        super().__init__(
+            f"This shop does not accept that payment method. Accepted: {methods}."
+        )
+        self.accepted = accepted
+
+
+def _from_row(row: MerchantPreferences) -> MerchantPreferencesData:
+    return MerchantPreferencesData(
+        accepts_cash_on_delivery=row.accepts_cash_on_delivery,
+        accepts_online_payment=row.accepts_online_payment,
+        timezone=row.timezone,
+        shop_address=row.shop_address,
+        opening_hours=row.opening_hours,
+        return_policy=row.return_policy,
+        delivery_fee_note=row.delivery_fee_note,
+        extra_info=row.extra_info,
+    )
+
+
+async def get_preferences(
+    db: AsyncSession, merchant_id: uuid.UUID
+) -> MerchantPreferencesData:
+    """Return stored preferences, or the no-row defaults."""
+    row = await db.get(MerchantPreferences, merchant_id)
+    if row is None:
+        return MerchantPreferencesData()
+    return _from_row(row)
+
+
+async def update_preferences(
+    db: AsyncSession,
+    merchant_id: uuid.UUID,
+    data: MerchantPreferencesData,
+) -> MerchantPreferencesData:
+    """Upsert the seven editable preference fields."""
+    row = await db.get(MerchantPreferences, merchant_id)
+    if row is None:
+        row = MerchantPreferences(merchant_id=merchant_id)
+        db.add(row)
+    row.accepts_cash_on_delivery = data.accepts_cash_on_delivery
+    row.accepts_online_payment = data.accepts_online_payment
+    row.timezone = data.timezone
+    row.shop_address = data.shop_address
+    row.opening_hours = data.opening_hours
+    row.return_policy = data.return_policy
+    row.delivery_fee_note = data.delivery_fee_note
+    row.extra_info = data.extra_info
+    await db.commit()
+    await db.refresh(row)
+    return _from_row(row)
+
+
+def accepted_payment_method_values(prefs: MerchantPreferencesData) -> list[str]:
+    accepted: list[str] = []
+    if prefs.accepts_cash_on_delivery:
+        accepted.append(PaymentMethod.cash_on_delivery.value)
+    if prefs.accepts_online_payment:
+        accepted.append(PaymentMethod.online.value)
+    return accepted
+
+
+def reject_unaccepted_payment_method(
+    prefs: MerchantPreferencesData, method: PaymentMethod
+) -> None:
+    if method == PaymentMethod.cash_on_delivery and not prefs.accepts_cash_on_delivery:
+        raise PaymentMethodNotAcceptedError(accepted_payment_method_values(prefs))
+    if method == PaymentMethod.online and not prefs.accepts_online_payment:
+        raise PaymentMethodNotAcceptedError(accepted_payment_method_values(prefs))

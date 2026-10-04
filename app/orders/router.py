@@ -3,7 +3,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field, HttpUrl, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.deps import get_current_merchant
@@ -38,9 +38,10 @@ from app.orders.service import (
     supprimer_zone_livraison,
 )
 
-# Authenticated merchant dashboard API. Availability and delivery-zones
-# routes stay unauthenticated (pre-pilot cleanup). POST /orders is
-# merchant-scoped via get_current_merchant — no merchant_id in the body.
+# Authenticated merchant dashboard API. Availability and
+# POST /agent/simulate-style scaffolding remain unauthenticated.
+# POST /orders and delivery-zones are merchant-scoped via
+# get_current_merchant — no merchant_id in the body.
 router = APIRouter(prefix="/orders", tags=["orders"])
 deliverers_router = APIRouter(prefix="/deliverers", tags=["deliverers"])
 
@@ -89,11 +90,16 @@ class OrderOut(BaseModel):
 
 
 class DeliveryZoneRequest(BaseModel):
-    merchant_id: uuid.UUID
     city: str
     available: bool = True
-    min_delivery_hours: int
-    max_delivery_hours: int
+    min_delivery_hours: int = Field(ge=0)
+    max_delivery_hours: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def max_hours_at_least_min(self) -> DeliveryZoneRequest:
+        if self.max_delivery_hours < self.min_delivery_hours:
+            raise ValueError("max_delivery_hours must be >= min_delivery_hours")
+        return self
 
 
 class DeliveryZoneOut(BaseModel):
@@ -266,12 +272,13 @@ def _to_zone_out(zone: DeliveryZone) -> DeliveryZoneOut:
 @router.post("/delivery-zones", response_model=DeliveryZoneOut)
 async def upsert_delivery_zone(
     body: DeliveryZoneRequest,
+    merchant: Merchant = Depends(get_current_merchant),
     db: AsyncSession = Depends(get_db),
 ) -> DeliveryZoneOut:
     try:
         zone = await creer_ou_maj_zone_livraison(
             db,
-            merchant_id=body.merchant_id,
+            merchant_id=merchant.id,
             city=body.city,
             available=body.available,
             min_delivery_hours=body.min_delivery_hours,
@@ -284,20 +291,21 @@ async def upsert_delivery_zone(
 
 @router.get("/delivery-zones", response_model=list[DeliveryZoneOut])
 async def list_delivery_zones(
-    merchant_id: uuid.UUID,
+    merchant: Merchant = Depends(get_current_merchant),
     db: AsyncSession = Depends(get_db),
 ) -> list[DeliveryZoneOut]:
-    zones = await lister_zones_livraison(db, merchant_id)
+    zones = await lister_zones_livraison(db, merchant.id)
     return [_to_zone_out(zone) for zone in zones]
 
 
 @router.delete("/delivery-zones/{zone_id}", status_code=204)
 async def delete_delivery_zone(
     zone_id: uuid.UUID,
+    merchant: Merchant = Depends(get_current_merchant),
     db: AsyncSession = Depends(get_db),
 ) -> None:
     try:
-        await supprimer_zone_livraison(db, zone_id)
+        await supprimer_zone_livraison(db, zone_id, merchant_id=merchant.id)
     except NotFoundError as exc:
         raise _map_error(exc) from exc
 

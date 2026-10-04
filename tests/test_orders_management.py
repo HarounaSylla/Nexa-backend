@@ -397,6 +397,84 @@ async def test_authenticated_create_order_is_scoped_to_session_merchant() -> Non
             assert stored.conversation_id is None
             assert stored.order_number == 1
             other_stock = await obtenir_disponibilite(db, other_product.id)
-        assert other_stock == 6
+            assert other_stock == 6
+    finally:
+        await _cleanup(owner.id, other.id)
+
+
+@pytest.mark.asyncio
+async def test_delivery_zone_routes_are_authenticated_and_merchant_scoped() -> None:
+    owner_clerk = f"user_zone_owner_{uuid.uuid4()}"
+    other_clerk = f"user_zone_other_{uuid.uuid4()}"
+    owner, _owner_product = await _seed_shop(
+        name=f"pytest-zones-owner-{uuid.uuid4()}",
+        clerk_user_id=owner_clerk,
+    )
+    other, _other_product = await _seed_shop(
+        name=f"pytest-zones-other-{uuid.uuid4()}",
+        clerk_user_id=other_clerk,
+    )
+    try:
+        async with await _client() as client:
+            unauth = await client.get("/orders/delivery-zones")
+            assert unauth.status_code == 401
+
+        with _auth(other_clerk):
+            async with await _client() as client:
+                other_thies = await client.post(
+                    "/orders/delivery-zones",
+                    headers=_headers(),
+                    json={
+                        "city": "Thiès",
+                        "available": True,
+                        "min_delivery_hours": 48,
+                        "max_delivery_hours": 72,
+                    },
+                )
+                assert other_thies.status_code == 200, other_thies.text
+                other_zone_id = other_thies.json()["id"]
+
+        with _auth(owner_clerk):
+            async with await _client() as client:
+                listed = await client.get(
+                    "/orders/delivery-zones", headers=_headers()
+                )
+                assert listed.status_code == 200
+                cities = [row["city"] for row in listed.json()]
+                assert cities == ["Dakar"]
+                assert all(
+                    row["merchant_id"] == str(owner.id) for row in listed.json()
+                )
+
+                created = await client.post(
+                    "/orders/delivery-zones",
+                    headers=_headers(),
+                    json={
+                        "city": "Thiès",
+                        "available": False,
+                        "min_delivery_hours": 48,
+                        "max_delivery_hours": 72,
+                    },
+                )
+                assert created.status_code == 200, created.text
+                assert created.json()["merchant_id"] == str(owner.id)
+                assert created.json()["city"] == "Thiès"
+
+                listed_after = await client.get(
+                    "/orders/delivery-zones", headers=_headers()
+                )
+                owner_cities = {row["city"] for row in listed_after.json()}
+                assert owner_cities == {"Dakar", "Thiès"}
+
+                stolen = await client.delete(
+                    f"/orders/delivery-zones/{other_zone_id}",
+                    headers=_headers(),
+                )
+                assert stolen.status_code == 404
+
+        async with AsyncSessionLocal() as db:
+            still = await db.get(DeliveryZone, uuid.UUID(other_zone_id))
+            assert still is not None
+            assert still.merchant_id == other.id
     finally:
         await _cleanup(owner.id, other.id)

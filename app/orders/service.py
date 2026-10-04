@@ -174,6 +174,8 @@ async def creer_ou_maj_zone_livraison(
     normalized = normalize_city(city)
     if not normalized:
         raise ValueError("city must not be empty")
+    if min_delivery_hours < 0:
+        raise ValueError("min_delivery_hours must be >= 0")
     if max_delivery_hours < min_delivery_hours:
         raise ValueError("max_delivery_hours must be >= min_delivery_hours")
 
@@ -209,10 +211,15 @@ async def lister_zones_livraison(
     return list(result.scalars().all())
 
 
-async def supprimer_zone_livraison(db: AsyncSession, zone_id: uuid.UUID) -> None:
-    result = await db.execute(
-        delete(DeliveryZone).where(DeliveryZone.id == zone_id)
-    )
+async def supprimer_zone_livraison(
+    db: AsyncSession,
+    zone_id: uuid.UUID,
+    merchant_id: uuid.UUID | None = None,
+) -> None:
+    query = delete(DeliveryZone).where(DeliveryZone.id == zone_id)
+    if merchant_id is not None:
+        query = query.where(DeliveryZone.merchant_id == merchant_id)
+    result = await db.execute(query)
     if result.rowcount == 0:
         raise NotFoundError(f"Delivery zone {zone_id} was not found")
     await db.commit()

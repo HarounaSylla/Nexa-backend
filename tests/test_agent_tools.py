@@ -14,8 +14,9 @@ from app.catalogue.models import Merchant, Product, ProductImage
 from app.catalogue.service import lister_produits_populaires
 from app.core.db import AsyncSessionLocal
 from app.notifications.models import Notification
-from app.orders.models import DeliveryZone, Order, OrderItem, StockMovement
-from app.orders.service import normalize_city
+from app.merchants.service import MerchantPreferencesData, update_preferences
+from app.orders.models import DeliveryZone, Order, OrderItem, PaymentMethod, StockMovement
+from app.orders.service import creer_commande, normalize_city
 from sqlalchemy import delete, select
 
 
@@ -624,5 +625,104 @@ async def test_execute_tool_consulter_commande_hides_other_customers_and_interna
             )
             assert latest["found"] is True
             assert latest["order_number"] == order_number
+        finally:
+            await _cleanup_merchant(db, merchant.id)
+
+
+@pytest.mark.asyncio
+async def test_execute_tool_creer_commande_rejects_unaccepted_payment_method() -> None:
+    async with AsyncSessionLocal() as db:
+        merchant = Merchant(name=f"pytest-agent-paylock-{uuid.uuid4()}")
+        db.add(merchant)
+        await db.flush()
+        product = Product(
+            merchant_id=merchant.id,
+            name="Article paylock",
+            description="test",
+            category="tests",
+            price=Decimal("1000.00"),
+            stock_qty=4,
+        )
+        conversation = Conversation(
+            merchant_id=merchant.id,
+            customer_phone="+221770009301",
+            status="active",
+        )
+        db.add_all(
+            [
+                product,
+                conversation,
+                DeliveryZone(
+                    merchant_id=merchant.id,
+                    city="Dakar",
+                    city_normalized=normalize_city("Dakar"),
+                    available=True,
+                    min_delivery_hours=24,
+                    max_delivery_hours=48,
+                ),
+            ]
+        )
+        await db.commit()
+        try:
+            await update_preferences(
+                db,
+                merchant.id,
+                MerchantPreferencesData(
+                    accepts_cash_on_delivery=True,
+                    accepts_online_payment=False,
+                ),
+            )
+            rejected = json.loads(
+                await execute_tool(
+                    db,
+                    tool_name="creer_commande",
+                    tool_args={
+                        "items": [{"product_id": str(product.id), "quantity": 1}],
+                        "mode_paiement": "online",
+                        "adresse_livraison": "Sacré-Cœur",
+                        "ville": "Dakar",
+                    },
+                    merchant_id=merchant.id,
+                    conversation_id=conversation.id,
+                )
+            )
+            assert "error" in rejected
+            assert "cash_on_delivery" in rejected["error"]
+            assert "does not accept" in rejected["error"]
+            orders = list(
+                (
+                    await db.execute(
+                        select(Order).where(Order.merchant_id == merchant.id)
+                    )
+                ).scalars().all()
+            )
+            assert orders == []
+
+            accepted = json.loads(
+                await execute_tool(
+                    db,
+                    tool_name="creer_commande",
+                    tool_args={
+                        "items": [{"product_id": str(product.id), "quantity": 1}],
+                        "mode_paiement": "cash_on_delivery",
+                        "adresse_livraison": "Sacré-Cœur",
+                        "ville": "Dakar",
+                    },
+                    merchant_id=merchant.id,
+                    conversation_id=conversation.id,
+                )
+            )
+            assert "error" not in accepted
+
+            dashboard = await creer_commande(
+                db,
+                merchant_id=merchant.id,
+                customer_phone="+221770009302",
+                items=[(product.id, 1)],
+                payment_method=PaymentMethod.online,
+                delivery_address="Plateau",
+                ville="Dakar",
+            )
+            assert dashboard.payment_method == PaymentMethod.online
         finally:
             await _cleanup_merchant(db, merchant.id)

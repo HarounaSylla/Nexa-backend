@@ -1581,6 +1581,7 @@ dependencies = [
     { name = "redis" },
     { name = "rq" },
     { name = "sqlalchemy" },
+    { name = "tzdata" },
     { name = "uvicorn", extra = ["standard"] },
     { name = "voyageai" },
 ]
@@ -1612,6 +1613,7 @@ requires-dist = [
     { name = "rq" },
     { name = "ruff", marker = "extra == 'dev'" },
     { name = "sqlalchemy", specifier = ">=2.0" },
+    { name = "tzdata", specifier = ">=2026.3" },
     { name = "uvicorn", extras = ["standard"] },
     { name = "voyageai" },
 ]

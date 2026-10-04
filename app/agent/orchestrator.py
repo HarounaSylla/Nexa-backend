@@ -18,6 +18,8 @@ from app.agent.service import STATUS_ACTIVE, STATUS_CLOSED
 from app.agent.tools import TOOLS, execute_tool
 from app.catalogue.models import Merchant
 from app.core.config import settings
+from app.merchants.service import get_preferences
+from app.orders.service import lister_zones_livraison
 
 CONVERSATION_INACTIVITY_TIMEOUT = timedelta(hours=48)
 CONVERSATION_REOPEN_GRACE_PERIOD = timedelta(minutes=15)
@@ -232,8 +234,13 @@ async def traiter_message_entrant(
     merchant_id: uuid.UUID,
     customer_phone: str,
     message_text: str,
+    now: datetime | None = None,
 ) -> str:
-    """Process one inbound customer message and return the agent reply text."""
+    """Process one inbound customer message and return the agent reply text.
+
+    `now` overrides the clock used in the merchant-settings prompt block.
+    Tests and proof scripts may pass it; the public simulate route does not.
+    """
     merchant = await db.get(Merchant, merchant_id)
     if merchant is None:
         raise ValueError(f"Merchant {merchant_id} was not found")
@@ -260,7 +267,15 @@ async def traiter_message_entrant(
     )
     await db.commit()
 
-    system_item = build_system_prompt(merchant.name)
+    preferences = await get_preferences(db, merchant_id)
+    zones = await lister_zones_livraison(db, merchant_id)
+    available_cities = [zone.city for zone in zones if zone.available]
+    system_item = build_system_prompt(
+        merchant.name,
+        preferences,
+        available_cities=available_cities,
+        now=now,
+    )
     compiled = _build_graph(db)
     initial: AgentState = {
         "input_list": [system_item, *prior_items, customer_item],

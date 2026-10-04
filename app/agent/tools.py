@@ -25,6 +25,11 @@ from app.catalogue.service import (
     rechercher_produits,
     trouver_produits_similaires,
 )
+from app.merchants.service import (
+    PaymentMethodNotAcceptedError,
+    get_preferences,
+    reject_unaccepted_payment_method,
+)
 from app.orders.models import PaymentMethod
 from app.orders.service import (
     DeliveryNotAvailableError,
@@ -325,6 +330,7 @@ async def execute_tool(
         ProductNotIndexedError,
         InvalidOrderStateError,
         DeliveryNotAvailableError,
+        PaymentMethodNotAcceptedError,
         ValueError,
     ) as exc:
         return json.dumps({"error": str(exc)})
@@ -416,12 +422,15 @@ async def _dispatch(
             )
             for item in raw_items
         ]
+        payment_method = _payment_method(str(tool_args["mode_paiement"]))
+        preferences = await get_preferences(db, merchant_id)
+        reject_unaccepted_payment_method(preferences, payment_method)
         order = await creer_commande(
             db,
             merchant_id=merchant_id,
             customer_phone=conversation.customer_phone,
             items=items,
-            payment_method=_payment_method(str(tool_args["mode_paiement"])),
+            payment_method=payment_method,
             delivery_address=str(tool_args["adresse_livraison"]),
             ville=str(tool_args["ville"]),
             conversation_id=conversation_id,
