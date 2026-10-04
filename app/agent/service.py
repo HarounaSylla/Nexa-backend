@@ -1,9 +1,9 @@
 """Agent-side helpers that are not catalogue or orders concerns."""
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import case, func, select
+from sqlalchemy import case, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.models import Conversation, Message, SentProductImage
@@ -93,6 +93,33 @@ async def fermer_conversation_si_active(
         return
     if conversation.status == STATUS_ACTIVE:
         conversation.status = STATUS_CLOSED
+
+
+async def fermer_conversations_inactives(
+    db: AsyncSession, inactivity_timeout: timedelta
+) -> int:
+    """Close active conversations idle longer than `inactivity_timeout`.
+
+    Returns the number of conversations closed. Escalated and already
+    closed conversations are never touched.
+    """
+    result = await db.execute(
+        update(Conversation)
+        .where(
+            Conversation.status == STATUS_ACTIVE,
+            Conversation.updated_at < func.now() - inactivity_timeout,
+        )
+        .values(
+            status=STATUS_CLOSED,
+            # Keep the original idle timestamp. Conversation.updated_at has
+            # onupdate=func.now(); a naive UPDATE would look "just closed"
+            # and the 15-minute reopen grace would put the customer back
+            # into a 48h+ stale thread.
+            updated_at=Conversation.updated_at,
+        )
+    )
+    await db.commit()
+    return result.rowcount or 0
 
 
 async def escalader_vers_humain(

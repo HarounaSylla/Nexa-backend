@@ -32,7 +32,7 @@ unchecked items as optional.
 - [x] Concurrent last-unit order test against local Postgres
 - [x] `delivery_zones` (per-city availability + delay window) and `orders.city`
 - [x] `creer_commande` rejects unserved cities (`DeliveryNotAvailableError`) before stock lock
-- [x] Per-merchant `order_number` (Alembic `0010`, merchant row `SELECT ... FOR UPDATE`) + optional `orders.conversation_id` (nullable, not closed on delivery yet)
+- [x] Per-merchant `order_number` (Alembic `0010`, merchant row `SELECT ... FOR UPDATE`) + optional `orders.conversation_id` (nullable; conversation closes on delivery, not on confirm)
 - [x] Agent tool `consulter_commande` (own orders only, by number or most recent)
 - [x] Agent tool `verifier_zone_livraison` + prompt rules for city / deliverer-calls-on-arrival
 - [x] Temporary `/orders/delivery-zones` router; Boutique Awa seed: Dakar 24-48h, Thiès 48-72h, Touba unavailable
@@ -54,6 +54,7 @@ TikTok comment classifier (Jalon 7) remains a separate model decision.
 - [x] Merchant-uploaded product photos in agent tool JSON + `/agent/simulate` `images` (dogfooding point 5 closed; URL never pasted into chat text)
 - [x] WhatsApp Cloud API webhook (`GET`/`POST /whatsapp/webhook`) — RQ job on Redis, worker calls `traiter_message_entrant` once then Graph API send. Merchant routed by `merchants.whatsapp_phone_number_id` (Alembic `0009`). `POST /agent/simulate` unchanged.
 - [x] WhatsApp outbound product photos: worker uploads local files via Graph `/media` then sends `type=image` with `media_id` (not a public `link`). Cap 3 per turn. `extract_product_images` lives in `app/agent/images.py` (simulate unchanged).
+- [x] Close conversations on delivery (`confirmer_livraison`) and 48h inactivity (lazy inbound + RQ `close_stale_conversations` on `maintenance` every 15 min). Sweep preserves `updated_at` so the 15-min reopen grace does not revive a swept thread.
 - [ ] WhatsApp inbound media / voice — non-text inbound is still logged and skipped.
 
 Jalon 3 part 2+ items get added only once that work actually starts.

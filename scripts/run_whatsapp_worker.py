@@ -11,12 +11,16 @@ from redis import Redis
 from rq import Queue, SimpleWorker
 
 from app.core.config import settings
+from app.workers import maintenance as maintenance_jobs  # noqa: F401
 from app.workers import whatsapp as whatsapp_jobs  # noqa: F401
 
 
 def main() -> None:
     connection = Redis.from_url(settings.redis_url)
-    queues = [Queue("whatsapp", connection=connection)]
+    queues = [
+        Queue("whatsapp", connection=connection),
+        Queue("maintenance", connection=connection),
+    ]
     SimpleWorker(queues, connection=connection).work()
 
 

@@ -355,3 +355,79 @@ async def test_get_or_create_closes_stale_reopens_recent_and_skips_escalated() -
             assert returned.status == STATUS_ACTIVE
     finally:
         await _cleanup(merchant.id)
+
+
+@pytest.mark.asyncio
+async def test_fermer_conversations_inactives_sweeps_only_stale_active() -> None:
+    from app.agent.orchestrator import (
+        CONVERSATION_INACTIVITY_TIMEOUT,
+        _get_or_create_conversation,
+    )
+    from app.agent.service import fermer_conversations_inactives
+
+    clerk_user_id = f"user_conv_sweep_{uuid.uuid4()}"
+    merchant = await _seed_merchant(
+        f"pytest-conv-sweep-{uuid.uuid4()}", clerk_user_id
+    )
+    now = datetime.now(timezone.utc)
+    stale_at = now - CONVERSATION_INACTIVITY_TIMEOUT - timedelta(minutes=1)
+    try:
+        stale = await _add_conversation(
+            merchant.id,
+            "+221770001041",
+            status=STATUS_ACTIVE,
+            updated_at=stale_at,
+            messages=[("customer", "ancienne discussion")],
+        )
+        fresh = await _add_conversation(
+            merchant.id,
+            "+221770001042",
+            status=STATUS_ACTIVE,
+            updated_at=now,
+        )
+        escalated = await _add_conversation(
+            merchant.id,
+            "+221770001043",
+            status=STATUS_ESCALATED,
+            updated_at=stale_at,
+        )
+        already_closed = await _add_conversation(
+            merchant.id,
+            "+221770001044",
+            status=STATUS_CLOSED,
+            updated_at=stale_at,
+        )
+        stale_updated_at = stale.updated_at
+
+        async with AsyncSessionLocal() as db:
+            closed_count = await fermer_conversations_inactives(
+                db, CONVERSATION_INACTIVITY_TIMEOUT
+            )
+        assert closed_count >= 1
+
+        async with AsyncSessionLocal() as db:
+            stale_row = await db.get(Conversation, stale.id)
+            fresh_row = await db.get(Conversation, fresh.id)
+            escalated_row = await db.get(Conversation, escalated.id)
+            closed_row = await db.get(Conversation, already_closed.id)
+            assert stale_row is not None
+            assert stale_row.status == STATUS_CLOSED
+            assert stale_row.updated_at == stale_updated_at
+            assert fresh_row is not None
+            assert fresh_row.status == STATUS_ACTIVE
+            assert escalated_row is not None
+            assert escalated_row.status == STATUS_ESCALATED
+            assert closed_row is not None
+            assert closed_row.status == STATUS_CLOSED
+
+            replacement = await _get_or_create_conversation(
+                db, merchant.id, stale.customer_phone
+            )
+            await db.commit()
+            assert replacement.id != stale.id
+            assert replacement.status == STATUS_ACTIVE
+            still_closed = await db.get(Conversation, stale.id)
+            assert still_closed is not None
+            assert still_closed.status == STATUS_CLOSED
+    finally:
+        await _cleanup(merchant.id)
