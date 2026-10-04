@@ -22,6 +22,7 @@ from app.orders.service import (
     InvalidOrderStateError,
     NotFoundError,
     PaymentLinkNotAllowedError,
+    PaymentNotMarkableError,
     annuler_commande_commercant,
     assigner_livreur_commercant,
     confirmer_livraison_commercant,
@@ -32,6 +33,7 @@ from app.orders.service import (
     lister_commandes_commercant,
     lister_livreurs,
     lister_zones_livraison,
+    marquer_commande_payee,
     obtenir_commande_commercant,
     obtenir_disponibilite,
     order_total,
@@ -348,6 +350,22 @@ async def set_merchant_payment_link(
     except NotFoundError as exc:
         raise _not_found_order() from exc
     except PaymentLinkNotAllowedError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return _to_detail(order, names)
+
+
+@router.post("/{order_id}/mark-paid", response_model=MerchantOrderDetail)
+async def mark_merchant_order_paid(
+    order_id: uuid.UUID,
+    merchant: Merchant = Depends(get_current_merchant),
+    db: AsyncSession = Depends(get_db),
+) -> MerchantOrderDetail:
+    try:
+        await marquer_commande_payee(db, merchant.id, order_id)
+        order, names = await obtenir_commande_commercant(db, merchant.id, order_id)
+    except NotFoundError as exc:
+        raise _not_found_order() from exc
+    except (InvalidOrderStateError, PaymentNotMarkableError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     return _to_detail(order, names)
 

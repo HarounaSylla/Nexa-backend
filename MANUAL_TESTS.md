@@ -34,6 +34,7 @@ line, screenshot, or database check) in the Proof column.
 | P1 | Per-merchant order numbers + agent `consulter_commande` | Passed | 2026-10-01. Alembic `0010_order_number`. Concurrent `creer_commande` on Boutique Awa → n°26 and n°27, never duplicated. Authenticated `POST /orders` 401 without token; with Boutique Awa Clerk mock → n°28, `conversation_id` null, ignored body `merchant_id`. Simulate +221770029301 confirmed **commande n°29** (not a UUID); lookup n°29 and “où en est ma commande ?” → recorded, awaiting a deliverer; n°999999 and another phone asking n°29 → honest not found. `pytest` 65 passed. |
 | P1 | RQ cron sweep closes idle conversations without reopening them | Passed | 2026-10-03. Worker `*** Listening on whatsapp, maintenance...`. Scheduler `--interval 30` logged `Enqueued job close_stale_conversations`. Worker: `closed 1 inactive conversation(s)`. Seeded (a) `172724bd-…` active backdated `2026-10-02 01:16:02.596237+00:00` → `closed` with **same** `updated_at`; (b) `56b681a7-…` stayed `active`; (c) `22a91ff4-…` stayed `escalated`. Simulate +221779038001 after sweep → new id `bfbf6090-…`, agent: “Je n’ai pas votre prénom ici.” Restart scheduler enqueued immediately, worker `closed 0`. Simulate +221779038002 while scheduler ran → hijab reply. Frontend maps `closed` → “Fermée”. `pytest` 70 passed. |
 | P1 | Merchant preferences + authenticated delivery zones + agent payment/shop-info lock | Passed | 2026-10-03. Alembic `0012_merchant_prefs`; check `ck_merchant_preferences_one_payment_method`. PUT COD-only + Europe/Paris then GET matches; `Mars/Olympus` → 422; timezone restored to Africa/Dakar. Kaolack declined; tool `verifier_zone_livraison`. En ligne refused, 0 online orders; COD **commande n°35**. Shop Qs answered from config; return policy cleared → escalated; fee cleared → no invented amount. Clock override on `traiter_message_entrant(now=)` (not a public route): Sat 22h → closed until lundi 9h; Tue 11h → « sous peu »; hours unset → « dès que possible ». Tool `online` while disabled → error, 0 orders. GET zones 401 without token. Boutique Awa restored to both payment methods + realistic shop info. `pytest` 76 passed. |
+| P1 | Order payment status is real (COD on delivery, online via mark-paid) | Passed | 2026-10-04. Alembic `0013_backfill_cod_paid` flipped **3** delivered COD rows (`pending`→`paid`): Boutique Awa n°9, n°17, n°33. Created/non-delivered/cancelled and all online rows unchanged (0 delivered online existed). COD n°36 confirm → `GET` `payment_status=paid`. Online n°37 confirm → still `pending`; `POST /orders/{id}/mark-paid` → `paid`; second call 200 unchanged. `mark-paid` on n°36 → 409 exact COD message. `pytest` 82 passed. |
 | P2 | WhatsApp inbound media / voice | Deferred | Inbound non-text is still logged and skipped. Outbound product photos now use `/media` + `media_id`. |
 
 ## RAG query / result pairs (2026-09-07, `voyage-4-lite`)
@@ -669,5 +670,43 @@ image bubbles; a >3-product turn sends at most 3 photos.
 Full pytest after this change: `59 passed in 9.07s`. `/agent/simulate`
 `images` items still only have `product_id` and `image_url`.
 
+### 28. Order payment status (2026-10-04)
 
+Boutique Awa `37292228-b8f5-437d-b8e6-2ff81d4e249d` linked as
+`user_3J3wWGKWhc9mlYbZCmq8ESgHZxl`. Dashboard routes used ASGI + mocked
+`verify_clerk_session_token` for that real linked user. Product
+`cd3f368c-…` (Coque iPhone 15 transparente), deliverer Ibrahima Diop
+`6dbab944-…`.
+
+**Before** `alembic upgrade head` (`0012_merchant_prefs`):
+
+```
+delivered + cash_on_delivery + pending: 3
+  n°9  423bbb6d-… delivered cash_on_delivery pending
+  n°17 00cae1c5-… delivered cash_on_delivery pending
+  n°33 delivered cash_on_delivery pending
+delivered + online: 0 rows
+```
+
+**After** `Running upgrade 0012_merchant_prefs -> 0013_backfill_cod_paid`:
+`0013_backfill_cod_paid` applied; those 3 rows are `paid`. Created (24 COD
++ 3 online), assigned (1 COD), cancelled (3 COD + 1 online) still
+`pending`. Online delivered rows were not touched (none existed).
+
+```
+POST /orders  cash_on_delivery  → n°36  bd8a11bf-…  payment_status=pending
+POST /orders/{id}/assign-deliverer → deliverer_assigned
+POST /orders/{id}/confirm-delivery → status=delivered payment_status=paid
+GET  /orders/bd8a11bf-… → n=36 delivered cash_on_delivery paid
+
+POST /orders  online  → n°37  6558e68b-…  payment_status=pending
+GET  /orders/6558e68b-… → 37 pending
+POST /orders/{id}/confirm-delivery → delivered pending
+POST /orders/{id}/mark-paid → 200 paid
+POST /orders/{id}/mark-paid → 200 paid  (idempotent)
+POST /orders/bd8a11bf-…/mark-paid → 409
+{"detail": "Only online-payment orders can be marked as paid; cash-on-delivery orders are marked paid when delivery is confirmed"}
+```
+
+Full pytest after the feature: `82 passed in 12.32s`.
 

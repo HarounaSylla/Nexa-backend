@@ -16,6 +16,7 @@ from app.orders.models import (
     OrderItem,
     OrderStatus,
     PaymentMethod,
+    PaymentStatus,
     StockMovement,
 )
 from app.orders.service import (
@@ -26,6 +27,7 @@ from app.orders.service import (
     confirmer_livraison,
     consulter_commande,
     creer_commande,
+    marquer_commande_payee,
     obtenir_disponibilite,
     obtenir_zone_livraison,
     normalize_city,
@@ -104,14 +106,19 @@ async def _cleanup(merchant_id: uuid.UUID) -> None:
         await db.commit()
 
 
-async def _place_order(merchant_id: uuid.UUID, product_id: uuid.UUID, quantity: int = 1) -> Order:
+async def _place_order(
+    merchant_id: uuid.UUID,
+    product_id: uuid.UUID,
+    quantity: int = 1,
+    payment_method: PaymentMethod = PaymentMethod.cash_on_delivery,
+) -> Order:
     async with AsyncSessionLocal() as db:
         return await creer_commande(
             db,
             merchant_id=merchant_id,
             customer_phone=PHONE,
             items=[(product_id, quantity)],
-            payment_method=PaymentMethod.cash_on_delivery,
+            payment_method=payment_method,
             delivery_address=ADDRESS,
             ville="Dakar",
         )
@@ -202,6 +209,7 @@ async def test_annuler_commande_restores_stock() -> None:
             assert await obtenir_disponibilite(db, product_id) == 3
             cancelled = await annuler_commande(db, order.id, reason="client changed mind")
             assert cancelled.status == OrderStatus.cancelled
+            assert cancelled.payment_status == PaymentStatus.pending
             assert await obtenir_disponibilite(db, product_id) == 5
     finally:
         await _cleanup(merchant_id)
@@ -220,6 +228,69 @@ async def test_confirmer_livraison_on_cancelled_order_raises() -> None:
             with pytest.raises(InvalidOrderStateError):
                 await confirmer_livraison(db, order.id)
             assert await obtenir_disponibilite(db, product_id) == 2
+    finally:
+        await _cleanup(merchant_id)
+
+
+@pytest.mark.asyncio
+async def test_confirmer_livraison_marks_cod_paid() -> None:
+    merchant_id, product_id = await _make_merchant_product(
+        stock_qty=2,
+        name=f"pytest-cod-paid-{uuid.uuid4()}",
+    )
+    try:
+        order = await _place_order(merchant_id, product_id)
+        assert order.payment_method == PaymentMethod.cash_on_delivery
+        assert order.payment_status == PaymentStatus.pending
+        async with AsyncSessionLocal() as db:
+            delivered = await confirmer_livraison(db, order.id)
+            assert delivered.status == OrderStatus.delivered
+            assert delivered.payment_status == PaymentStatus.paid
+    finally:
+        await _cleanup(merchant_id)
+
+
+@pytest.mark.asyncio
+async def test_confirmer_livraison_leaves_online_pending() -> None:
+    merchant_id, product_id = await _make_merchant_product(
+        stock_qty=2,
+        name=f"pytest-online-pending-{uuid.uuid4()}",
+    )
+    try:
+        order = await _place_order(
+            merchant_id, product_id, payment_method=PaymentMethod.online
+        )
+        assert order.payment_status == PaymentStatus.pending
+        async with AsyncSessionLocal() as db:
+            delivered = await confirmer_livraison(db, order.id)
+            assert delivered.status == OrderStatus.delivered
+            assert delivered.payment_status == PaymentStatus.pending
+    finally:
+        await _cleanup(merchant_id)
+
+
+@pytest.mark.asyncio
+async def test_annuler_commande_does_not_change_payment_status() -> None:
+    merchant_id, product_id = await _make_merchant_product(
+        stock_qty=4,
+        name=f"pytest-cancel-pay-{uuid.uuid4()}",
+    )
+    try:
+        pending = await _place_order(
+            merchant_id, product_id, payment_method=PaymentMethod.online
+        )
+        already_paid = await _place_order(
+            merchant_id, product_id, payment_method=PaymentMethod.online
+        )
+        async with AsyncSessionLocal() as db:
+            marked = await marquer_commande_payee(db, merchant_id, already_paid.id)
+            assert marked.payment_status == PaymentStatus.paid
+            cancelled_pending = await annuler_commande(db, pending.id, reason=None)
+            cancelled_paid = await annuler_commande(db, already_paid.id, reason=None)
+            assert cancelled_pending.status == OrderStatus.cancelled
+            assert cancelled_pending.payment_status == PaymentStatus.pending
+            assert cancelled_paid.status == OrderStatus.cancelled
+            assert cancelled_paid.payment_status == PaymentStatus.paid
     finally:
         await _cleanup(merchant_id)
 

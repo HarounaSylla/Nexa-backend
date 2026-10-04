@@ -64,9 +64,17 @@ Jalon 3 part 2+ items get added only once that work actually starts.
 - [x] Clerk session JWT verification (JWKS); `merchants.clerk_user_id`; onboarding + `/merchants/me` + temp `link-demo`
 - [x] Merchant catalogue management (authenticated): product CRUD, photo upload to `/static` + `product_images` upsert, dashboard category list (no stock filter), category rename. No new `categories` table.
 - [x] Merchant order management (authenticated): list/detail, deliverers list+create, assign/confirm/cancel scoped to the caller, payment-link on `online` orders only (`payment_status` stays `pending`/`paid` — no new enum). `POST /orders` is authenticated (merchant from the session; no `merchant_id` in the body). Delivery-zone routes are authenticated (same session merchant); availability stays unauthenticated.
+- [x] Order `payment_status` is real: cash-on-delivery becomes `paid` when delivery is confirmed; online is marked `paid` by the merchant via `POST /orders/{id}/mark-paid` (idempotent, 409 on COD or cancelled). Cancel does not change `payment_status`. Alembic `0013_backfill_cod_paid` backfills delivered COD rows.
 - [x] Merchant preferences (Alembic `0012_merchant_prefs`): payment methods, timezone, shop address/hours/return policy/fee note/extra info. `GET`/`PUT /merchants/me/preferences`. Agent prompt + `creer_commande` tool lock. Dashboard `POST /orders` is not restricted by preferences.
 - [x] Merchant conversation handoff (authenticated): list (escalated first), thread, human reply (`turn_role=merchant`, no agent loop), return-to-agent (409 if not escalated). Temp `POST /agent/simulate` and `GET /agent/conversations/{id}/messages` left in place; dashboard lives on `/conversations`.
 - [x] Merchant notifications (authenticated): `notifications` table (Alembic `0008`), emitted on successful `creer_commande` (`new_order`; `product_out_of_stock` only when that path zeroes stock) and `escalader_vers_humain` (`conversation_escalated`). Raw `data` JSON, no French copy. `GET /notifications`, `POST /notifications/{id}/read`, `POST /notifications/read-all`. Catalogue stock edits do not notify.
+
+## Payments — later
+
+- `paid_at` timestamp when an order becomes paid
+- Refund handling when a paid order is cancelled
+- Automatic online payment confirmation via a provider webhook
+- Un-marking a payment marked by mistake
 
 ## Preferences — later
 

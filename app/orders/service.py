@@ -408,6 +408,8 @@ async def confirmer_livraison(db: AsyncSession, order_id: uuid.UUID) -> Order:
         if order.status == OrderStatus.delivered:
             raise InvalidOrderStateError(order.id, order.status, "confirm delivery of")
         order.status = OrderStatus.delivered
+        if order.payment_method == PaymentMethod.cash_on_delivery:
+            order.payment_status = PaymentStatus.paid
         for item in order.items:
             db.add(
                 StockMovement(
@@ -474,6 +476,16 @@ class PaymentLinkNotAllowedError(ValueError):
     def __init__(self) -> None:
         super().__init__(
             "A payment link can only be set on an online-payment order"
+        )
+
+
+class PaymentNotMarkableError(ValueError):
+    """Raised when mark-paid is used on a non-online order."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            "Only online-payment orders can be marked as paid; "
+            "cash-on-delivery orders are marked paid when delivery is confirmed"
         )
 
 
@@ -559,6 +571,32 @@ async def annuler_commande_commercant(
 ) -> Order:
     await _owned_order(db, merchant_id, order_id)
     return await annuler_commande(db, order_id, reason)
+
+
+async def marquer_commande_payee(
+    db: AsyncSession,
+    merchant_id: uuid.UUID,
+    order_id: uuid.UUID,
+) -> Order:
+    """Mark an online order as paid. Idempotent if already paid."""
+    await _owned_order(db, merchant_id, order_id)
+    try:
+        order = await _get_order_for_update(db, order_id)
+        if order.status == OrderStatus.cancelled:
+            raise InvalidOrderStateError(order.id, order.status, "mark as paid")
+        if order.payment_method != PaymentMethod.online:
+            raise PaymentNotMarkableError()
+        if order.payment_status != PaymentStatus.paid:
+            order.payment_status = PaymentStatus.paid
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
+
+    result = await db.execute(
+        select(Order).options(selectinload(Order.items)).where(Order.id == order.id)
+    )
+    return result.scalar_one()
 
 
 async def enregistrer_lien_paiement(

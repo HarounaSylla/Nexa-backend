@@ -216,6 +216,7 @@ async def test_assign_confirm_cancel_through_authenticated_routes() -> None:
                 )
                 assert confirmed.status_code == 200, confirmed.text
                 assert confirmed.json()["status"] == OrderStatus.delivered.value
+                assert confirmed.json()["payment_status"] == PaymentStatus.paid.value
 
                 async with AsyncSessionLocal() as db:
                     stock_before_cancel = await obtenir_disponibilite(db, product.id)
@@ -227,6 +228,7 @@ async def test_assign_confirm_cancel_through_authenticated_routes() -> None:
                 )
                 assert cancelled.status_code == 200, cancelled.text
                 assert cancelled.json()["status"] == OrderStatus.cancelled.value
+                assert cancelled.json()["payment_status"] == PaymentStatus.pending.value
 
                 async with AsyncSessionLocal() as db:
                     stock_after_cancel = await obtenir_disponibilite(db, product.id)
@@ -476,5 +478,132 @@ async def test_delivery_zone_routes_are_authenticated_and_merchant_scoped() -> N
             still = await db.get(DeliveryZone, uuid.UUID(other_zone_id))
             assert still is not None
             assert still.merchant_id == other.id
+    finally:
+        await _cleanup(owner.id, other.id)
+
+
+@pytest.mark.asyncio
+async def test_mark_paid_online_idempotent_and_allowed_after_delivery() -> None:
+    clerk_user_id = f"user_ord_mark_{uuid.uuid4()}"
+    merchant, product = await _seed_shop(
+        name=f"pytest-ord-mark-{uuid.uuid4()}",
+        clerk_user_id=clerk_user_id,
+        stock_qty=6,
+    )
+    try:
+        online = await _place(
+            merchant.id, product.id, payment_method=PaymentMethod.online
+        )
+        delivered_online = await _place(
+            merchant.id, product.id, payment_method=PaymentMethod.online
+        )
+        with _auth(clerk_user_id):
+            async with await _client() as client:
+                first = await client.post(
+                    f"/orders/{online.id}/mark-paid", headers=_headers()
+                )
+                assert first.status_code == 200, first.text
+                assert first.json()["payment_status"] == PaymentStatus.paid.value
+                assert first.json()["payment_method"] == PaymentMethod.online.value
+
+                second = await client.post(
+                    f"/orders/{online.id}/mark-paid", headers=_headers()
+                )
+                assert second.status_code == 200, second.text
+                assert second.json()["payment_status"] == PaymentStatus.paid.value
+
+                confirmed = await client.post(
+                    f"/orders/{delivered_online.id}/confirm-delivery",
+                    headers=_headers(),
+                )
+                assert confirmed.status_code == 200, confirmed.text
+                assert confirmed.json()["status"] == OrderStatus.delivered.value
+                assert confirmed.json()["payment_status"] == PaymentStatus.pending.value
+
+                after_delivery = await client.post(
+                    f"/orders/{delivered_online.id}/mark-paid",
+                    headers=_headers(),
+                )
+                assert after_delivery.status_code == 200, after_delivery.text
+                assert after_delivery.json()["payment_status"] == PaymentStatus.paid.value
+    finally:
+        await _cleanup(merchant.id)
+
+
+@pytest.mark.asyncio
+async def test_mark_paid_rejected_on_cod_and_cancelled_online() -> None:
+    clerk_user_id = f"user_ord_mark_rej_{uuid.uuid4()}"
+    merchant, product = await _seed_shop(
+        name=f"pytest-ord-mark-rej-{uuid.uuid4()}",
+        clerk_user_id=clerk_user_id,
+        stock_qty=4,
+    )
+    try:
+        cod = await _place(
+            merchant.id, product.id, payment_method=PaymentMethod.cash_on_delivery
+        )
+        online = await _place(
+            merchant.id, product.id, payment_method=PaymentMethod.online
+        )
+        with _auth(clerk_user_id):
+            async with await _client() as client:
+                cancelled = await client.post(
+                    f"/orders/{online.id}/cancel", headers=_headers()
+                )
+                assert cancelled.status_code == 200, cancelled.text
+                assert cancelled.json()["payment_status"] == PaymentStatus.pending.value
+
+                on_cod = await client.post(
+                    f"/orders/{cod.id}/mark-paid", headers=_headers()
+                )
+                assert on_cod.status_code == 409, on_cod.text
+                assert on_cod.json()["detail"] == (
+                    "Only online-payment orders can be marked as paid; "
+                    "cash-on-delivery orders are marked paid when delivery is confirmed"
+                )
+
+                on_cancelled = await client.post(
+                    f"/orders/{online.id}/mark-paid", headers=_headers()
+                )
+                assert on_cancelled.status_code == 409, on_cancelled.text
+                assert "mark as paid" in on_cancelled.json()["detail"]
+
+                detail_cod = await client.get(f"/orders/{cod.id}", headers=_headers())
+                assert detail_cod.json()["payment_status"] == PaymentStatus.pending.value
+                detail_online = await client.get(
+                    f"/orders/{online.id}", headers=_headers()
+                )
+                assert detail_online.json()["payment_status"] == PaymentStatus.pending.value
+    finally:
+        await _cleanup(merchant.id)
+
+
+@pytest.mark.asyncio
+async def test_mark_paid_404_other_merchant_and_401_without_token() -> None:
+    owner_clerk = f"user_ord_mark_a_{uuid.uuid4()}"
+    other_clerk = f"user_ord_mark_b_{uuid.uuid4()}"
+    owner, _owner_product = await _seed_shop(
+        name=f"pytest-ord-mark-a-{uuid.uuid4()}",
+        clerk_user_id=owner_clerk,
+    )
+    other, other_product = await _seed_shop(
+        name=f"pytest-ord-mark-b-{uuid.uuid4()}",
+        clerk_user_id=other_clerk,
+    )
+    try:
+        theirs = await _place(
+            other.id, other_product.id, payment_method=PaymentMethod.online
+        )
+        async with await _client() as client:
+            unauth = await client.post(f"/orders/{theirs.id}/mark-paid")
+            assert unauth.status_code == 401
+
+        with _auth(owner_clerk):
+            async with await _client() as client:
+                stolen = await client.post(
+                    f"/orders/{theirs.id}/mark-paid", headers=_headers()
+                )
+                assert stolen.status_code == 404
+                assert stolen.json()["detail"] == "Order was not found"
     finally:
         await _cleanup(owner.id, other.id)
