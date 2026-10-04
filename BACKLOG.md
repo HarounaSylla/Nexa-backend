@@ -67,6 +67,7 @@ Jalon 3 part 2+ items get added only once that work actually starts.
 - [x] Order `payment_status` is real: cash-on-delivery becomes `paid` when delivery is confirmed; online is marked `paid` by the merchant via `POST /orders/{id}/mark-paid` (idempotent, 409 on COD or cancelled). Cancel does not change `payment_status`. Alembic `0013_backfill_cod_paid` backfills delivered COD rows.
 - [x] Merchant preferences (Alembic `0012_merchant_prefs`): payment methods, timezone, shop address/hours/return policy/fee note/extra info. `GET`/`PUT /merchants/me/preferences`. Agent prompt + `creer_commande` tool lock. Dashboard `POST /orders` is not restricted by preferences.
 - [x] Merchant conversation handoff (authenticated): list (escalated first), thread, human reply (`turn_role=merchant`, no agent loop), return-to-agent (409 if not escalated). Temp `POST /agent/simulate` and `GET /agent/conversations/{id}/messages` left in place; dashboard lives on `/conversations`.
+- [x] Merchant replies and payment links reach the customer on WhatsApp (`envoyer_message_commercant`). `POST /conversations/{id}/reply` sends then stores (502 + no row on send failure). `POST /orders/{id}/send-payment-link` replaces `PATCH .../payment-link`: save link, send French message, set `payment_link_sent_at` (Alembic `0014`). `/agent/simulate` conversations cannot receive replies (fake phones).
 - [x] Merchant notifications (authenticated): `notifications` table (Alembic `0008`), emitted on successful `creer_commande` (`new_order`; `product_out_of_stock` only when that path zeroes stock) and `escalader_vers_humain` (`conversation_escalated`). Raw `data` JSON, no French copy. `GET /notifications`, `POST /notifications/{id}/read`, `POST /notifications/read-all`. Catalogue stock edits do not notify.
 
 ## Payments — later
@@ -75,6 +76,9 @@ Jalon 3 part 2+ items get added only once that work actually starts.
 - Refund handling when a paid order is cancelled
 - Automatic online payment confirmation via a provider webhook
 - Un-marking a payment marked by mistake
+- Inbound payment-proof photos (next step)
+- WhatsApp message templates for sending after the 24 h window
+- A "Renvoyer" retry queue for failed merchant sends
 
 ## Preferences — later
 

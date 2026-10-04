@@ -21,6 +21,7 @@ from app.auth.deps import get_current_merchant
 from app.catalogue.models import Merchant
 from app.core.db import get_db
 from app.orders.service import NotFoundError
+from app.whatsapp.service import WhatsAppSendError
 
 # Temporary scaffolding to drive the agent by HTTP before the WhatsApp
 # webhook exists (Jalon 3 part 2). Not the final API surface; no auth.
@@ -189,12 +190,14 @@ async def reply_as_merchant(
 ) -> MerchantMessageOut:
     try:
         message = await repondre_en_humain(
-            db, merchant.id, conversation_id, body.message
+            db, merchant, conversation_id, body.message
         )
     except NotFoundError as exc:
         raise _not_found_conversation() from exc
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except WhatsAppSendError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     return MerchantMessageOut(
         id=message.id,
         turn_role=message.turn_role,

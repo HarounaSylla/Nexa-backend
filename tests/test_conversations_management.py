@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime, timedelta, timezone
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
@@ -57,9 +57,18 @@ async def _cleanup(*merchant_ids: uuid.UUID) -> None:
         await db.commit()
 
 
-async def _seed_merchant(name: str, clerk_user_id: str) -> Merchant:
+async def _seed_merchant(
+    name: str,
+    clerk_user_id: str,
+    *,
+    whatsapp_phone_number_id: str | None = None,
+) -> Merchant:
     async with AsyncSessionLocal() as db:
-        merchant = Merchant(name=name, clerk_user_id=clerk_user_id)
+        merchant = Merchant(
+            name=name,
+            clerk_user_id=clerk_user_id,
+            whatsapp_phone_number_id=whatsapp_phone_number_id,
+        )
         db.add(merchant)
         await db.commit()
         await db.refresh(merchant)
@@ -171,7 +180,9 @@ async def test_conversation_list_and_thread_are_merchant_scoped() -> None:
 async def test_human_reply_is_merchant_role_and_does_not_call_agent() -> None:
     clerk_user_id = f"user_conv_reply_{uuid.uuid4()}"
     merchant = await _seed_merchant(
-        f"pytest-conv-reply-{uuid.uuid4()}", clerk_user_id
+        f"pytest-conv-reply-{uuid.uuid4()}",
+        clerk_user_id,
+        whatsapp_phone_number_id=f"pnid-reply-{uuid.uuid4()}",
     )
     try:
         conversation = await _add_conversation(
@@ -188,6 +199,10 @@ async def test_human_reply_is_merchant_role_and_does_not_call_agent() -> None:
             _auth(clerk_user_id),
             patch("app.agent.orchestrator.traiter_message_entrant") as agent_loop,
             patch("app.agent.tools.execute_tool") as tools,
+            patch("app.whatsapp.service.settings.whatsapp_access_token", "tok"),
+            patch(
+                "app.whatsapp.service.envoyer_texte_whatsapp", new_callable=AsyncMock
+            ) as send,
         ):
             async with await _client() as client:
                 replied = await client.post(
@@ -209,6 +224,9 @@ async def test_human_reply_is_merchant_role_and_does_not_call_agent() -> None:
                 assert roles == ["customer", "agent", TURN_ROLE_MERCHANT]
                 assert texts[-1] == "Bonjour, je m'en occupe."
 
+        send.assert_awaited_once()
+        assert send.await_args.args[0] == "+221770001011"
+        assert send.await_args.args[1] == "Bonjour, je m'en occupe."
         agent_loop.assert_not_called()
         tools.assert_not_called()
     finally:
@@ -431,3 +449,123 @@ async def test_fermer_conversations_inactives_sweeps_only_stale_active() -> None
             assert still_closed.status == STATUS_CLOSED
     finally:
         await _cleanup(merchant.id)
+
+
+@pytest.mark.asyncio
+async def test_human_reply_send_failure_is_502_and_stores_nothing() -> None:
+    from app.whatsapp.service import WhatsAppSendError
+
+    clerk_user_id = f"user_conv_reply_fail_{uuid.uuid4()}"
+    merchant = await _seed_merchant(
+        f"pytest-conv-reply-fail-{uuid.uuid4()}",
+        clerk_user_id,
+        whatsapp_phone_number_id=f"pnid-fail-{uuid.uuid4()}",
+    )
+    try:
+        conversation = await _add_conversation(
+            merchant.id,
+            "+221770001012",
+            status=STATUS_ESCALATED,
+            messages=[("customer", "hello")],
+        )
+        with (
+            _auth(clerk_user_id),
+            patch("app.whatsapp.service.settings.whatsapp_access_token", "tok"),
+            patch(
+                "app.agent.service.envoyer_message_commercant",
+                new_callable=AsyncMock,
+                side_effect=WhatsAppSendError("whatsapp_window_closed"),
+            ),
+        ):
+            async with await _client() as client:
+                failed = await client.post(
+                    f"/conversations/{conversation.id}/reply",
+                    headers=_headers(),
+                    json={"message": "On vous rappelle."},
+                )
+                assert failed.status_code == 502, failed.text
+                assert failed.json()["detail"] == "whatsapp_window_closed"
+
+        async with AsyncSessionLocal() as db:
+            rows = list(
+                (
+                    await db.execute(
+                        select(Message.turn_role, Message.display_text).where(
+                            Message.conversation_id == conversation.id
+                        )
+                    )
+                ).all()
+            )
+        assert rows == [("customer", "hello")]
+    finally:
+        await _cleanup(merchant.id)
+
+
+@pytest.mark.asyncio
+async def test_human_reply_404_empty_and_unauth_do_not_send() -> None:
+    owner_clerk = f"user_conv_reply_scope_{uuid.uuid4()}"
+    other_clerk = f"user_conv_reply_other_{uuid.uuid4()}"
+    owner = await _seed_merchant(
+        f"pytest-conv-reply-scope-{uuid.uuid4()}",
+        owner_clerk,
+        whatsapp_phone_number_id=f"pnid-scope-{uuid.uuid4()}",
+    )
+    other = await _seed_merchant(
+        f"pytest-conv-reply-other-{uuid.uuid4()}",
+        other_clerk,
+        whatsapp_phone_number_id=f"pnid-other-{uuid.uuid4()}",
+    )
+    try:
+        theirs = await _add_conversation(
+            other.id,
+            "+221770001013",
+            status=STATUS_ESCALATED,
+            messages=[("customer", "secret")],
+        )
+        mine = await _add_conversation(
+            owner.id,
+            "+221770001014",
+            status=STATUS_ESCALATED,
+            messages=[("customer", "ok")],
+        )
+        with (
+            _auth(owner_clerk),
+            patch("app.whatsapp.service.settings.whatsapp_access_token", "tok"),
+            patch(
+                "app.whatsapp.service.envoyer_texte_whatsapp", new_callable=AsyncMock
+            ) as send,
+        ):
+            async with await _client() as client:
+                hidden = await client.post(
+                    f"/conversations/{theirs.id}/reply",
+                    headers=_headers(),
+                    json={"message": "should not send"},
+                )
+                assert hidden.status_code == 404
+                assert hidden.json()["detail"] == "Conversation was not found"
+
+                empty = await client.post(
+                    f"/conversations/{mine.id}/reply",
+                    headers=_headers(),
+                    json={"message": ""},
+                )
+                assert empty.status_code == 422
+
+                blank = await client.post(
+                    f"/conversations/{mine.id}/reply",
+                    headers=_headers(),
+                    json={"message": "   "},
+                )
+                assert blank.status_code == 400
+                assert "empty" in blank.json()["detail"]
+
+        send.assert_not_called()
+
+        async with await _client() as client:
+            unauth = await client.post(
+                f"/conversations/{mine.id}/reply",
+                json={"message": "no token"},
+            )
+            assert unauth.status_code == 401
+    finally:
+        await _cleanup(owner.id, other.id)

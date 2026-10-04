@@ -1,11 +1,12 @@
 import uuid
 from decimal import Decimal
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 import pytest
 from sqlalchemy import delete, select
 
+from app.agent.models import Conversation, Message
 from app.catalogue.models import Merchant, Product
 from app.core.db import AsyncSessionLocal
 from app.main import app
@@ -57,6 +58,22 @@ async def _cleanup(*merchant_ids: uuid.UUID) -> None:
             )
             await db.execute(delete(OrderItem).where(OrderItem.order_id.in_(order_ids)))
             await db.execute(delete(Order).where(Order.id.in_(order_ids)))
+        conversation_ids = list(
+            (
+                await db.execute(
+                    select(Conversation.id).where(
+                        Conversation.merchant_id.in_(merchant_ids)
+                    )
+                )
+            ).scalars().all()
+        )
+        if conversation_ids:
+            await db.execute(
+                delete(Message).where(Message.conversation_id.in_(conversation_ids))
+            )
+            await db.execute(
+                delete(Conversation).where(Conversation.id.in_(conversation_ids))
+            )
         await db.execute(
             delete(Deliverer).where(Deliverer.merchant_id.in_(merchant_ids))
         )
@@ -74,9 +91,14 @@ async def _seed_shop(
     clerk_user_id: str,
     stock_qty: int = 10,
     price: str = "1000.00",
+    whatsapp_phone_number_id: str | None = None,
 ) -> tuple[Merchant, Product]:
     async with AsyncSessionLocal() as db:
-        merchant = Merchant(name=name, clerk_user_id=clerk_user_id)
+        merchant = Merchant(
+            name=name,
+            clerk_user_id=clerk_user_id,
+            whatsapp_phone_number_id=whatsapp_phone_number_id,
+        )
         db.add(merchant)
         await db.flush()
         product = Product(
@@ -279,44 +301,306 @@ async def test_assign_confirm_cancel_404_for_other_merchant_order() -> None:
         await _cleanup(owner.id, other.id)
 
 
+def test_build_payment_link_message_exact_text() -> None:
+    from app.orders.service import build_payment_link_message
+
+    first = build_payment_link_message(
+        12, Decimal("25000.00"), "https://pay.example.com/x", updated=False
+    )
+    assert first == (
+        "Bonjour, voici le lien pour régler votre commande n°12 (25 000 FCFA) :\n"
+        "https://pay.example.com/x\n"
+        "\n"
+        "Après le paiement, envoyez-nous ici une photo ou une capture "
+        "d'écran de la preuve de paiement, en indiquant le numéro de "
+        "commande 12. Plusieurs clients peuvent payer avec le même lien : "
+        "c'est cette preuve qui nous permet de retrouver votre paiement."
+    )
+    updated = build_payment_link_message(
+        12, Decimal("25000.00"), "https://pay.example.com/y", updated=True
+    )
+    assert updated.startswith(
+        "Bonjour, voici le lien mis à jour pour régler votre commande "
+        "n°12 (25 000 FCFA) :"
+    )
+    assert "https://pay.example.com/y" in updated
+    assert "preuve de paiement" in updated
+
+
+async def _attach_conversation(
+    merchant_id: uuid.UUID, order_id: uuid.UUID, phone: str
+) -> Conversation:
+    async with AsyncSessionLocal() as db:
+        conversation = Conversation(
+            merchant_id=merchant_id,
+            customer_phone=phone,
+            status="active",
+        )
+        db.add(conversation)
+        await db.flush()
+        order = await db.get(Order, order_id)
+        assert order is not None
+        order.conversation_id = conversation.id
+        await db.commit()
+        await db.refresh(conversation)
+        return conversation
+
+
 @pytest.mark.asyncio
-async def test_payment_link_rejected_on_cod_accepted_on_online() -> None:
+async def test_send_payment_link_success_resend_and_no_conversation() -> None:
     clerk_user_id = f"user_ord_pay_{uuid.uuid4()}"
     merchant, product = await _seed_shop(
         name=f"pytest-ord-pay-{uuid.uuid4()}",
         clerk_user_id=clerk_user_id,
-        stock_qty=5,
+        stock_qty=8,
+        price="25000.00",
+        whatsapp_phone_number_id=f"pnid-pay-{uuid.uuid4()}",
     )
     try:
-        cod = await _place(
-            merchant.id, product.id, payment_method=PaymentMethod.cash_on_delivery
-        )
         online = await _place(
             merchant.id, product.id, payment_method=PaymentMethod.online
         )
-        link = "https://pay.example.com/nexa-test"
+        conversation = await _attach_conversation(
+            merchant.id, online.id, online.customer_phone
+        )
+        orphan = await _place(
+            merchant.id, product.id, payment_method=PaymentMethod.online
+        )
+        first_link = "https://pay.example.com/nexa-test"
+        second_link = "https://pay.example.com/nexa-updated"
+
+        with (
+            _auth(clerk_user_id),
+            patch("app.whatsapp.service.settings.whatsapp_access_token", "tok"),
+            patch(
+                "app.whatsapp.service.envoyer_texte_whatsapp", new_callable=AsyncMock
+            ) as send,
+        ):
+            async with await _client() as client:
+                accepted = await client.post(
+                    f"/orders/{online.id}/send-payment-link",
+                    headers=_headers(),
+                    json={"payment_link": first_link},
+                )
+                assert accepted.status_code == 200, accepted.text
+                body = accepted.json()
+                assert body["payment_link"] == first_link
+                assert body["payment_status"] == PaymentStatus.pending.value
+                assert body["payment_link_sent_at"] is not None
+
+                resent = await client.post(
+                    f"/orders/{online.id}/send-payment-link",
+                    headers=_headers(),
+                    json={"payment_link": second_link},
+                )
+                assert resent.status_code == 200, resent.text
+                assert resent.json()["payment_link"] == second_link
+                assert resent.json()["payment_link_sent_at"] is not None
+
+                orphaned = await client.post(
+                    f"/orders/{orphan.id}/send-payment-link",
+                    headers=_headers(),
+                    json={"payment_link": first_link},
+                )
+                assert orphaned.status_code == 200, orphaned.text
+                assert orphaned.json()["payment_link_sent_at"] is not None
+
+        assert send.await_count == 3
+        first_text = send.await_args_list[0].args[1]
+        assert str(online.order_number) in first_text
+        assert "25 000 FCFA" in first_text
+        assert first_link in first_text
+        assert "preuve de paiement" in first_text
+        assert "mis à jour" not in first_text
+        second_text = send.await_args_list[1].args[1]
+        assert "mis à jour" in second_text
+        assert second_link in second_text
+
+        async with AsyncSessionLocal() as db:
+            stored = list(
+                (
+                    await db.execute(
+                        select(Message).where(
+                            Message.conversation_id == conversation.id
+                        )
+                    )
+                ).scalars().all()
+            )
+            assert len(stored) == 2
+            assert stored[0].turn_role == "merchant"
+            assert stored[0].items == []
+            assert str(online.order_number) in stored[0].display_text
+            assert first_link in stored[0].display_text
+            assert "preuve de paiement" in stored[0].display_text
+            assert "mis à jour" in stored[1].display_text
+    finally:
+        await _cleanup(merchant.id)
+
+
+@pytest.mark.asyncio
+async def test_send_payment_link_failures_and_rules() -> None:
+    from app.whatsapp.service import WhatsAppSendError
+
+    clerk_user_id = f"user_ord_pay_fail_{uuid.uuid4()}"
+    other_clerk = f"user_ord_pay_other_{uuid.uuid4()}"
+    merchant, product = await _seed_shop(
+        name=f"pytest-ord-pay-fail-{uuid.uuid4()}",
+        clerk_user_id=clerk_user_id,
+        stock_qty=8,
+        whatsapp_phone_number_id=f"pnid-fail-{uuid.uuid4()}",
+    )
+    bare, bare_product = await _seed_shop(
+        name=f"pytest-ord-pay-bare-{uuid.uuid4()}",
+        clerk_user_id=f"user_ord_pay_bare_{uuid.uuid4()}",
+        stock_qty=3,
+    )
+    other, other_product = await _seed_shop(
+        name=f"pytest-ord-pay-other-{uuid.uuid4()}",
+        clerk_user_id=other_clerk,
+        stock_qty=3,
+        whatsapp_phone_number_id=f"pnid-other-{uuid.uuid4()}",
+    )
+    try:
+        online = await _place(
+            merchant.id, product.id, payment_method=PaymentMethod.online
+        )
+        window = await _place(
+            merchant.id, product.id, payment_method=PaymentMethod.online
+        )
+        conversation = await _attach_conversation(
+            merchant.id, window.id, window.customer_phone
+        )
+        generic = await _place(
+            merchant.id, product.id, payment_method=PaymentMethod.online
+        )
+        cod = await _place(
+            merchant.id, product.id, payment_method=PaymentMethod.cash_on_delivery
+        )
+        cancelled = await _place(
+            merchant.id, product.id, payment_method=PaymentMethod.online
+        )
+        paid = await _place(
+            merchant.id, product.id, payment_method=PaymentMethod.online
+        )
+        bare_online = await _place(
+            bare.id, bare_product.id, payment_method=PaymentMethod.online
+        )
+        theirs = await _place(
+            other.id, other_product.id, payment_method=PaymentMethod.online
+        )
+        link = "https://pay.example.com/nexa-fail"
 
         with _auth(clerk_user_id):
             async with await _client() as client:
-                rejected = await client.patch(
-                    f"/orders/{cod.id}/payment-link",
-                    headers=_headers(),
-                    json={"payment_link": link},
+                cancelled_resp = await client.post(
+                    f"/orders/{cancelled.id}/cancel", headers=_headers()
                 )
-                assert rejected.status_code == 409, rejected.text
-                assert "online-payment" in rejected.json()["detail"]
+                assert cancelled_resp.status_code == 200
+                paid_resp = await client.post(
+                    f"/orders/{paid.id}/mark-paid", headers=_headers()
+                )
+                assert paid_resp.status_code == 200
 
-                accepted = await client.patch(
-                    f"/orders/{online.id}/payment-link",
+        with (
+            _auth(clerk_user_id),
+            patch("app.whatsapp.service.settings.whatsapp_access_token", "tok"),
+            patch(
+                "app.whatsapp.service.envoyer_message_commercant",
+                new_callable=AsyncMock,
+                side_effect=[
+                    WhatsAppSendError("whatsapp_window_closed"),
+                    WhatsAppSendError("whatsapp_send_failed"),
+                ],
+            ) as send,
+        ):
+            async with await _client() as client:
+                closed = await client.post(
+                    f"/orders/{window.id}/send-payment-link",
                     headers=_headers(),
                     json={"payment_link": link},
                 )
-                assert accepted.status_code == 200, accepted.text
-                assert accepted.json()["payment_link"] == link
-                assert accepted.json()["payment_status"] == PaymentStatus.pending.value
-                assert accepted.json()["payment_method"] == PaymentMethod.online.value
+                assert closed.status_code == 502, closed.text
+                assert closed.json()["detail"] == "whatsapp_window_closed"
+
+                failed = await client.post(
+                    f"/orders/{generic.id}/send-payment-link",
+                    headers=_headers(),
+                    json={"payment_link": link},
+                )
+                assert failed.status_code == 502
+                assert failed.json()["detail"] == "whatsapp_send_failed"
+
+                on_cod = await client.post(
+                    f"/orders/{cod.id}/send-payment-link",
+                    headers=_headers(),
+                    json={"payment_link": link},
+                )
+                assert on_cod.status_code == 409
+                assert "online-payment" in on_cod.json()["detail"]
+
+                on_cancelled = await client.post(
+                    f"/orders/{cancelled.id}/send-payment-link",
+                    headers=_headers(),
+                    json={"payment_link": link},
+                )
+                assert on_cancelled.status_code == 409
+                assert "send a payment link for" in on_cancelled.json()["detail"]
+
+                on_paid = await client.post(
+                    f"/orders/{paid.id}/send-payment-link",
+                    headers=_headers(),
+                    json={"payment_link": link},
+                )
+                assert on_paid.status_code == 409
+                assert on_paid.json()["detail"] == "This order is already paid"
+
+                stolen = await client.post(
+                    f"/orders/{theirs.id}/send-payment-link",
+                    headers=_headers(),
+                    json={"payment_link": link},
+                )
+                assert stolen.status_code == 404
+
+        assert send.await_count == 2
+
+        async with AsyncSessionLocal() as db:
+            window_row = await db.get(Order, window.id)
+            generic_row = await db.get(Order, generic.id)
+            assert window_row is not None
+            assert window_row.payment_link == link
+            assert window_row.payment_link_sent_at is None
+            assert generic_row is not None
+            assert generic_row.payment_link == link
+            assert generic_row.payment_link_sent_at is None
+            stored = list(
+                (
+                    await db.execute(
+                        select(Message).where(
+                            Message.conversation_id == conversation.id
+                        )
+                    )
+                ).scalars().all()
+            )
+            assert stored == []
+
+        with _auth(bare.clerk_user_id):
+            async with await _client() as client:
+                unconfigured = await client.post(
+                    f"/orders/{bare_online.id}/send-payment-link",
+                    headers=_headers(),
+                    json={"payment_link": link},
+                )
+                assert unconfigured.status_code == 502
+                assert unconfigured.json()["detail"] == "whatsapp_not_configured"
+
+        async with await _client() as client:
+            unauth = await client.post(
+                f"/orders/{online.id}/send-payment-link",
+                json={"payment_link": link},
+            )
+            assert unauth.status_code == 401
     finally:
-        await _cleanup(merchant.id)
+        await _cleanup(merchant.id, bare.id, other.id)
 
 
 @pytest.mark.asyncio

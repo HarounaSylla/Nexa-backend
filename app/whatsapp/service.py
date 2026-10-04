@@ -14,6 +14,7 @@ from typing import Any
 
 import httpx
 
+from app.catalogue.models import Merchant
 from app.catalogue.service import chemin_photo_locale
 from app.core.config import settings
 
@@ -175,6 +176,52 @@ async def envoyer_texte_whatsapp(
                 response.text,
             )
             raise
+
+
+GRAPH_WINDOW_CLOSED_CODE = 131047
+
+
+class WhatsAppSendError(Exception):
+    """code is one of: whatsapp_not_configured, whatsapp_window_closed, whatsapp_send_failed"""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+def _graph_error_code(response: httpx.Response) -> int | None:
+    try:
+        payload = response.json()
+    except ValueError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return None
+    try:
+        return int(error["code"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+async def envoyer_message_commercant(
+    merchant: Merchant, customer_phone: str, text: str
+) -> None:
+    """Send a merchant-authored text to a customer on WhatsApp."""
+    phone_number_id = (merchant.whatsapp_phone_number_id or "").strip()
+    if not phone_number_id or not settings.whatsapp_access_token:
+        raise WhatsAppSendError("whatsapp_not_configured")
+    try:
+        await envoyer_texte_whatsapp(customer_phone, text, phone_number_id)
+    except RuntimeError as exc:
+        raise WhatsAppSendError("whatsapp_not_configured") from exc
+    except httpx.HTTPStatusError as exc:
+        if _graph_error_code(exc.response) == GRAPH_WINDOW_CLOSED_CODE:
+            raise WhatsAppSendError("whatsapp_window_closed") from exc
+        raise WhatsAppSendError("whatsapp_send_failed") from exc
+    except httpx.RequestError as exc:
+        raise WhatsAppSendError("whatsapp_send_failed") from exc
 
 
 _IMAGE_CONTENT_TYPES = {

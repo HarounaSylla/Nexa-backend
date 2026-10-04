@@ -16,11 +16,13 @@ from app.orders.models import (
     PaymentMethod,
     PaymentStatus,
 )
+from app.whatsapp.service import WhatsAppSendError
 from app.orders.service import (
     DeliveryNotAvailableError,
     InsufficientStockError,
     InvalidOrderStateError,
     NotFoundError,
+    OrderAlreadyPaidError,
     PaymentLinkNotAllowedError,
     PaymentNotMarkableError,
     annuler_commande_commercant,
@@ -29,7 +31,7 @@ from app.orders.service import (
     creer_commande,
     creer_livreur,
     creer_ou_maj_zone_livraison,
-    enregistrer_lien_paiement,
+    envoyer_lien_paiement,
     lister_commandes_commercant,
     lister_livreurs,
     lister_zones_livraison,
@@ -148,6 +150,7 @@ class AssignedDelivererOut(BaseModel):
 class MerchantOrderDetail(MerchantOrderListItem):
     items: list[MerchantOrderItemOut]
     deliverer: AssignedDelivererOut | None
+    payment_link_sent_at: datetime | None
 
 
 class PaymentLinkRequest(BaseModel):
@@ -230,6 +233,7 @@ def _to_detail(
             for item in order.items
         ],
         deliverer=deliverer,
+        payment_link_sent_at=order.payment_link_sent_at,
     )
 
 
@@ -335,22 +339,29 @@ async def get_merchant_order(
     return _to_detail(order, names)
 
 
-@router.patch("/{order_id}/payment-link", response_model=MerchantOrderDetail)
-async def set_merchant_payment_link(
+@router.post("/{order_id}/send-payment-link", response_model=MerchantOrderDetail)
+async def send_merchant_payment_link(
     order_id: uuid.UUID,
     body: PaymentLinkRequest,
     merchant: Merchant = Depends(get_current_merchant),
     db: AsyncSession = Depends(get_db),
 ) -> MerchantOrderDetail:
+    merchant_id = merchant.id
     try:
-        await enregistrer_lien_paiement(
-            db, merchant.id, order_id, str(body.payment_link)
+        await envoyer_lien_paiement(
+            db, merchant, order_id, str(body.payment_link)
         )
-        order, names = await obtenir_commande_commercant(db, merchant.id, order_id)
+        order, names = await obtenir_commande_commercant(db, merchant_id, order_id)
     except NotFoundError as exc:
         raise _not_found_order() from exc
-    except PaymentLinkNotAllowedError as exc:
+    except (
+        PaymentLinkNotAllowedError,
+        InvalidOrderStateError,
+        OrderAlreadyPaidError,
+    ) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except WhatsAppSendError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
     return _to_detail(order, names)
 
 

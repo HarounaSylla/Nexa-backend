@@ -80,6 +80,15 @@ def _merchant_settings_block(
             "If the customer asks to pay à la livraison, say politely that this "
             "shop does not take that method and that payment is en ligne."
         )
+    if preferences.accepts_online_payment:
+        lines.append(
+            "When an order paid en ligne has just been confirmed, add one "
+            "short, separate sentence after the delivery-window sentence: the "
+            "shop will send the payment link here on WhatsApp, and after "
+            "paying the customer should send a photo of the proof of payment "
+            "with the order number. Do not promise a time. Never write a "
+            "payment link yourself."
+        )
 
     if preferences.delivery_fee_note:
         lines.append(

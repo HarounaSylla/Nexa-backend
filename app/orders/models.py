@@ -130,6 +130,10 @@ class Order(Base):
         server_default=text("'pending'"),
     )
     payment_link: Mapped[str | None] = mapped_column(String, nullable=True)
+    payment_link_sent_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
     delivery_address: Mapped[str] = mapped_column(Text, nullable=False)
     city: Mapped[str | None] = mapped_column(String, nullable=True)
     deliverer_id: Mapped[uuid.UUID | None] = mapped_column(

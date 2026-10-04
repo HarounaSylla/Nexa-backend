@@ -222,6 +222,8 @@ def test_build_system_prompt_merchant_settings_and_rule_9() -> None:
     )["content"]
     assert "Never offer online payment" not in both
     assert "Never offer cash on delivery" not in both
+    assert "payment link here on WhatsApp" in both
+    assert "proof of payment" in both
     assert "Cities we deliver to: Dakar, Thiès" in both
     assert "Touba" not in both
     assert "Grand Yoff" not in both.split("Merchant settings:")[0]
@@ -257,6 +259,8 @@ def test_build_system_prompt_merchant_settings_and_rule_9() -> None:
     )["content"]
     assert "Never offer online payment" in cod_only
     assert "Never offer cash on delivery" not in cod_only
+    assert "payment link here on WhatsApp" not in cod_only
+    assert "proof of payment" not in cod_only
     assert "<shop_info>" in cod_only
     assert "Adresse: Sacré-Cœur" in cod_only
     assert "Horaires: Lundi au samedi, 9h à 19h" in cod_only
@@ -275,3 +279,5 @@ def test_build_system_prompt_merchant_settings_and_rule_9() -> None:
     assert "Never offer cash on delivery" in online_only
     assert "Never offer online payment" not in online_only
     assert "payment link after the order" in online_only
+    assert "payment link here on WhatsApp" in online_only
+    assert "proof of payment" in online_only

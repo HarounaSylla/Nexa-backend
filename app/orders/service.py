@@ -1,6 +1,7 @@
 import unicodedata
 import uuid
 from collections import defaultdict
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from sqlalchemy import delete, select
@@ -8,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.catalogue.models import Merchant, Product
+from app.core.formatting import format_fcfa
 from app.notifications.service import (
     NotificationRelatedType,
     NotificationType,
@@ -489,6 +491,41 @@ class PaymentNotMarkableError(ValueError):
         )
 
 
+class OrderAlreadyPaidError(ValueError):
+    """Raised when a payment link is sent for an already-paid order."""
+
+    def __init__(self) -> None:
+        super().__init__("This order is already paid")
+
+
+def build_payment_link_message(
+    order_number: int,
+    total: Decimal,
+    payment_link: str,
+    updated: bool,
+) -> str:
+    amount = format_fcfa(total)
+    first = (
+        f"Bonjour, voici le lien mis à jour pour régler votre commande "
+        f"n°{order_number} ({amount}) :"
+        if updated
+        else (
+            f"Bonjour, voici le lien pour régler votre commande "
+            f"n°{order_number} ({amount}) :"
+        )
+    )
+    return (
+        f"{first}\n"
+        f"{payment_link}\n"
+        "\n"
+        "Après le paiement, envoyez-nous ici une photo ou une capture "
+        "d'écran de la preuve de paiement, en indiquant le numéro de "
+        f"commande {order_number}. Plusieurs clients peuvent payer avec "
+        "le même lien : c'est cette preuve qui nous permet de retrouver "
+        "votre paiement."
+    )
+
+
 def order_total(items: list[OrderItem]) -> Decimal:
     return sum(
         (item.unit_price * item.quantity for item in items),
@@ -599,17 +636,53 @@ async def marquer_commande_payee(
     return result.scalar_one()
 
 
-async def enregistrer_lien_paiement(
+async def envoyer_lien_paiement(
     db: AsyncSession,
-    merchant_id: uuid.UUID,
+    merchant: Merchant,
     order_id: uuid.UUID,
     payment_link: str,
 ) -> Order:
+    from app.agent.service import enregistrer_message_commercant
+    from app.whatsapp.service import envoyer_message_commercant
+
+    merchant_id = merchant.id
+    sender = Merchant(
+        whatsapp_phone_number_id=merchant.whatsapp_phone_number_id
+    )
     order = await _owned_order(db, merchant_id, order_id)
     if order.payment_method != PaymentMethod.online:
         raise PaymentLinkNotAllowedError()
+    if order.status == OrderStatus.cancelled:
+        raise InvalidOrderStateError(order.id, order.status, "send a payment link for")
+    if order.payment_status == PaymentStatus.paid:
+        raise OrderAlreadyPaidError()
+
+    updated = order.payment_link_sent_at is not None
     order.payment_link = payment_link
     await db.commit()
+
+    result = await db.execute(
+        select(Order).options(selectinload(Order.items)).where(Order.id == order.id)
+    )
+    order = result.scalar_one()
+    customer_phone = order.customer_phone
+    conversation_id = order.conversation_id
+    text = build_payment_link_message(
+        order.order_number,
+        order_total(list(order.items)),
+        payment_link,
+        updated,
+    )
+    await db.rollback()
+
+    await envoyer_message_commercant(sender, customer_phone, text)
+
+    order = await _owned_order(db, merchant_id, order_id)
+    order.payment_link_sent_at = datetime.now(timezone.utc)
+    if conversation_id is not None:
+        await enregistrer_message_commercant(db, conversation_id, text)
+    await db.commit()
+
     result = await db.execute(
         select(Order).options(selectinload(Order.items)).where(Order.id == order.id)
     )

@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import json
 import uuid
-from decimal import Decimal
 from typing import Any
 
 from pydantic import BaseModel
+
+from app.core.formatting import format_fcfa
 
 
 class ProductImageRef(BaseModel):
@@ -82,11 +83,6 @@ def product_names_from_items(items: list[Any] | None) -> dict[uuid.UUID, str]:
     return names
 
 
-def _format_price_fcfa(price: Any) -> str:
-    value = int(Decimal(str(price)))
-    return f"{value:,}".replace(",", " ") + " FCFA"
-
-
 def product_descriptions_from_items(items: list[Any] | None) -> dict[uuid.UUID, str]:
     """'<name> — <price> FCFA' per product, built from the same tool output
     data already used for extract_product_images / product_names_from_items
@@ -113,13 +109,13 @@ def product_descriptions_from_items(items: list[Any] | None) -> dict[uuid.UUID, 
             price = product.get("price")
             if raw_id and name and price is not None:
                 descriptions[uuid.UUID(str(raw_id))] = (
-                    f"{name} — {_format_price_fcfa(price)}"
+                    f"{name} — {format_fcfa(price)}"
                 )
         raw_id = payload.get("product_id")
         name = payload.get("name")
         price = payload.get("price")
         if raw_id and name and price is not None:
             descriptions[uuid.UUID(str(raw_id))] = (
-                f"{name} — {_format_price_fcfa(price)}"
+                f"{name} — {format_fcfa(price)}"
             )
     return descriptions

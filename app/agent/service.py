@@ -7,12 +7,14 @@ from sqlalchemy import case, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.models import Conversation, Message, SentProductImage
+from app.catalogue.models import Merchant
 from app.notifications.service import (
     NotificationRelatedType,
     NotificationType,
     emit_notification,
 )
 from app.orders.service import NotFoundError
+from app.whatsapp.service import envoyer_message_commercant
 
 STATUS_ACTIVE = "active"
 STATUS_ESCALATED = "escalated"
@@ -249,17 +251,43 @@ async def lister_messages_commercant(
     return await lister_messages(db, conversation_id)
 
 
+async def enregistrer_message_commercant(
+    db: AsyncSession, conversation_id: uuid.UUID, text: str
+) -> None:
+    """Persist a merchant message already delivered. Does not commit."""
+    conversation = await db.get(Conversation, conversation_id)
+    if conversation is None:
+        return
+    db.add(
+        Message(
+            conversation_id=conversation.id,
+            turn_role=TURN_ROLE_MERCHANT,
+            display_text=text,
+            items=[],
+        )
+    )
+    conversation.updated_at = datetime.now(timezone.utc)
+
+
 async def repondre_en_humain(
     db: AsyncSession,
-    merchant_id: uuid.UUID,
+    merchant: Merchant,
     conversation_id: uuid.UUID,
     message: str,
 ) -> Message:
-    """Append a merchant message. Does not call the agent or any tool."""
+    """Send a merchant reply on WhatsApp, then store it. Does not call the agent."""
+    merchant_id = merchant.id
+    sender = Merchant(
+        whatsapp_phone_number_id=merchant.whatsapp_phone_number_id
+    )
     conversation = await _owned_conversation(db, merchant_id, conversation_id)
     text = message.strip()
     if not text:
         raise ValueError("message must not be empty")
+    customer_phone = conversation.customer_phone
+    await db.rollback()
+    await envoyer_message_commercant(sender, customer_phone, text)
+    conversation = await _owned_conversation(db, merchant_id, conversation_id)
     row = Message(
         conversation_id=conversation.id,
         turn_role=TURN_ROLE_MERCHANT,

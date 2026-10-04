@@ -35,6 +35,7 @@ line, screenshot, or database check) in the Proof column.
 | P1 | RQ cron sweep closes idle conversations without reopening them | Passed | 2026-10-03. Worker `*** Listening on whatsapp, maintenance...`. Scheduler `--interval 30` logged `Enqueued job close_stale_conversations`. Worker: `closed 1 inactive conversation(s)`. Seeded (a) `172724bd-…` active backdated `2026-10-02 01:16:02.596237+00:00` → `closed` with **same** `updated_at`; (b) `56b681a7-…` stayed `active`; (c) `22a91ff4-…` stayed `escalated`. Simulate +221779038001 after sweep → new id `bfbf6090-…`, agent: “Je n’ai pas votre prénom ici.” Restart scheduler enqueued immediately, worker `closed 0`. Simulate +221779038002 while scheduler ran → hijab reply. Frontend maps `closed` → “Fermée”. `pytest` 70 passed. |
 | P1 | Merchant preferences + authenticated delivery zones + agent payment/shop-info lock | Passed | 2026-10-03. Alembic `0012_merchant_prefs`; check `ck_merchant_preferences_one_payment_method`. PUT COD-only + Europe/Paris then GET matches; `Mars/Olympus` → 422; timezone restored to Africa/Dakar. Kaolack declined; tool `verifier_zone_livraison`. En ligne refused, 0 online orders; COD **commande n°35**. Shop Qs answered from config; return policy cleared → escalated; fee cleared → no invented amount. Clock override on `traiter_message_entrant(now=)` (not a public route): Sat 22h → closed until lundi 9h; Tue 11h → « sous peu »; hours unset → « dès que possible ». Tool `online` while disabled → error, 0 orders. GET zones 401 without token. Boutique Awa restored to both payment methods + realistic shop info. `pytest` 76 passed. |
 | P1 | Order payment status is real (COD on delivery, online via mark-paid) | Passed | 2026-10-04. Alembic `0013_backfill_cod_paid` flipped **3** delivered COD rows (`pending`→`paid`): Boutique Awa n°9, n°17, n°33. Created/non-delivered/cancelled and all online rows unchanged (0 delivered online existed). COD n°36 confirm → `GET` `payment_status=paid`. Online n°37 confirm → still `pending`; `POST /orders/{id}/mark-paid` → `paid`; second call 200 unchanged. `mark-paid` on n°36 → 409 exact COD message. `pytest` 82 passed. |
+| P1 | Merchant replies and payment links are sent on WhatsApp | Passed | 2026-10-04. Alembic `0014_payment_link_sent_at`. Agent online confirmation (Boutique Awa n°43, +221772738363) includes the separate “lien de paiement ici sur WhatsApp” / “preuve de paiement” sentence. `POST /orders/7a93368c-…/send-payment-link` and `POST /conversations/417e1a05-…/reply` both hit live Graph and returned **502 `whatsapp_send_failed`** (token expired, Graph 401/190); link saved, `payment_link_sent_at` still null, no merchant row stored. Unit tests cover `whatsapp_not_configured` (no phone id) and `whatsapp_window_closed` (131047). `/agent/simulate` conversations cannot receive replies. Phone screenshot blocked until `WHATSAPP_ACCESS_TOKEN` is refreshed. `pytest` 90 passed. |
 | P2 | WhatsApp inbound media / voice | Deferred | Inbound non-text is still logged and skipped. Outbound product photos now use `/media` + `media_id`. |
 
 ## RAG query / result pairs (2026-09-07, `voyage-4-lite`)
@@ -709,4 +710,51 @@ POST /orders/bd8a11bf-…/mark-paid → 409
 ```
 
 Full pytest after the feature: `82 passed in 12.32s`.
+
+### 29. Merchant WhatsApp send — payment link + dashboard reply (2026-10-04)
+
+Boutique Awa `37292228-b8f5-437d-b8e6-2ff81d4e249d` / Clerk
+`user_3J3wWGKWhc9mlYbZCmq8ESgHZxl` / Cloud API phone
+`1229802316893138`. Customer phone `+221772738363` (existing Awa
+thread `417e1a05-…`). `/agent/simulate` conversations cannot receive
+replies (fake phones → 502).
+
+`alembic upgrade head` → `0014_payment_link_sent_at`.
+
+Agent confirmation after online order n°43 (`7a93368c-587c-4be2-b7b5-bfc390b70b5a`):
+
+```
+Merci pour votre commande 😊
+Le numéro de votre commande est le 43.
+Un livreur vous appellera juste avant de passer.
+Retenez que le délai de livraison est entre 24 h et 48 h. …
+Nous vous enverrons le lien de paiement ici sur WhatsApp. Après paiement, envoyez une photo de la preuve de paiement avec le numéro de commande.
+```
+
+Live Graph send (token expired, code 190):
+
+```
+POST /orders/7a93368c-…/send-payment-link
+502 {"detail":"whatsapp_send_failed"}
+GET  /orders/7a93368c-… → payment_link=https://pay.wave.com/nexa-awa-proof  payment_link_sent_at=null
+
+POST /conversations/417e1a05-…/reply
+502 {"detail":"whatsapp_send_failed"}
+```
+
+502 unit tests (no network):
+
+```
+tests/test_whatsapp_merchant_send.py::test_envoyer_message_commercant_not_configured_without_phone_id PASSED
+tests/test_whatsapp_merchant_send.py::test_envoyer_message_commercant_not_configured_without_token PASSED
+tests/test_whatsapp_merchant_send.py::test_envoyer_message_commercant_maps_graph_and_network_errors PASSED
+tests/test_conversations_management.py::test_human_reply_send_failure_is_502_and_stores_nothing PASSED
+tests/test_orders_management.py::test_send_payment_link_failures_and_rules PASSED
+```
+
+Phone screenshot for the payment-link / reply texts needs a fresh
+`WHATSAPP_ACCESS_TOKEN`. Retry `send-payment-link` on n°43 (link already
+saved) then `reply` on `417e1a05-…`.
+
+Full pytest after the feature: `90 passed in 13.30s`.
 
