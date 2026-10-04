@@ -37,6 +37,7 @@ class PaymentMethod(str, enum.Enum):
 
 class PaymentStatus(str, enum.Enum):
     pending = "pending"
+    proof_received = "proof_received"
     paid = "paid"
 
 

@@ -16,6 +16,7 @@ from app.orders.models import (
     PaymentMethod,
     PaymentStatus,
 )
+from app.proofs.service import lister_preuves_commande
 from app.whatsapp.service import WhatsAppSendError
 from app.orders.service import (
     DeliveryNotAvailableError,
@@ -25,6 +26,7 @@ from app.orders.service import (
     OrderAlreadyPaidError,
     PaymentLinkNotAllowedError,
     PaymentNotMarkableError,
+    ProofRejectionNotAllowedError,
     annuler_commande_commercant,
     assigner_livreur_commercant,
     confirmer_livraison_commercant,
@@ -32,6 +34,7 @@ from app.orders.service import (
     creer_livreur,
     creer_ou_maj_zone_livraison,
     envoyer_lien_paiement,
+    rejeter_preuve,
     lister_commandes_commercant,
     lister_livreurs,
     lister_zones_livraison,
@@ -147,10 +150,19 @@ class AssignedDelivererOut(BaseModel):
     phone: str
 
 
+class OrderProofOut(BaseModel):
+    id: uuid.UUID
+    classification: str
+    detected_amount: Decimal | None
+    created_at: datetime
+
+
 class MerchantOrderDetail(MerchantOrderListItem):
     items: list[MerchantOrderItemOut]
     deliverer: AssignedDelivererOut | None
     payment_link_sent_at: datetime | None
+    conversation_id: uuid.UUID | None = None
+    proofs: list[OrderProofOut] = []
 
 
 class PaymentLinkRequest(BaseModel):
@@ -234,7 +246,27 @@ def _to_detail(
         ],
         deliverer=deliverer,
         payment_link_sent_at=order.payment_link_sent_at,
+        conversation_id=order.conversation_id,
+        proofs=[],
     )
+
+
+async def _detail_for(
+    db: AsyncSession, merchant_id: uuid.UUID, order_id: uuid.UUID
+) -> MerchantOrderDetail:
+    order, names = await obtenir_commande_commercant(db, merchant_id, order_id)
+    detail = _to_detail(order, names)
+    proofs = await lister_preuves_commande(db, order.id)
+    detail.proofs = [
+        OrderProofOut(
+            id=row.id,
+            classification=row.classification,
+            detected_amount=row.detected_amount,
+            created_at=row.created_at,
+        )
+        for row in proofs
+    ]
+    return detail
 
 
 def _not_found_order() -> HTTPException:
@@ -333,10 +365,9 @@ async def get_merchant_order(
     db: AsyncSession = Depends(get_db),
 ) -> MerchantOrderDetail:
     try:
-        order, names = await obtenir_commande_commercant(db, merchant.id, order_id)
+        return await _detail_for(db, merchant.id, order_id)
     except NotFoundError as exc:
         raise _not_found_order() from exc
-    return _to_detail(order, names)
 
 
 @router.post("/{order_id}/send-payment-link", response_model=MerchantOrderDetail)
@@ -351,7 +382,7 @@ async def send_merchant_payment_link(
         await envoyer_lien_paiement(
             db, merchant, order_id, str(body.payment_link)
         )
-        order, names = await obtenir_commande_commercant(db, merchant_id, order_id)
+        return await _detail_for(db, merchant_id, order_id)
     except NotFoundError as exc:
         raise _not_found_order() from exc
     except (
@@ -362,7 +393,6 @@ async def send_merchant_payment_link(
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except WhatsAppSendError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
-    return _to_detail(order, names)
 
 
 @router.post("/{order_id}/mark-paid", response_model=MerchantOrderDetail)
@@ -373,12 +403,26 @@ async def mark_merchant_order_paid(
 ) -> MerchantOrderDetail:
     try:
         await marquer_commande_payee(db, merchant.id, order_id)
-        order, names = await obtenir_commande_commercant(db, merchant.id, order_id)
+        return await _detail_for(db, merchant.id, order_id)
     except NotFoundError as exc:
         raise _not_found_order() from exc
     except (InvalidOrderStateError, PaymentNotMarkableError) as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
-    return _to_detail(order, names)
+
+
+@router.post("/{order_id}/reject-proof", response_model=MerchantOrderDetail)
+async def reject_merchant_order_proof(
+    order_id: uuid.UUID,
+    merchant: Merchant = Depends(get_current_merchant),
+    db: AsyncSession = Depends(get_db),
+) -> MerchantOrderDetail:
+    try:
+        await rejeter_preuve(db, merchant.id, order_id)
+        return await _detail_for(db, merchant.id, order_id)
+    except NotFoundError as exc:
+        raise _not_found_order() from exc
+    except (InvalidOrderStateError, ProofRejectionNotAllowedError) as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @router.post("", response_model=OrderOut)

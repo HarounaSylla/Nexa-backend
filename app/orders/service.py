@@ -498,6 +498,22 @@ class OrderAlreadyPaidError(ValueError):
         super().__init__("This order is already paid")
 
 
+class ProofRejectionNotAllowedError(ValueError):
+    """Raised when reject-proof is called on a paid order."""
+
+    def __init__(self) -> None:
+        super().__init__("This order is already paid")
+
+
+def phone_lookup_variants(phone: str) -> list[str]:
+    raw = (phone or "").strip()
+    if not raw:
+        return []
+    plus = raw if raw.startswith("+") else f"+{raw}"
+    bare = raw.lstrip("+")
+    return list(dict.fromkeys([raw, plus, bare]))
+
+
 def build_payment_link_message(
     order_number: int,
     total: Decimal,
@@ -630,6 +646,86 @@ async def marquer_commande_payee(
         await db.rollback()
         raise
 
+    result = await db.execute(
+        select(Order).options(selectinload(Order.items)).where(Order.id == order.id)
+    )
+    return result.scalar_one()
+
+
+async def commandes_en_attente_de_preuve(
+    db: AsyncSession, merchant_id: uuid.UUID, customer_phone: str
+) -> list[Order]:
+    variants = phone_lookup_variants(customer_phone)
+    if not variants:
+        return []
+    result = await db.execute(
+        select(Order)
+        .where(
+            Order.merchant_id == merchant_id,
+            Order.customer_phone.in_(variants),
+            Order.payment_method == PaymentMethod.online,
+            Order.status != OrderStatus.cancelled,
+            Order.payment_status.in_(
+                (PaymentStatus.pending, PaymentStatus.proof_received)
+            ),
+            Order.payment_link_sent_at.is_not(None),
+        )
+        .order_by(Order.created_at.desc(), Order.id.desc())
+    )
+    return list(result.scalars().all())
+
+
+async def appliquer_preuve_recue(db: AsyncSession, order_id: uuid.UUID) -> Order:
+    """Set pending → proof_received under the usual row lock. Does not commit."""
+    order = await _get_order_for_update(db, order_id)
+    if order.payment_status == PaymentStatus.pending:
+        order.payment_status = PaymentStatus.proof_received
+    return order
+
+
+async def lister_commandes_par_conversations(
+    db: AsyncSession,
+    merchant_id: uuid.UUID,
+    conversation_ids: list[uuid.UUID],
+    *,
+    limit_per_conversation: int = 10,
+) -> dict[uuid.UUID, list[Order]]:
+    if not conversation_ids:
+        return {}
+    result = await db.execute(
+        select(Order)
+        .where(
+            Order.merchant_id == merchant_id,
+            Order.conversation_id.in_(conversation_ids),
+        )
+        .order_by(Order.created_at.desc(), Order.id.desc())
+    )
+    grouped: dict[uuid.UUID, list[Order]] = {cid: [] for cid in conversation_ids}
+    for order in result.scalars().all():
+        if order.conversation_id is None:
+            continue
+        bucket = grouped.setdefault(order.conversation_id, [])
+        if len(bucket) < limit_per_conversation:
+            bucket.append(order)
+    return grouped
+
+
+async def rejeter_preuve(
+    db: AsyncSession, merchant_id: uuid.UUID, order_id: uuid.UUID
+) -> Order:
+    await _owned_order(db, merchant_id, order_id)
+    try:
+        order = await _get_order_for_update(db, order_id)
+        if order.status == OrderStatus.cancelled:
+            raise InvalidOrderStateError(order.id, order.status, "reject proof for")
+        if order.payment_status == PaymentStatus.paid:
+            raise ProofRejectionNotAllowedError()
+        if order.payment_status == PaymentStatus.proof_received:
+            order.payment_status = PaymentStatus.pending
+        await db.commit()
+    except Exception:
+        await db.rollback()
+        raise
     result = await db.execute(
         select(Order).options(selectinload(Order.items)).where(Order.id == order.id)
     )

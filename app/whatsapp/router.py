@@ -13,7 +13,9 @@ from app.core.config import settings
 from app.core.db import get_db
 from app.merchants.service import get_merchant_by_whatsapp_phone_number_id
 from app.whatsapp.service import (
+    enqueue_inbound_image,
     enqueue_inbound_text,
+    extract_image_messages,
     extract_text_messages,
     signature_verification_enabled,
     verify_signature,
@@ -78,6 +80,25 @@ async def receive_webhook(
             item["message_id"],
             item["customer_phone"],
             item["message_text"],
+            item["phone_number_id"],
+        )
+    for item in extract_image_messages(payload):
+        merchant = await get_merchant_by_whatsapp_phone_number_id(
+            db, item["phone_number_id"]
+        )
+        if merchant is None:
+            logger.warning(
+                "Dropping WhatsApp image %s: no merchant for phone_number_id=%s",
+                item["whatsapp_message_id"],
+                item["phone_number_id"],
+            )
+            continue
+        enqueue_inbound_image(
+            item["customer_phone"],
+            item["whatsapp_message_id"],
+            item["media_id"],
+            item["mime_type"],
+            item["caption"],
             item["phone_number_id"],
         )
     return Response(status_code=200)

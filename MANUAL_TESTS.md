@@ -36,7 +36,8 @@ line, screenshot, or database check) in the Proof column.
 | P1 | Merchant preferences + authenticated delivery zones + agent payment/shop-info lock | Passed | 2026-10-03. Alembic `0012_merchant_prefs`; check `ck_merchant_preferences_one_payment_method`. PUT COD-only + Europe/Paris then GET matches; `Mars/Olympus` → 422; timezone restored to Africa/Dakar. Kaolack declined; tool `verifier_zone_livraison`. En ligne refused, 0 online orders; COD **commande n°35**. Shop Qs answered from config; return policy cleared → escalated; fee cleared → no invented amount. Clock override on `traiter_message_entrant(now=)` (not a public route): Sat 22h → closed until lundi 9h; Tue 11h → « sous peu »; hours unset → « dès que possible ». Tool `online` while disabled → error, 0 orders. GET zones 401 without token. Boutique Awa restored to both payment methods + realistic shop info. `pytest` 76 passed. |
 | P1 | Order payment status is real (COD on delivery, online via mark-paid) | Passed | 2026-10-04. Alembic `0013_backfill_cod_paid` flipped **3** delivered COD rows (`pending`→`paid`): Boutique Awa n°9, n°17, n°33. Created/non-delivered/cancelled and all online rows unchanged (0 delivered online existed). COD n°36 confirm → `GET` `payment_status=paid`. Online n°37 confirm → still `pending`; `POST /orders/{id}/mark-paid` → `paid`; second call 200 unchanged. `mark-paid` on n°36 → 409 exact COD message. `pytest` 82 passed. |
 | P1 | Merchant replies and payment links are sent on WhatsApp | Passed | 2026-10-04. Alembic `0014_payment_link_sent_at`. Agent online confirmation (Boutique Awa n°43, +221772738363) includes the separate “lien de paiement ici sur WhatsApp” / “preuve de paiement” sentence. `POST /orders/7a93368c-…/send-payment-link` and `POST /conversations/417e1a05-…/reply` both hit live Graph and returned **502 `whatsapp_send_failed`** (token expired, Graph 401/190); link saved, `payment_link_sent_at` still null, no merchant row stored. Unit tests cover `whatsapp_not_configured` (no phone id) and `whatsapp_window_closed` (131047). `/agent/simulate` conversations cannot receive replies. Phone screenshot blocked until `WHATSAPP_ACCESS_TOKEN` is refreshed. `pytest` 90 passed. |
-| P2 | WhatsApp inbound media / voice | Deferred | Inbound non-text is still logged and skipped. Outbound product photos now use `/media` + `media_id`. |
+| P1 | Inbound payment-proof photos + conversation ↔ order links | Code landed (live webhook blocked) | 2026-10-04. Alembic `0015_payment_proofs`: enum `pending`/`paid`/`proof_received`; `inbound_images`. `alembic downgrade -1` then `upgrade head` works (downgrade drops the default, recasts, restores `'pending'`). `pytest` **101 passed**. Stubbed replay (same handler the worker calls; Meta + vision mocked) created Boutique Awa **n°46** `ab1cc4fb-…` → `proof_received`, image `55554ba2-…`, notification `9bd271cc-…`, ack stored. `GET /images/55554ba2-…` → **200 `image/png` `Cache-Control: private, no-store`**. Seed script `Nexa/proofs/seed_inbound_proof.py`: n°47 `0761704d-…` image `663812e9-…`; unmatched conv `e9bdfa60-…` image `a41d1c00-…`. Live phone procedure in §28 (blocked on token/tunnel). |
+| P2 | WhatsApp inbound voice / PDF | Deferred | Images are handled (payment-proof pipeline). Voice and documents are still logged and skipped. |
 
 ## RAG query / result pairs (2026-09-07, `voyage-4-lite`)
 
@@ -757,4 +758,74 @@ Phone screenshot for the payment-link / reply texts needs a fresh
 saved) then `reply` on `417e1a05-…`.
 
 Full pytest after the feature: `90 passed in 13.30s`.
+
+## 28. Live inbound payment-proof photo (when the webhook works)
+
+Blocked today: `WHATSAPP_ACCESS_TOKEN` expired (Graph 401/190) and the tunnel
+is down. Code path is the RQ image job → `traiter_image_entrante` (same
+function as the stubbed replay below). Do this on a real phone after the
+token and webhook are restored.
+
+1. Confirm `GET /whatsapp/webhook` handshake and that the worker is listening
+   on the `whatsapp` queue.
+2. Use an **online** Boutique Awa order whose payment link was sent through
+   Nexa (`payment_link_sent_at` set). n°43 (`7a93368c-…`) still needs a
+   successful `POST /orders/{id}/send-payment-link` (link is saved, timestamp
+   is still null until Graph accepts the send).
+3. From the customer phone, send a **photo / screenshot** of a payment
+   confirmation with caption `n°{order_number}` (or just the photo if that
+   phone has only one awaiting-proof order).
+4. Expect: image stored under `MEDIA_DIR` (not `/static`); thread row
+   `display_text` = caption or `Photo`; `inbound_images.classification=payment_proof`;
+   order `payment_status=proof_received` (**not** `paid`); customer ack
+   `Merci, nous avons bien reçu votre photo. La boutique va vérifier votre paiement.`;
+   merchant notification “Preuve de paiement reçue — commande #{n} : à vérifier.”
+5. `GET /images/{id}` with a merchant session → 200, `Content-Type` of the
+   file, `Cache-Control: private, no-store`. Other merchant → 404.
+6. `POST /orders/{id}/mark-paid` → `paid`. Or `POST /orders/{id}/reject-proof`
+   → `pending` (images kept). A second photo after reject is analysed again.
+7. Negative: photo from a phone with no awaiting-proof order (no link sent,
+   COD, paid, cancelled, or no order) → file + thread row,
+   `classification=not_analyzed`, no vision call, no ack, no notification.
+8. `proof_received` must never be shown as paid in the UI.
+
+Stubbed replay used while the webhook was down (2026-10-04),
+`uv run python ../proofs/replay_inbound_proof.py` from `Nexa/backend`:
+
+```
+created_order_id ab1cc4fb-c65b-4d71-be42-df3b0d2173c8
+order_number 46
+conversation_id 73cacfa1-2497-43e5-832f-304986cf424a
+product Baskets blanches homme ac0fae1f-…
+inbound_images 55554ba2-…  classification=payment_proof  order_id=ab1cc4fb-…
+order payment_status=proof_received
+notification 9bd271cc-…  "Preuve de paiement reçue — commande #46 : à vérifier."
+messages customer "n°46" + merchant ack
+GET /images/55554ba2-…  200  image/png  Cache-Control: private, no-store
+```
+
+Frontend seed (outside the repo): `uv run python ../proofs/seed_inbound_proof.py --demo-awa`
+
+```
+matched n°47 0761704d-…  image 663812e9-…
+unmatched conversation e9bdfa60-…  image a41d1c00-…  classification=unknown
+GET /images/663812e9-…  200  image/png  private, no-store
+```
+
+Alembic cycle:
+
+```
+payment_status values: ['pending', 'paid', 'proof_received']
+inbound_images: inbound_images
+alembic_version: 0015_payment_proofs
+alembic downgrade -1
+payment_status values: ['pending', 'paid']
+inbound_images: None
+alembic_version: 0014_payment_link_sent_at
+alembic upgrade head
+payment_status values: ['pending', 'paid', 'proof_received']
+```
+
+Full pytest after the feature: `101 passed in 15.42s`.
+
 

@@ -10,3 +10,4 @@ dist
 build
 app/static/product_images/*
 !app/static/product_images/.gitkeep
+data/private_media/

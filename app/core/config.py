@@ -56,6 +56,8 @@ class Settings(BaseSettings):
     clerk_jwks_url: str = ""
     # Comma-separated origins allowed in the token azp claim (and CORS).
     clerk_authorized_parties: str = "http://localhost:3000"
+    # Private inbound media (payment proofs). Never under /static.
+    media_dir: str = "./data/private_media"
 
     def clerk_authorized_party_list(self) -> list[str]:
         return [

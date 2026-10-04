@@ -72,11 +72,12 @@ def extract_text_messages(payload: dict[str, Any]) -> list[dict[str, str]]:
                     continue
                 message_type = message.get("type")
                 if message_type != "text":
-                    logger.info(
-                        "Ignoring non-text WhatsApp message type=%s id=%s",
-                        message_type,
-                        message.get("id"),
-                    )
+                    if message_type != "image":
+                        logger.info(
+                            "Ignoring non-text WhatsApp message type=%s id=%s",
+                            message_type,
+                            message.get("id"),
+                        )
                     continue
                 text_obj = message.get("text") or {}
                 body = ""
@@ -96,6 +97,56 @@ def extract_text_messages(payload: dict[str, Any]) -> list[dict[str, str]]:
                         "message_id": message_id,
                         "customer_phone": customer_phone,
                         "message_text": body,
+                        "phone_number_id": phone_number_id,
+                    }
+                )
+    return found
+
+
+def extract_image_messages(payload: dict[str, Any]) -> list[dict[str, str]]:
+    """Pull inbound image messages from a Cloud API webhook body."""
+    found: list[dict[str, str]] = []
+    for entry in payload.get("entry") or []:
+        if not isinstance(entry, dict):
+            continue
+        for change in entry.get("changes") or []:
+            if not isinstance(change, dict):
+                continue
+            value = change.get("value") or {}
+            if not isinstance(value, dict):
+                continue
+            metadata = value.get("metadata") or {}
+            phone_number_id = ""
+            if isinstance(metadata, dict):
+                phone_number_id = str(metadata.get("phone_number_id") or "")
+            for message in value.get("messages") or []:
+                if not isinstance(message, dict):
+                    continue
+                if message.get("type") != "image":
+                    continue
+                image_obj = message.get("image") or {}
+                if not isinstance(image_obj, dict):
+                    continue
+                media_id = str(image_obj.get("id") or "")
+                mime_type = str(image_obj.get("mime_type") or "")
+                caption = image_obj.get("caption")
+                caption_text = str(caption) if caption is not None else ""
+                message_id = str(message.get("id") or "")
+                customer_phone = str(message.get("from") or "")
+                if not message_id or not customer_phone or not media_id:
+                    logger.warning(
+                        "Skipping incomplete image message id=%s from=%s",
+                        message.get("id"),
+                        message.get("from"),
+                    )
+                    continue
+                found.append(
+                    {
+                        "customer_phone": customer_phone,
+                        "whatsapp_message_id": message_id,
+                        "media_id": media_id,
+                        "mime_type": mime_type,
+                        "caption": caption_text,
                         "phone_number_id": phone_number_id,
                     }
                 )
@@ -136,6 +187,73 @@ def enqueue_inbound_text(
         message_text,
         phone_number_id,
     )
+
+
+def enqueue_inbound_image(
+    customer_phone: str,
+    whatsapp_message_id: str,
+    media_id: str,
+    mime_type: str,
+    caption: str,
+    phone_number_id: str,
+) -> None:
+    from redis import Redis
+    from rq import Queue
+
+    from app.workers.whatsapp import process_inbound_whatsapp_image
+
+    queue = Queue("whatsapp", connection=Redis.from_url(settings.redis_url))
+    queue.enqueue(
+        process_inbound_whatsapp_image,
+        customer_phone,
+        whatsapp_message_id,
+        media_id,
+        mime_type,
+        caption,
+        phone_number_id,
+    )
+
+
+async def telecharger_media_whatsapp(media_id: str) -> tuple[bytes, str]:
+    """Download inbound media bytes from Graph. Never logs the bytes."""
+    if not settings.whatsapp_access_token:
+        raise RuntimeError("WHATSAPP_ACCESS_TOKEN is empty")
+    if not media_id:
+        raise RuntimeError("media_id is empty")
+    meta_url = (
+        f"https://graph.facebook.com/{settings.whatsapp_api_version}/{media_id}"
+    )
+    headers = {"Authorization": f"Bearer {settings.whatsapp_access_token}"}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        meta = await client.get(meta_url, headers=headers)
+        try:
+            meta.raise_for_status()
+        except httpx.HTTPStatusError:
+            logger.exception(
+                "WhatsApp media metadata failed media_id=%s status=%s",
+                media_id,
+                meta.status_code,
+            )
+            raise
+        payload = meta.json() if meta.content else {}
+        url = ""
+        mime_type = ""
+        if isinstance(payload, dict):
+            url = str(payload.get("url") or "")
+            mime_type = str(payload.get("mime_type") or "")
+        if not url:
+            raise RuntimeError("WhatsApp media metadata returned no url")
+        download = await client.get(url, headers=headers)
+        try:
+            download.raise_for_status()
+        except httpx.HTTPStatusError:
+            logger.exception(
+                "WhatsApp media download failed media_id=%s status=%s",
+                media_id,
+                download.status_code,
+            )
+            raise
+        return download.content, mime_type
 
 
 async def envoyer_texte_whatsapp(

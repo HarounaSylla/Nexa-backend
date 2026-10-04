@@ -14,6 +14,7 @@ from app.merchants.router import router as merchants_router
 from app.notifications.router import router as notifications_router
 from app.orders.router import deliverers_router
 from app.orders.router import router as orders_router
+from app.proofs.router import router as images_router
 from app.whatsapp.router import router as whatsapp_router
 from app.whatsapp.service import signature_verification_enabled
 
@@ -50,6 +51,7 @@ app.include_router(conversations_router)
 app.include_router(merchants_router)
 app.include_router(notifications_router)
 app.include_router(whatsapp_router)
+app.include_router(images_router)
 app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
 
 

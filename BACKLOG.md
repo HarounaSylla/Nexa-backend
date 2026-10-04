@@ -55,7 +55,7 @@ TikTok comment classifier (Jalon 7) remains a separate model decision.
 - [x] WhatsApp Cloud API webhook (`GET`/`POST /whatsapp/webhook`) — RQ job on Redis, worker calls `traiter_message_entrant` once then Graph API send. Merchant routed by `merchants.whatsapp_phone_number_id` (Alembic `0009`). `POST /agent/simulate` unchanged.
 - [x] WhatsApp outbound product photos: worker uploads local files via Graph `/media` then sends `type=image` with `media_id` (not a public `link`). Cap 3 per turn. `extract_product_images` lives in `app/agent/images.py` (simulate unchanged).
 - [x] Close conversations on delivery (`confirmer_livraison`) and 48h inactivity (lazy inbound + RQ `close_stale_conversations` on `maintenance` every 15 min). Sweep preserves `updated_at` so the 15-min reopen grace does not revive a swept thread.
-- [ ] WhatsApp inbound media / voice — non-text inbound is still logged and skipped.
+- [x] WhatsApp inbound images (payment proofs) — stored privately, vision only when an order is awaiting a proof. Voice / PDF still skipped.
 
 Jalon 3 part 2+ items get added only once that work actually starts.
 
@@ -76,9 +76,15 @@ Jalon 3 part 2+ items get added only once that work actually starts.
 - Refund handling when a paid order is cancelled
 - Automatic online payment confirmation via a provider webhook
 - Un-marking a payment marked by mistake
-- Inbound payment-proof photos (next step)
+- [x] Inbound payment-proof photos: WhatsApp images stored privately, vision only when an online order is awaiting a proof (`payment_link_sent_at` set). Status becomes `proof_received` (never `paid`). Alembic `0015_payment_proofs`. `POST /orders/{id}/reject-proof`. Conversation ↔ order links on the merchant APIs.
 - WhatsApp message templates for sending after the 24 h window
 - A "Renvoyer" retry queue for failed merchant sends
+- PDF/document proofs and image questions from customers (non-proof images get no agent reply today)
+- Notification when a customer sends a photo before any link was sent (currently stored and visible in the thread only)
+- Merchant "attach this photo to an order" action for ambiguous cases
+- Image retention/cleanup policy
+- 24 h template for acknowledgements
+- Real-phone test of the inbound proof flow (blocked on the WhatsApp token/webhook)
 
 ## Preferences — later
 

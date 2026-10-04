@@ -14,6 +14,7 @@ from app.core.db import Base
 from app.merchants import models as merchants_models  # noqa: F401
 from app.notifications import models as notifications_models  # noqa: F401
 from app.orders import models as orders_models  # noqa: F401
+from app.proofs import models as proofs_models  # noqa: F401
 
 config = context.config
 config.set_main_option(

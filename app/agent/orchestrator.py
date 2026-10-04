@@ -43,6 +43,31 @@ def _get_client() -> AsyncOpenAI:
     return _client
 
 
+def history_items_from_messages(messages: list[Message]) -> list[Any]:
+    prior_items: list[Any] = []
+    for message in messages:
+        for item in message.items or []:
+            if _is_replayable_history_item(item):
+                prior_items.append(item)
+    return prior_items
+
+
+def _is_replayable_history_item(item: Any) -> bool:
+    """Inbound image rows use items=[] or a non-LLM marker and must not replay."""
+    if not isinstance(item, dict):
+        return False
+    if item.get("type") == "inbound_image":
+        return False
+    if item.get("role") or item.get("type") in {
+        "function_call",
+        "function_call_output",
+        "message",
+        "reasoning",
+    }:
+        return True
+    return False
+
+
 def serialize_item(item: Any) -> dict[str, Any]:
     if isinstance(item, dict):
         raw = item
@@ -252,9 +277,7 @@ async def traiter_message_entrant(
         .where(Message.conversation_id == conversation.id)
         .order_by(Message.created_at, Message.id)
     )
-    prior_items: list[Any] = []
-    for message in history.scalars().all():
-        prior_items.extend(message.items or [])
+    prior_items = history_items_from_messages(list(history.scalars().all()))
 
     customer_item = {"role": "user", "content": message_text}
     db.add(

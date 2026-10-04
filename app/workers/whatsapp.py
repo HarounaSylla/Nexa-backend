@@ -179,3 +179,71 @@ async def process_inbound_whatsapp_text_async(
                         )
     finally:
         await engine.dispose()
+
+
+def process_inbound_whatsapp_image(
+    customer_phone: str,
+    whatsapp_message_id: str,
+    media_id: str,
+    mime_type: str,
+    caption: str,
+    phone_number_id: str,
+) -> None:
+    try:
+        asyncio.run(
+            process_inbound_whatsapp_image_async(
+                customer_phone,
+                whatsapp_message_id,
+                media_id,
+                mime_type,
+                caption,
+                phone_number_id,
+            )
+        )
+    except Exception:
+        logger.exception(
+            "WhatsApp image job crashed message_id=%s from=%s",
+            whatsapp_message_id,
+            customer_phone,
+        )
+
+
+async def process_inbound_whatsapp_image_async(
+    customer_phone: str,
+    whatsapp_message_id: str,
+    media_id: str,
+    mime_type: str,
+    caption: str,
+    phone_number_id: str,
+) -> None:
+    try:
+        if not claim_inbound_message(whatsapp_message_id):
+            logger.info(
+                "Skipping duplicate WhatsApp image message_id=%s",
+                whatsapp_message_id,
+            )
+            return
+        async with AsyncSessionLocal() as db:
+            merchant = await get_merchant_by_whatsapp_phone_number_id(
+                db, phone_number_id
+            )
+            if merchant is None:
+                logger.warning(
+                    "Worker drop image message_id=%s: no merchant for phone_number_id=%s",
+                    whatsapp_message_id,
+                    phone_number_id,
+                )
+                return
+            from app.proofs.service import traiter_image_entrante
+
+            await traiter_image_entrante(
+                db,
+                merchant,
+                customer_phone,
+                whatsapp_message_id,
+                media_id,
+                mime_type or None,
+                caption or None,
+            )
+    finally:
+        await engine.dispose()

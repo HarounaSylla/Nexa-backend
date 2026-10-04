@@ -149,7 +149,10 @@ async def test_webhook_post_enqueues_text_and_ignores_statuses() -> None:
     merchant = await _seed_linked_merchant()
     assert merchant.whatsapp_phone_number_id is not None
     try:
-        with patch("app.whatsapp.router.enqueue_inbound_text") as enqueue:
+        with (
+            patch("app.whatsapp.router.enqueue_inbound_text") as enqueue,
+            patch("app.whatsapp.router.enqueue_inbound_image") as enqueue_image,
+        ):
             async with await _client() as client:
                 statuses = await client.post(
                     "/whatsapp/webhook", json=_status_payload()
@@ -189,6 +192,46 @@ async def test_webhook_post_enqueues_text_and_ignores_statuses() -> None:
                 )
                 assert image.status_code == 200
                 assert enqueue.call_count == 1
+                enqueue_image.assert_not_called()
+
+                complete_image = {
+                    "object": "whatsapp_business_account",
+                    "entry": [
+                        {
+                            "changes": [
+                                {
+                                    "value": {
+                                        "metadata": {
+                                            "phone_number_id": merchant.whatsapp_phone_number_id
+                                        },
+                                        "messages": [
+                                            {
+                                                "from": "221770001300",
+                                                "id": "wamid.img-complete",
+                                                "type": "image",
+                                                "image": {
+                                                    "id": "media-99",
+                                                    "mime_type": "image/jpeg",
+                                                    "caption": "n°43",
+                                                },
+                                            }
+                                        ],
+                                    }
+                                }
+                            ]
+                        }
+                    ],
+                }
+                queued = await client.post("/whatsapp/webhook", json=complete_image)
+                assert queued.status_code == 200
+                enqueue_image.assert_called_once_with(
+                    "221770001300",
+                    "wamid.img-complete",
+                    "media-99",
+                    "image/jpeg",
+                    "n°43",
+                    merchant.whatsapp_phone_number_id,
+                )
     finally:
         await _cleanup(merchant.id)
 

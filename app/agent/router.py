@@ -14,9 +14,11 @@ from app.agent.service import (
     lister_conversations_commercant,
     lister_messages,
     lister_messages_commercant,
+    obtenir_conversation_commercant,
     reprendre_par_agent,
     repondre_en_humain,
 )
+from app.proofs.service import lister_images_par_messages
 from app.auth.deps import get_current_merchant
 from app.catalogue.models import Merchant
 from app.core.db import get_db
@@ -52,6 +54,13 @@ class MessageOut(BaseModel):
     created_at: datetime | None = None
 
 
+class ConversationOrderOut(BaseModel):
+    id: uuid.UUID
+    order_number: int
+    status: str
+    payment_status: str
+
+
 class ConversationListItem(BaseModel):
     id: uuid.UUID
     customer_phone: str
@@ -59,6 +68,14 @@ class ConversationListItem(BaseModel):
     last_message_preview: str | None
     last_message_at: datetime | None
     message_count: int
+    orders: list[ConversationOrderOut] = []
+
+
+class MessageImageOut(BaseModel):
+    id: uuid.UUID
+    classification: str
+    order_id: uuid.UUID | None
+    detected_amount: str | None
 
 
 class MerchantMessageOut(BaseModel):
@@ -66,6 +83,7 @@ class MerchantMessageOut(BaseModel):
     turn_role: str
     display_text: str
     created_at: datetime
+    image: MessageImageOut | None = None
 
 
 class HumanReplyRequest(BaseModel):
@@ -155,6 +173,26 @@ async def list_merchant_conversations(
 
 
 @conversations_router.get(
+    "/{conversation_id}",
+    response_model=ConversationListItem,
+)
+async def get_merchant_conversation(
+    conversation_id: uuid.UUID,
+    merchant: Merchant = Depends(get_current_merchant),
+    db: AsyncSession = Depends(get_db),
+) -> ConversationListItem:
+    try:
+        await obtenir_conversation_commercant(db, merchant.id, conversation_id)
+    except NotFoundError as exc:
+        raise _not_found_conversation() from exc
+    rows = await lister_conversations_commercant(db, merchant.id)
+    for row in rows:
+        if row["id"] == conversation_id:
+            return ConversationListItem.model_validate(row)
+    raise _not_found_conversation()
+
+
+@conversations_router.get(
     "/{conversation_id}/messages",
     response_model=list[MerchantMessageOut],
 )
@@ -167,15 +205,32 @@ async def get_merchant_conversation_messages(
         messages = await lister_messages_commercant(db, merchant.id, conversation_id)
     except NotFoundError as exc:
         raise _not_found_conversation() from exc
-    return [
-        MerchantMessageOut(
-            id=message.id,
-            turn_role=message.turn_role,
-            display_text=message.display_text,
-            created_at=message.created_at,
+    images = await lister_images_par_messages(db, [message.id for message in messages])
+    out: list[MerchantMessageOut] = []
+    for message in messages:
+        image = images.get(message.id)
+        image_out = None
+        if image is not None:
+            image_out = MessageImageOut(
+                id=image.id,
+                classification=image.classification,
+                order_id=image.order_id,
+                detected_amount=(
+                    str(image.detected_amount)
+                    if image.detected_amount is not None
+                    else None
+                ),
+            )
+        out.append(
+            MerchantMessageOut(
+                id=message.id,
+                turn_role=message.turn_role,
+                display_text=message.display_text,
+                created_at=message.created_at,
+                image=image_out,
+            )
         )
-        for message in messages
-    ]
+    return out
 
 
 @conversations_router.post(

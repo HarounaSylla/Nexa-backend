@@ -233,8 +233,25 @@ async def lister_conversations_commercant(
                 "last_message_preview": preview,
                 "last_message_at": last_at,
                 "message_count": int(counts.get(conversation.id, 0)),
+                "orders": [],
             }
         )
+    from app.orders.service import lister_commandes_par_conversations
+
+    by_conversation = await lister_commandes_par_conversations(
+        db, merchant_id, ids
+    )
+    for row in rows:
+        orders = by_conversation.get(row["id"], [])
+        row["orders"] = [
+            {
+                "id": order.id,
+                "order_number": order.order_number,
+                "status": order.status.value,
+                "payment_status": order.payment_status.value,
+            }
+            for order in orders
+        ]
     return rows
 
 
