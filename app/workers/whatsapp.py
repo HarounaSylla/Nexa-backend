@@ -22,6 +22,7 @@ from app.agent.service import (
     record_sent_product_image,
 )
 from app.core.db import AsyncSessionLocal, engine
+from app.core.phone import try_normalize_phone
 from app.merchants.service import get_merchant_by_whatsapp_phone_number_id
 from app.whatsapp.service import (
     FALLBACK_REPLY,
@@ -81,6 +82,8 @@ async def process_inbound_whatsapp_text_async(
             logger.info("Skipping duplicate WhatsApp message_id=%s", message_id)
             return
 
+        customer_phone = try_normalize_phone(customer_phone)
+
         async with AsyncSessionLocal() as db:
             merchant = await get_merchant_by_whatsapp_phone_number_id(
                 db, phone_number_id
@@ -107,6 +110,9 @@ async def process_inbound_whatsapp_text_async(
                     customer_phone, FALLBACK_REPLY, phone_number_id
                 )
                 return
+
+        if reply is None:
+            return
 
         await envoyer_texte_whatsapp(customer_phone, reply, phone_number_id)
 
@@ -223,6 +229,7 @@ async def process_inbound_whatsapp_image_async(
                 whatsapp_message_id,
             )
             return
+        customer_phone = try_normalize_phone(customer_phone)
         async with AsyncSessionLocal() as db:
             merchant = await get_merchant_by_whatsapp_phone_number_id(
                 db, phone_number_id

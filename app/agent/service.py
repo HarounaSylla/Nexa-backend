@@ -12,8 +12,9 @@ from app.notifications.service import (
     NotificationRelatedType,
     NotificationType,
     emit_notification,
+    has_unread_notification,
 )
-from app.orders.service import NotFoundError
+from app.orders.service import NotFoundError, phone_lookup_variants
 from app.whatsapp.service import envoyer_message_commercant
 
 STATUS_ACTIVE = "active"
@@ -43,7 +44,7 @@ async def obtenir_dernier_message_agent(
         select(Conversation)
         .where(
             Conversation.merchant_id == merchant_id,
-            Conversation.customer_phone == customer_phone,
+            Conversation.customer_phone.in_(phone_lookup_variants(customer_phone)),
         )
         .order_by(Conversation.updated_at.desc())
     )
@@ -95,6 +96,99 @@ async def fermer_conversation_si_active(
         return
     if conversation.status == STATUS_ACTIVE:
         conversation.status = STATUS_CLOSED
+
+
+async def trouver_conversation_escaladee(
+    db: AsyncSession, merchant_id: uuid.UUID, customer_phone: str
+) -> Conversation | None:
+    variants = phone_lookup_variants(customer_phone)
+    if not variants:
+        return None
+    result = await db.execute(
+        select(Conversation)
+        .where(
+            Conversation.merchant_id == merchant_id,
+            Conversation.customer_phone.in_(variants),
+            Conversation.status == STATUS_ESCALATED,
+        )
+        .order_by(Conversation.updated_at.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def trouver_conversation_ouverte(
+    db: AsyncSession, merchant_id: uuid.UUID, customer_phone: str
+) -> Conversation | None:
+    """The open (escalated, else newest active) conversation for this phone."""
+    variants = phone_lookup_variants(customer_phone)
+    if not variants:
+        return None
+    result = await db.execute(
+        select(Conversation)
+        .where(
+            Conversation.merchant_id == merchant_id,
+            Conversation.customer_phone.in_(variants),
+            Conversation.status.in_([STATUS_ACTIVE, STATUS_ESCALATED]),
+        )
+        .order_by(
+            case((Conversation.status == STATUS_ESCALATED, 0), else_=1),
+            Conversation.updated_at.desc(),
+            Conversation.id.desc(),
+        )
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def notifier_message_escalade(
+    db: AsyncSession,
+    merchant_id: uuid.UUID,
+    conversation: Conversation,
+    phone: str,
+) -> None:
+    """One unread escalated_customer_message per conversation until it is read."""
+    if conversation.status != STATUS_ESCALATED:
+        return
+    if await has_unread_notification(
+        db,
+        merchant_id=merchant_id,
+        notification_type=NotificationType.escalated_customer_message,
+        related_id=conversation.id,
+    ):
+        return
+    await emit_notification(
+        db,
+        merchant_id=merchant_id,
+        notification_type=NotificationType.escalated_customer_message,
+        related_type=NotificationRelatedType.conversation,
+        related_id=conversation.id,
+        data={"customer_phone": phone},
+    )
+
+
+async def fermer_conversations_actives_du_client(
+    db: AsyncSession,
+    merchant_id: uuid.UUID,
+    customer_phone: str,
+    extra_conversation_id: uuid.UUID | None = None,
+) -> None:
+    """Close active conversations for this merchant+phone. Never touches escalated."""
+    ids: set[uuid.UUID] = set()
+    if extra_conversation_id is not None:
+        ids.add(extra_conversation_id)
+    variants = phone_lookup_variants(customer_phone)
+    if variants:
+        result = await db.execute(
+            select(Conversation.id).where(
+                Conversation.merchant_id == merchant_id,
+                Conversation.customer_phone.in_(variants),
+                Conversation.status == STATUS_ACTIVE,
+            )
+        )
+        ids.update(result.scalars().all())
+    for conversation_id in ids:
+        await fermer_conversation_si_active(db, conversation_id)
 
 
 async def fermer_conversations_inactives(

@@ -28,6 +28,10 @@ async def get_inbound_image(
         image = await obtenir_image_commercant(db, merchant.id, image_id)
     except NotFoundError as exc:
         raise _not_found() from exc
+    if image.media_deleted_at is not None:
+        raise HTTPException(status_code=410, detail="Image has been deleted")
+    if not image.media_path:
+        raise _not_found()
     path = absolute_media_path(image.media_path)
     if not path.is_file():
         raise _not_found()

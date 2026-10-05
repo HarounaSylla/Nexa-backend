@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,7 +22,8 @@ from app.proofs.service import lister_images_par_messages
 from app.auth.deps import get_current_merchant
 from app.catalogue.models import Merchant
 from app.core.db import get_db
-from app.orders.service import NotFoundError
+from app.core.phone import InvalidPhoneNumberError, normalize_phone
+from app.orders.service import NotFoundError, phone_lookup_variants
 from app.whatsapp.service import WhatsAppSendError
 
 # Temporary scaffolding to drive the agent by HTTP before the WhatsApp
@@ -38,6 +39,14 @@ class SimulateRequest(BaseModel):
     merchant_id: uuid.UUID
     customer_phone: str
     message: str
+
+    @field_validator("customer_phone")
+    @classmethod
+    def canonicalize_phone(cls, value: str) -> str:
+        try:
+            return normalize_phone(value)
+        except InvalidPhoneNumberError as exc:
+            raise ValueError(str(exc)) from exc
 
 
 class SimulateResponse(BaseModel):
@@ -76,6 +85,7 @@ class MessageImageOut(BaseModel):
     classification: str
     order_id: uuid.UUID | None
     detected_amount: str | None
+    deleted: bool = False
 
 
 class MerchantMessageOut(BaseModel):
@@ -113,12 +123,20 @@ async def simulate(
     result = await db.execute(
         select(Conversation).where(
             Conversation.merchant_id == body.merchant_id,
-            Conversation.customer_phone == body.customer_phone,
+            Conversation.customer_phone.in_(
+                phone_lookup_variants(body.customer_phone)
+            ),
         ).order_by(Conversation.updated_at.desc())
     )
     conversation = result.scalars().first()
     if conversation is None:
         raise HTTPException(status_code=500, detail="Conversation was not persisted")
+    if reply is None:
+        return SimulateResponse(
+            conversation_id=conversation.id,
+            reply="",
+            images=[],
+        )
     last_agent = await db.execute(
         select(Message)
         .where(
@@ -220,6 +238,7 @@ async def get_merchant_conversation_messages(
                     if image.detected_amount is not None
                     else None
                 ),
+                deleted=image.media_deleted_at is not None,
             )
         out.append(
             MerchantMessageOut(

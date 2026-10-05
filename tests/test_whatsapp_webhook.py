@@ -19,6 +19,7 @@ from app.main import app
 from app.whatsapp.service import (
     FALLBACK_REPLY,
     envoyer_image_whatsapp,
+    envoyer_texte_whatsapp,
     extract_text_messages,
     verify_signature,
 )
@@ -177,7 +178,7 @@ async def test_webhook_post_enqueues_text_and_ignores_statuses() -> None:
                 assert inbound.status_code == 200
                 enqueue.assert_called_once_with(
                     "wamid.robes",
-                    "221770001300",
+                    "+221770001300",
                     "vous avez des robes ?",
                     merchant.whatsapp_phone_number_id,
                 )
@@ -225,7 +226,7 @@ async def test_webhook_post_enqueues_text_and_ignores_statuses() -> None:
                 queued = await client.post("/whatsapp/webhook", json=complete_image)
                 assert queued.status_code == 200
                 enqueue_image.assert_called_once_with(
-                    "221770001300",
+                    "+221770001300",
                     "wamid.img-complete",
                     "media-99",
                     "image/jpeg",
@@ -284,7 +285,7 @@ def test_verify_signature_and_extract_text_messages() -> None:
     assert texts == [
         {
             "message_id": "wamid.test-1",
-            "customer_phone": "221770001300",
+            "customer_phone": "+221770001300",
             "message_text": "vous avez des robes ?",
             "phone_number_id": "pn",
         }
@@ -320,10 +321,10 @@ async def test_worker_calls_orchestrator_once_then_sends() -> None:
             args = agent.await_args
             assert args is not None
             assert args.args[1] == merchant.id
-            assert args.args[2] == "221770001301"
+            assert args.args[2] == "+221770001301"
             assert args.args[3] == "vous avez des robes ?"
             send.assert_awaited_once_with(
-                "221770001301",
+                "+221770001301",
                 "Oui, nous avons des robes.",
                 merchant.whatsapp_phone_number_id,
             )
@@ -394,12 +395,89 @@ async def test_worker_sends_fallback_when_agent_raises() -> None:
             )
             agent.assert_awaited_once()
             send.assert_awaited_once_with(
-                "221770001304",
+                "+221770001304",
                 FALLBACK_REPLY,
                 merchant.whatsapp_phone_number_id,
             )
     finally:
         await _cleanup(merchant.id)
+
+
+@pytest.mark.asyncio
+async def test_worker_sends_nothing_when_orchestrator_returns_none() -> None:
+    merchant = await _seed_linked_merchant()
+    try:
+        with (
+            patch(
+                "app.workers.whatsapp.claim_inbound_message", return_value=True
+            ),
+            patch(
+                "app.workers.whatsapp.traiter_message_entrant",
+                new_callable=AsyncMock,
+                return_value=None,
+            ) as agent,
+            patch(
+                "app.workers.whatsapp.envoyer_texte_whatsapp",
+                new_callable=AsyncMock,
+            ) as send,
+            patch(
+                "app.workers.whatsapp.envoyer_image_whatsapp",
+                new_callable=AsyncMock,
+            ) as send_image,
+        ):
+            await process_inbound_whatsapp_text_async(
+                "wamid.escalated",
+                "221770001310",
+                "toujours là ?",
+                merchant.whatsapp_phone_number_id or "",
+            )
+            agent.assert_awaited_once()
+            send.assert_not_called()
+            send_image.assert_not_called()
+    finally:
+        await _cleanup(merchant.id)
+
+
+@pytest.mark.asyncio
+async def test_envoyer_texte_whatsapp_sends_e164_plus_in_to_field() -> None:
+    captured: list[dict] = []
+
+    class _FakeResponse:
+        def __init__(self, payload: dict, status_code: int = 200) -> None:
+            self._payload = payload
+            self.status_code = status_code
+            self.text = json.dumps(payload)
+
+        def json(self) -> dict:
+            return self._payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+    class _FakeClient:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def post(self, url, **kwargs):
+            captured.append({"url": url, **kwargs})
+            return _FakeResponse({"messages": [{"id": "wamid.out"}]})
+
+    with (
+        patch.object(settings, "whatsapp_access_token", "token"),
+        patch.object(settings, "whatsapp_api_version", "v21.0"),
+        patch("app.whatsapp.service.httpx.AsyncClient", _FakeClient),
+    ):
+        await envoyer_texte_whatsapp("221770001311", "bonjour", PHONE_NUMBER_ID)
+
+    assert len(captured) == 1
+    assert captured[0]["json"]["to"] == "+221770001311"
+    assert captured[0]["json"]["type"] == "text"
 
 
 _MINI_PNG = (
@@ -460,6 +538,7 @@ async def test_envoyer_image_whatsapp_uses_media_id_not_link(tmp_path: Path) -> 
     assert len(captured) == 2
     assert captured[0]["url"].endswith(f"/{PHONE_NUMBER_ID}/media")
     assert captured[0]["data"]["messaging_product"] == "whatsapp"
+    assert captured[1]["json"]["to"] == "+221770001305"
     assert captured[1]["json"]["type"] == "image"
     assert captured[1]["json"]["image"] == {
         "id": "media-123",

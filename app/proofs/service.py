@@ -7,20 +7,25 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.models import Conversation, Message
 from app.agent.orchestrator import _get_or_create_conversation
 from app.agent.service import (
     STATUS_CLOSED,
+    STATUS_ESCALATED,
     TURN_ROLE_CUSTOMER,
     TURN_ROLE_MERCHANT,
+    notifier_message_escalade,
+    trouver_conversation_escaladee,
 )
 from app.catalogue.models import Merchant
+from app.core.config import settings
+from app.core.phone import try_normalize_phone
 from app.notifications.models import NotificationRelatedType, NotificationType
 from app.notifications.service import emit_notification
-from app.orders.models import Order
+from app.orders.models import Order, OrderStatus, PaymentStatus
 from app.orders.service import (
     appliquer_preuve_recue,
     commandes_en_attente_de_preuve,
@@ -36,6 +41,7 @@ from app.proofs.models import (
 )
 from app.proofs.storage import (
     RejectedMediaError,
+    delete_inbound_image_file,
     save_inbound_image,
 )
 from app.proofs.vision import ImageAnalysis, ImageAnalysisError, classer_image_entrante
@@ -105,7 +111,7 @@ async def _already_stored(
 async def _analyses_in_last_day(
     db: AsyncSession, merchant_id: uuid.UUID, customer_phone: str
 ) -> int:
-    variants = phone_lookup_variants(customer_phone)
+    variants = phone_lookup_variants(try_normalize_phone(customer_phone))
     since = datetime.now(timezone.utc) - timedelta(days=1)
     result = await db.execute(
         select(InboundImage)
@@ -170,12 +176,16 @@ async def _choose_conversation(
     matched: Order | None,
 ) -> tuple[Conversation, bool]:
     """Return (conversation, bump_updated_at)."""
+    phone = try_normalize_phone(customer_phone)
+    escalated = await trouver_conversation_escaladee(db, merchant_id, phone)
+    if escalated is not None:
+        return escalated, True
     if matched is not None and matched.conversation_id is not None:
         conversation = await db.get(Conversation, matched.conversation_id)
         if conversation is not None:
             bump = conversation.status != STATUS_CLOSED
             return conversation, bump
-    conversation = await _get_or_create_conversation(db, merchant_id, customer_phone)
+    conversation = await _get_or_create_conversation(db, merchant_id, phone)
     return conversation, True
 
 
@@ -191,6 +201,8 @@ async def traiter_image_entrante(
     existing = await _already_stored(db, whatsapp_message_id)
     if existing is not None:
         return existing
+
+    customer_phone = try_normalize_phone(customer_phone)
 
     try:
         content, downloaded_mime = await telecharger_media_whatsapp(media_id)
@@ -301,6 +313,11 @@ async def traiter_image_entrante(
             data=data,
         )
 
+    if conversation.status == STATUS_ESCALATED:
+        await notifier_message_escalade(
+            db, merchant.id, conversation, customer_phone
+        )
+
     conversation_id = conversation.id
     merchant_phone_id = merchant.whatsapp_phone_number_id
     await db.commit()
@@ -333,3 +350,53 @@ async def traiter_image_entrante(
                 await db.commit()
 
     return image
+
+
+async def purger_images_expirees(
+    db: AsyncSession, now: datetime | None = None, limit: int = 500
+) -> int:
+    """Delete expired inbound image files. Rows stay; path and timestamp are cleared.
+
+    Eligible when `created_at` is older than the retention window and the
+    image has no order, or its order is paid or cancelled. Pending /
+    proof_received orders keep their files. One failing file is logged and
+    skipped. Returns the number of rows purged.
+    """
+    moment = now or datetime.now(timezone.utc)
+    cutoff = moment - timedelta(days=settings.payment_proof_retention_days)
+    result = await db.execute(
+        select(InboundImage)
+        .outerjoin(Order, Order.id == InboundImage.order_id)
+        .where(
+            InboundImage.media_deleted_at.is_(None),
+            InboundImage.created_at < cutoff,
+            or_(
+                InboundImage.order_id.is_(None),
+                Order.payment_status == PaymentStatus.paid,
+                Order.status == OrderStatus.cancelled,
+            ),
+        )
+        .order_by(InboundImage.created_at.asc(), InboundImage.id.asc())
+        .limit(limit)
+    )
+    rows = list(result.scalars().all())
+    ids = [row.id for row in rows]
+    purged = 0
+    for image_id in ids:
+        image = await db.get(InboundImage, image_id)
+        if image is None or image.media_deleted_at is not None:
+            continue
+        try:
+            delete_inbound_image_file(image.media_path)
+            image.media_path = None
+            image.media_deleted_at = moment
+            await db.commit()
+            purged += 1
+        except Exception:
+            await db.rollback()
+            logger.warning(
+                "Failed to purge inbound image %s",
+                image_id,
+                exc_info=True,
+            )
+    return purged

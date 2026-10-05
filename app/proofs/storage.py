@@ -48,3 +48,11 @@ def absolute_media_path(relative: str) -> Path:
     if root not in path.parents and path != root:
         raise FileNotFoundError(relative)
     return path
+
+
+def delete_inbound_image_file(relative: str | None) -> None:
+    """Unlink a file under the private media root. Missing files are fine."""
+    if not relative:
+        return
+    path = absolute_media_path(relative)
+    path.unlink(missing_ok=True)

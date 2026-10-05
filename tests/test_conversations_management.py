@@ -358,15 +358,12 @@ async def test_get_or_create_closes_stale_reopens_recent_and_skips_escalated() -
             assert leftover.status == STATUS_CLOSED
 
         async with AsyncSessionLocal() as db:
-            beside_escalated = await _get_or_create_conversation(
+            same_escalated = await _get_or_create_conversation(
                 db, merchant.id, escalated.customer_phone
             )
             await db.commit()
-            assert beside_escalated.id != escalated.id
-            assert beside_escalated.status == STATUS_ACTIVE
-            still_escalated = await db.get(Conversation, escalated.id)
-            assert still_escalated is not None
-            assert still_escalated.status == STATUS_ESCALATED
+            assert same_escalated.id == escalated.id
+            assert same_escalated.status == STATUS_ESCALATED
 
         async with AsyncSessionLocal() as db:
             returned = await reprendre_par_agent(db, merchant.id, escalated.id)

@@ -17,6 +17,7 @@ import httpx
 from app.catalogue.models import Merchant
 from app.catalogue.service import chemin_photo_locale
 from app.core.config import settings
+from app.core.phone import normalize_phone_webhook, try_normalize_phone
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +96,7 @@ def extract_text_messages(payload: dict[str, Any]) -> list[dict[str, str]]:
                 found.append(
                     {
                         "message_id": message_id,
-                        "customer_phone": customer_phone,
+                        "customer_phone": normalize_phone_webhook(customer_phone),
                         "message_text": body,
                         "phone_number_id": phone_number_id,
                     }
@@ -142,7 +143,7 @@ def extract_image_messages(payload: dict[str, Any]) -> list[dict[str, str]]:
                     continue
                 found.append(
                     {
-                        "customer_phone": customer_phone,
+                        "customer_phone": normalize_phone_webhook(customer_phone),
                         "whatsapp_message_id": message_id,
                         "media_id": media_id,
                         "mime_type": mime_type,
@@ -266,7 +267,7 @@ async def envoyer_texte_whatsapp(
         raise RuntimeError("WHATSAPP_ACCESS_TOKEN is empty")
     if not phone_number_id:
         raise RuntimeError("phone_number_id is empty")
-    to = customer_phone.lstrip("+")
+    to = try_normalize_phone(customer_phone)
     url = (
         f"https://graph.facebook.com/{settings.whatsapp_api_version}"
         f"/{phone_number_id}/messages"
@@ -382,7 +383,7 @@ async def envoyer_image_whatsapp(
         if not phone_number_id:
             raise RuntimeError("phone_number_id is empty")
 
-        to = customer_phone.lstrip("+")
+        to = try_normalize_phone(customer_phone)
         media_url = (
             f"https://graph.facebook.com/{settings.whatsapp_api_version}"
             f"/{phone_number_id}/media"

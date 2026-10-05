@@ -49,7 +49,7 @@ class InboundImage(Base):
         nullable=True,
     )
     whatsapp_message_id: Mapped[str] = mapped_column(Text, nullable=False)
-    media_path: Mapped[str] = mapped_column(Text, nullable=False)
+    media_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     mime_type: Mapped[str] = mapped_column(Text, nullable=False)
     caption: Mapped[str | None] = mapped_column(Text, nullable=True)
     classification: Mapped[str] = mapped_column(Text, nullable=False)
@@ -58,4 +58,8 @@ class InboundImage(Base):
         DateTime(timezone=True),
         server_default=func.now(),
         nullable=False,
+    )
+    media_deleted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
     )

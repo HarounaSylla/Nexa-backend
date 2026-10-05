@@ -541,3 +541,107 @@ async def test_confirmer_livraison_closes_active_conversation_only() -> None:
     finally:
         await _cleanup(merchant_id)
 
+
+@pytest.mark.asyncio
+async def test_delivery_and_cancel_close_active_conversation_by_phone() -> None:
+    merchant_id, product_id = await _make_merchant_product(
+        stock_qty=8,
+        name=f"pytest-close-by-phone-{uuid.uuid4()}",
+    )
+    try:
+        async with AsyncSessionLocal() as db:
+            dashboard_thread = Conversation(
+                merchant_id=merchant_id,
+                customer_phone=PHONE,
+                status=STATUS_ACTIVE,
+            )
+            cancel_thread = Conversation(
+                merchant_id=merchant_id,
+                customer_phone="+221770000011",
+                status=STATUS_ACTIVE,
+            )
+            escalated = Conversation(
+                merchant_id=merchant_id,
+                customer_phone="+221770000012",
+                status=STATUS_ESCALATED,
+            )
+            already_closed = Conversation(
+                merchant_id=merchant_id,
+                customer_phone="+221770000013",
+                status=STATUS_CLOSED,
+            )
+            db.add_all(
+                [dashboard_thread, cancel_thread, escalated, already_closed]
+            )
+            await db.commit()
+            await db.refresh(dashboard_thread)
+            await db.refresh(cancel_thread)
+            await db.refresh(escalated)
+            await db.refresh(already_closed)
+            dashboard_id = dashboard_thread.id
+            cancel_id = cancel_thread.id
+            escalated_id = escalated.id
+            closed_id = already_closed.id
+
+        async with AsyncSessionLocal() as db:
+            dashboard_order = await creer_commande(
+                db,
+                merchant_id=merchant_id,
+                customer_phone=PHONE,
+                items=[(product_id, 1)],
+                payment_method=PaymentMethod.cash_on_delivery,
+                delivery_address=ADDRESS,
+                ville="Dakar",
+            )
+            assert dashboard_order.conversation_id is None
+            cancel_order = await creer_commande(
+                db,
+                merchant_id=merchant_id,
+                customer_phone="+221770000011",
+                items=[(product_id, 1)],
+                payment_method=PaymentMethod.cash_on_delivery,
+                delivery_address=ADDRESS,
+                ville="Dakar",
+                conversation_id=cancel_id,
+            )
+            escalated_order = await creer_commande(
+                db,
+                merchant_id=merchant_id,
+                customer_phone="+221770000012",
+                items=[(product_id, 1)],
+                payment_method=PaymentMethod.cash_on_delivery,
+                delivery_address=ADDRESS,
+                ville="Dakar",
+                conversation_id=escalated_id,
+            )
+            closed_order = await creer_commande(
+                db,
+                merchant_id=merchant_id,
+                customer_phone="+221770000013",
+                items=[(product_id, 1)],
+                payment_method=PaymentMethod.cash_on_delivery,
+                delivery_address=ADDRESS,
+                ville="Dakar",
+                conversation_id=closed_id,
+            )
+
+        async with AsyncSessionLocal() as db:
+            await confirmer_livraison(db, dashboard_order.id)
+            closed_dashboard = await db.get(Conversation, dashboard_id)
+            assert closed_dashboard is not None
+            assert closed_dashboard.status == STATUS_CLOSED
+
+        async with AsyncSessionLocal() as db:
+            await annuler_commande(db, cancel_order.id, reason=None)
+            closed_cancel = await db.get(Conversation, cancel_id)
+            assert closed_cancel is not None
+            assert closed_cancel.status == STATUS_CLOSED
+
+        async with AsyncSessionLocal() as db:
+            await confirmer_livraison(db, escalated_order.id)
+            await annuler_commande(db, closed_order.id, reason=None)
+            assert (await db.get(Conversation, escalated_id)).status == STATUS_ESCALATED
+            assert (await db.get(Conversation, closed_id)).status == STATUS_CLOSED
+    finally:
+        await _cleanup(merchant_id)
+

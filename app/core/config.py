@@ -58,6 +58,12 @@ class Settings(BaseSettings):
     clerk_authorized_parties: str = "http://localhost:3000"
     # Private inbound media (payment proofs). Never under /static.
     media_dir: str = "./data/private_media"
+    # Days after reception before an inbound image file may be deleted, once
+    # the linked order is paid/cancelled or the image has no order.
+    payment_proof_retention_days: int = 90
+    # Country calling code (no +) used when a 9-digit local mobile starting
+    # with 7 is entered without a country prefix (Senegal: 771234567 → +221…).
+    default_country_calling_code: str = "221"
 
     def clerk_authorized_party_list(self) -> list[str]:
         return [

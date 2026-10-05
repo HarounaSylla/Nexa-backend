@@ -86,9 +86,14 @@ Jalon 3 part 2+ items get added only once that work actually starts.
 - PDF/document proofs and image questions from customers (non-proof images get no agent reply today)
 - Notification when a customer sends a photo before any link was sent (currently stored and visible in the thread only)
 - Merchant "attach this photo to an order" action for ambiguous cases
-- Image retention/cleanup policy
+- [x] Inbound image file retention (Alembic `0019`, 90 days after reception once unpaid/pending proofs are done; row kept, file deleted)
+- Retention counted from `paid_at` once that column exists
+- Delete conversations/messages retention policy
+- Delete-merchant data purge
 - 24 h template for acknowledgements
 - Real-phone test of the inbound proof flow (blocked on the WhatsApp token/webhook)
+- Customer acknowledgement when a message arrives on an escalated conversation (merchant is notified; agent stays silent; no auto-reply today)
+- Auto-return / auto-close policy for unanswered escalations
 
 ## Preferences — later
 
@@ -99,3 +104,4 @@ Jalon 3 part 2+ items get added only once that work actually starts.
 - Manual order validation
 - Structured per-zone delivery fee
 - Multi-country readiness: per-merchant currency code/symbol instead of the hardcoded "F"/"FCFA" in `app/agent/images.py` and the frontend formatters; merchant country / default phone prefix; UI and agent language beyond French
+- Multi-country phone defaults beyond `DEFAULT_COUNTRY_CALLING_CODE=221` (per-merchant calling code, non-Senegalese local forms)

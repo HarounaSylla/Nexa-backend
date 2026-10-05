@@ -10,16 +10,26 @@ from typing import Any, Literal, TypedDict
 from langgraph.graph import END, START, StateGraph
 from openai import AsyncOpenAI
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.models import Conversation, Message
 from app.agent.prompts import build_system_prompt
-from app.agent.service import STATUS_ACTIVE, STATUS_CLOSED
+from app.agent.service import (
+    STATUS_ACTIVE,
+    STATUS_CLOSED,
+    STATUS_ESCALATED,
+    TURN_ROLE_CUSTOMER,
+    notifier_message_escalade,
+    trouver_conversation_escaladee,
+    trouver_conversation_ouverte,
+)
 from app.agent.tools import TOOLS, execute_tool
 from app.catalogue.models import Merchant
 from app.core.config import settings
+from app.core.phone import try_normalize_phone
 from app.merchants.service import get_preferences
-from app.orders.service import lister_zones_livraison
+from app.orders.service import lister_zones_livraison, phone_lookup_variants
 
 CONVERSATION_INACTIVITY_TIMEOUT = timedelta(hours=48)
 CONVERSATION_REOPEN_GRACE_PERIOD = timedelta(minutes=15)
@@ -214,44 +224,85 @@ def _build_graph(db: AsyncSession):
 async def _get_or_create_conversation(
     db: AsyncSession, merchant_id: uuid.UUID, customer_phone: str
 ) -> Conversation:
-    result = await db.execute(
-        select(Conversation)
-        .where(
-            Conversation.merchant_id == merchant_id,
-            Conversation.customer_phone == customer_phone,
-            Conversation.status.in_([STATUS_ACTIVE, STATUS_CLOSED]),
-        )
-        .order_by(Conversation.updated_at.desc())
-        .limit(1)
-    )
-    conversation = result.scalar_one_or_none()
+    canonical = try_normalize_phone(customer_phone)
+    variants = phone_lookup_variants(canonical)
     now = datetime.now(timezone.utc)
 
-    if conversation is not None:
-        age = now - conversation.updated_at
-        if conversation.status == STATUS_ACTIVE and age <= CONVERSATION_INACTIVITY_TIMEOUT:
-            return conversation
-        if conversation.status == STATUS_ACTIVE:
-            # Stale — close it instead of silently appending onto old context.
-            conversation.status = STATUS_CLOSED
-            await db.flush()
-        elif age <= CONVERSATION_REOPEN_GRACE_PERIOD:
-            # Just closed (e.g. delivery confirmed moments ago, "merci, bien
-            # reçu !") and the customer is still typing — reopen the same
-            # thread instead of wiping context they'd reasonably expect the
-            # agent to still have.
-            conversation.status = STATUS_ACTIVE
-            await db.flush()
-            return conversation
+    open_row = await trouver_conversation_ouverte(db, merchant_id, canonical)
+    closed_stale = False
+    if open_row is not None:
+        if open_row.status == STATUS_ESCALATED:
+            return open_row
+        age = now - open_row.updated_at
+        if age <= CONVERSATION_INACTIVITY_TIMEOUT:
+            return open_row
+        open_row.status = STATUS_CLOSED
+        await db.flush()
+        closed_stale = True
 
-    conversation = Conversation(
-        merchant_id=merchant_id,
-        customer_phone=customer_phone,
-        status=STATUS_ACTIVE,
+    if not closed_stale:
+        result = await db.execute(
+            select(Conversation)
+            .where(
+                Conversation.merchant_id == merchant_id,
+                Conversation.customer_phone.in_(variants),
+                Conversation.status == STATUS_CLOSED,
+            )
+            .order_by(Conversation.updated_at.desc())
+            .limit(1)
+        )
+        closed = result.scalar_one_or_none()
+        if closed is not None:
+            age = now - closed.updated_at
+            if age <= CONVERSATION_REOPEN_GRACE_PERIOD:
+                try:
+                    async with db.begin_nested():
+                        closed.status = STATUS_ACTIVE
+                        await db.flush()
+                    return closed
+                except IntegrityError:
+                    found = await trouver_conversation_ouverte(
+                        db, merchant_id, canonical
+                    )
+                    if found is None:
+                        raise
+                    return found
+
+    try:
+        async with db.begin_nested():
+            conversation = Conversation(
+                merchant_id=merchant_id,
+                customer_phone=canonical,
+                status=STATUS_ACTIVE,
+            )
+            db.add(conversation)
+            await db.flush()
+            return conversation
+    except IntegrityError:
+        found = await trouver_conversation_ouverte(db, merchant_id, canonical)
+        if found is None:
+            raise
+        return found
+
+
+async def _store_escalated_inbound(
+    db: AsyncSession,
+    conversation: Conversation,
+    merchant_id: uuid.UUID,
+    customer_phone: str,
+    message_text: str,
+) -> None:
+    db.add(
+        Message(
+            conversation_id=conversation.id,
+            turn_role=TURN_ROLE_CUSTOMER,
+            display_text=message_text,
+            items=[],
+        )
     )
-    db.add(conversation)
-    await db.flush()
-    return conversation
+    conversation.updated_at = datetime.now(timezone.utc)
+    await notifier_message_escalade(db, merchant_id, conversation, customer_phone)
+    await db.commit()
 
 
 async def traiter_message_entrant(
@@ -260,8 +311,11 @@ async def traiter_message_entrant(
     customer_phone: str,
     message_text: str,
     now: datetime | None = None,
-) -> str:
+) -> str | None:
     """Process one inbound customer message and return the agent reply text.
+
+    Returns None when the conversation is escalated: the message is stored
+    on that thread and no WhatsApp reply should be sent.
 
     `now` overrides the clock used in the merchant-settings prompt block.
     Tests and proof scripts may pass it; the public simulate route does not.
@@ -270,7 +324,15 @@ async def traiter_message_entrant(
     if merchant is None:
         raise ValueError(f"Merchant {merchant_id} was not found")
 
-    conversation = await _get_or_create_conversation(db, merchant_id, customer_phone)
+    phone = try_normalize_phone(customer_phone)
+    escalated = await trouver_conversation_escaladee(db, merchant_id, phone)
+    if escalated is not None:
+        await _store_escalated_inbound(
+            db, escalated, merchant_id, phone, message_text
+        )
+        return None
+
+    conversation = await _get_or_create_conversation(db, merchant_id, phone)
 
     history = await db.execute(
         select(Message)

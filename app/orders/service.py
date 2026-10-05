@@ -1,7 +1,7 @@
 import unicodedata
 import uuid
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
 from sqlalchemy import delete, select
@@ -10,6 +10,7 @@ from sqlalchemy.orm import selectinload
 
 from app.catalogue.models import Merchant, Product
 from app.core.formatting import format_fcfa
+from app.core.phone import try_normalize_phone
 from app.notifications.service import (
     NotificationRelatedType,
     NotificationType,
@@ -29,6 +30,7 @@ from app.orders.models import (
 MOVEMENT_PROVISIONAL_DECREMENT = "order_provisional_decrement"
 MOVEMENT_CANCELLED_RESTOCK = "order_cancelled_restock"
 MOVEMENT_DELIVERED_FINALIZE = "order_delivered_finalize"
+PROOF_ACCEPTANCE_WINDOW = timedelta(days=14)
 
 
 class NotFoundError(LookupError):
@@ -254,6 +256,7 @@ async def creer_commande(
     `conversation_id` is stored when the order came from a WhatsApp
     thread; merchant-created orders leave it None.
     """
+    phone = try_normalize_phone(customer_phone)
     quantities = _aggregate_quantities(items)
     product_ids = sorted(quantities)
     try:
@@ -280,7 +283,7 @@ async def creer_commande(
             merchant_id=merchant_id,
             order_number=order_number,
             conversation_id=conversation_id,
-            customer_phone=customer_phone,
+            customer_phone=phone,
             status=OrderStatus.created,
             payment_method=payment_method,
             payment_status=PaymentStatus.pending,
@@ -323,7 +326,7 @@ async def creer_commande(
             related_type=NotificationRelatedType.order,
             related_id=order.id,
             data={
-                "customer_phone": customer_phone,
+                "customer_phone": phone,
                 "total": str(total),
             },
         )
@@ -361,12 +364,15 @@ async def consulter_commande(
     order by guessing a number. If order_number is None, return the most
     recent order for this phone at this merchant.
     """
+    variants = phone_lookup_variants(customer_phone)
+    if not variants:
+        return None
     query = (
         select(Order)
         .options(selectinload(Order.items), selectinload(Order.deliverer))
         .where(
             Order.merchant_id == merchant_id,
-            Order.customer_phone == customer_phone,
+            Order.customer_phone.in_(variants),
         )
     )
     if order_number is not None:
@@ -421,10 +427,14 @@ async def confirmer_livraison(db: AsyncSession, order_id: uuid.UUID) -> Order:
                     quantity_delta=0,
                 )
             )
-        if order.conversation_id is not None:
-            from app.agent.service import fermer_conversation_si_active
+        from app.agent.service import fermer_conversations_actives_du_client
 
-            await fermer_conversation_si_active(db, order.conversation_id)
+        await fermer_conversations_actives_du_client(
+            db,
+            order.merchant_id,
+            order.customer_phone,
+            extra_conversation_id=order.conversation_id,
+        )
         await db.commit()
     except Exception:
         await db.rollback()
@@ -461,6 +471,14 @@ async def annuler_commande(
                 )
             )
         order.status = OrderStatus.cancelled
+        from app.agent.service import fermer_conversations_actives_du_client
+
+        await fermer_conversations_actives_du_client(
+            db,
+            order.merchant_id,
+            order.customer_phone,
+            extra_conversation_id=order.conversation_id,
+        )
         await db.commit()
     except Exception:
         await db.rollback()
@@ -506,12 +524,25 @@ class ProofRejectionNotAllowedError(ValueError):
 
 
 def phone_lookup_variants(phone: str) -> list[str]:
+    """Spellings that may exist on legacy rows during the E.164 transition."""
     raw = (phone or "").strip()
     if not raw:
         return []
     plus = raw if raw.startswith("+") else f"+{raw}"
     bare = raw.lstrip("+")
-    return list(dict.fromkeys([raw, plus, bare]))
+    variants = [raw, plus, bare]
+    canonical = try_normalize_phone(raw)
+    variants.append(canonical)
+    variants.append(canonical.lstrip("+"))
+    from app.core.config import settings
+
+    cc = (settings.default_country_calling_code or "221").strip().lstrip("+")
+    prefix = f"+{cc}"
+    if canonical.startswith(prefix):
+        rest = canonical[len(prefix) :]
+        if len(rest) == 9 and rest.startswith("7"):
+            variants.append(rest)
+    return list(dict.fromkeys(v for v in variants if v))
 
 
 def build_payment_link_message(
@@ -672,6 +703,8 @@ async def commandes_en_attente_de_preuve(
                 (PaymentStatus.pending, PaymentStatus.proof_received)
             ),
             Order.payment_link_sent_at.is_not(None),
+            Order.payment_link_sent_at
+            >= datetime.now(timezone.utc) - PROOF_ACCEPTANCE_WINDOW,
         )
         .order_by(Order.created_at.desc(), Order.id.desc())
     )

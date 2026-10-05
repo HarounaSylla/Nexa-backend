@@ -14,9 +14,13 @@ from redis import Redis
 from rq.cron import CronScheduler
 
 from app.core.config import settings
-from app.workers.maintenance import close_stale_conversations
+from app.workers.maintenance import (
+    close_stale_conversations,
+    purge_expired_inbound_images,
+)
 
 DEFAULT_INTERVAL_SECONDS = 900
+PURGE_INTERVAL_SECONDS = 86400
 
 
 def main() -> None:
@@ -30,7 +34,8 @@ def main() -> None:
         metavar="SECONDS",
         help=(
             "Seconds between close_stale_conversations runs "
-            f"(default: {DEFAULT_INTERVAL_SECONDS})"
+            f"(default: {DEFAULT_INTERVAL_SECONDS}). "
+            "Inbound-image purge stays at once a day."
         ),
     )
     args = parser.parse_args()
@@ -41,6 +46,12 @@ def main() -> None:
         close_stale_conversations,
         queue_name="maintenance",
         interval=args.interval,
+        result_ttl=60,
+    )
+    scheduler.register(
+        purge_expired_inbound_images,
+        queue_name="maintenance",
+        interval=PURGE_INTERVAL_SECONDS,
         result_ttl=60,
     )
     scheduler.start()

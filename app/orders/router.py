@@ -3,12 +3,13 @@ from datetime import datetime
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.deps import get_current_merchant
 from app.catalogue.models import Merchant
 from app.core.db import get_db
+from app.core.phone import InvalidPhoneNumberError, normalize_phone
 from app.orders.models import (
     DeliveryZone,
     Order,
@@ -65,6 +66,14 @@ class CreateOrderRequest(BaseModel):
     payment_method: PaymentMethod
     delivery_address: str
     ville: str
+
+    @field_validator("customer_phone")
+    @classmethod
+    def canonicalize_phone(cls, value: str) -> str:
+        try:
+            return normalize_phone(value)
+        except InvalidPhoneNumberError as exc:
+            raise ValueError(str(exc)) from exc
 
 
 class AssignDelivererRequest(BaseModel):
@@ -156,6 +165,7 @@ class OrderProofOut(BaseModel):
     classification: str
     detected_amount: Decimal | None
     created_at: datetime
+    deleted: bool = False
 
 
 class MerchantOrderDetail(MerchantOrderListItem):
@@ -266,6 +276,7 @@ async def _detail_for(
             classification=row.classification,
             detected_amount=row.detected_amount,
             created_at=row.created_at,
+            deleted=row.media_deleted_at is not None,
         )
         for row in proofs
     ]

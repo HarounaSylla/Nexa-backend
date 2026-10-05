@@ -25,6 +25,7 @@ __all__ = [
     "NotificationRelatedType",
     "NotificationType",
     "emit_notification",
+    "has_unread_notification",
     "lister_notifications",
     "marquer_comme_lue",
     "marquer_toutes_comme_lues",
@@ -61,6 +62,26 @@ async def emit_notification(
     db.add(row)
     await db.flush()
     return row
+
+
+async def has_unread_notification(
+    db: AsyncSession,
+    *,
+    merchant_id: uuid.UUID,
+    notification_type: NotificationType | str,
+    related_id: uuid.UUID,
+) -> bool:
+    result = await db.execute(
+        select(Notification.id)
+        .where(
+            Notification.merchant_id == merchant_id,
+            Notification.type == _as_value(notification_type),
+            Notification.related_id == related_id,
+            Notification.read_at.is_(None),
+        )
+        .limit(1)
+    )
+    return result.scalar_one_or_none() is not None
 
 
 async def lister_notifications(

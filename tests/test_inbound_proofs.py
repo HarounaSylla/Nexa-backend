@@ -1,5 +1,5 @@
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -9,12 +9,13 @@ import pytest
 from sqlalchemy import delete, select
 
 from app.agent.models import Conversation, Message
-from app.agent.orchestrator import history_items_from_messages
-from app.agent.service import STATUS_CLOSED, TURN_ROLE_CUSTOMER
+from app.agent.orchestrator import history_items_from_messages, traiter_message_entrant
+from app.agent.service import STATUS_CLOSED, STATUS_ESCALATED, TURN_ROLE_CUSTOMER
 from app.catalogue.models import Merchant, Product
 from app.core.db import AsyncSessionLocal
 from app.main import app
 from app.notifications.models import Notification
+from app.notifications.service import marquer_comme_lue
 from app.orders.models import (
     DeliveryZone,
     Order,
@@ -955,5 +956,287 @@ async def test_worker_does_not_call_sales_agent(tmp_path: Path) -> None:
                 merchant.whatsapp_phone_number_id or "",
             )
         agent.assert_not_called()
+    finally:
+        await _cleanup(merchant.id)
+
+
+@pytest.mark.asyncio
+async def test_escalated_image_stays_on_escalated_conversation(tmp_path: Path) -> None:
+    merchant, _product, _clerk = await _seed_shop(tmp_path)
+    try:
+        conversation = await _add_conversation(
+            merchant.id, PHONE, status=STATUS_ESCALATED
+        )
+        vision = AsyncMock(return_value=ImageAnalysis(True, None))
+        with (
+            patch("app.core.config.settings.media_dir", str(tmp_path / "media")),
+            patch(
+                "app.proofs.service.telecharger_media_whatsapp",
+                new=AsyncMock(return_value=(TINY_PNG, "image/png")),
+            ),
+            patch("app.proofs.service.classer_image_entrante", vision),
+            patch("app.proofs.service.envoyer_message_commercant", AsyncMock()),
+        ):
+            async with AsyncSessionLocal() as db:
+                stored = await traiter_image_entrante(
+                    db, merchant, "221770040200", "wamid.esc-img", "m",
+                    "image/png", None,
+                )
+        assert stored is not None
+        assert stored.conversation_id == conversation.id
+        assert stored.classification == CLASSIFICATION_NOT_ANALYZED
+        vision.assert_not_awaited()
+        async with AsyncSessionLocal() as db:
+            row = await db.get(Conversation, conversation.id)
+            assert row is not None
+            assert row.status == STATUS_ESCALATED
+            convs = list(
+                (
+                    await db.execute(
+                        select(Conversation).where(
+                            Conversation.merchant_id == merchant.id
+                        )
+                    )
+                ).scalars().all()
+            )
+            assert len(convs) == 1
+    finally:
+        await _cleanup(merchant.id)
+
+
+@pytest.mark.asyncio
+async def test_proof_acceptance_window(tmp_path: Path) -> None:
+    from app.orders.service import commandes_en_attente_de_preuve
+
+    merchant, product, _clerk = await _seed_shop(tmp_path)
+    try:
+        inside_phone = "+221770040210"
+        outside_phone = "+221770040211"
+        delivered_phone = "+221770040212"
+        paid_phone = "+221770040213"
+        cancelled_phone = "+221770040214"
+        inside = await _place(merchant.id, product.id, phone=inside_phone)
+        outside = await _place(merchant.id, product.id, phone=outside_phone)
+        delivered = await _place(merchant.id, product.id, phone=delivered_phone)
+        paid = await _place(merchant.id, product.id, phone=paid_phone)
+        cancelled = await _place(merchant.id, product.id, phone=cancelled_phone)
+        now = datetime.now(timezone.utc)
+        async with AsyncSessionLocal() as db:
+            for order_id, sent_at, status, pay in (
+                (inside.id, now - timedelta(days=13), OrderStatus.created, PaymentStatus.pending),
+                (outside.id, now - timedelta(days=15), OrderStatus.created, PaymentStatus.pending),
+                (
+                    delivered.id,
+                    now - timedelta(days=1),
+                    OrderStatus.delivered,
+                    PaymentStatus.pending,
+                ),
+                (paid.id, now - timedelta(days=1), OrderStatus.created, PaymentStatus.paid),
+                (
+                    cancelled.id,
+                    now - timedelta(days=1),
+                    OrderStatus.cancelled,
+                    PaymentStatus.pending,
+                ),
+            ):
+                row = await db.get(Order, order_id)
+                assert row is not None
+                row.payment_link = "https://pay.example.com/x"
+                row.payment_link_sent_at = sent_at
+                row.status = status
+                row.payment_status = pay
+            await db.commit()
+
+        async with AsyncSessionLocal() as db:
+            inside_ids = {
+                row.id
+                for row in await commandes_en_attente_de_preuve(
+                    db, merchant.id, inside_phone
+                )
+            }
+            outside_ids = {
+                row.id
+                for row in await commandes_en_attente_de_preuve(
+                    db, merchant.id, outside_phone
+                )
+            }
+            delivered_ids = {
+                row.id
+                for row in await commandes_en_attente_de_preuve(
+                    db, merchant.id, delivered_phone
+                )
+            }
+            paid_ids = {
+                row.id
+                for row in await commandes_en_attente_de_preuve(
+                    db, merchant.id, paid_phone
+                )
+            }
+            cancelled_ids = {
+                row.id
+                for row in await commandes_en_attente_de_preuve(
+                    db, merchant.id, cancelled_phone
+                )
+            }
+        assert inside.id in inside_ids
+        assert outside.id not in outside_ids
+        assert delivered.id in delivered_ids
+        assert paid.id not in paid_ids
+        assert cancelled.id not in cancelled_ids
+
+        vision = AsyncMock(return_value=ImageAnalysis(True, None))
+        send = AsyncMock()
+        media = str(tmp_path / "media")
+
+        async def _run(phone: str, message_id: str):
+            with (
+                patch("app.core.config.settings.media_dir", media),
+                patch(
+                    "app.proofs.service.telecharger_media_whatsapp",
+                    new=AsyncMock(return_value=(TINY_PNG, "image/png")),
+                ),
+                patch("app.proofs.service.classer_image_entrante", vision),
+                patch("app.proofs.service.envoyer_message_commercant", send),
+            ):
+                async with AsyncSessionLocal() as db:
+                    return await traiter_image_entrante(
+                        db, merchant, phone, message_id, "m", "image/png", None
+                    )
+
+        inside_row = await _run(inside_phone, "wamid.win-13")
+        assert inside_row is not None
+        assert inside_row.classification == CLASSIFICATION_PAYMENT_PROOF
+        assert vision.await_count == 1
+
+        vision.reset_mock()
+        outside_row = await _run(outside_phone, "wamid.win-15")
+        assert outside_row is not None
+        assert outside_row.classification == CLASSIFICATION_NOT_ANALYZED
+        vision.assert_not_awaited()
+
+        async with AsyncSessionLocal() as db:
+            stale = await db.get(Order, outside.id)
+            assert stale is not None
+            stale.payment_link_sent_at = datetime.now(timezone.utc)
+            await db.commit()
+
+        refreshed = await _run(outside_phone, "wamid.win-resend")
+        assert refreshed is not None
+        assert refreshed.classification == CLASSIFICATION_PAYMENT_PROOF
+        assert vision.await_count == 1
+
+        vision.reset_mock()
+        delivered_row = await _run(delivered_phone, "wamid.win-delivered")
+        assert delivered_row is not None
+        assert delivered_row.classification == CLASSIFICATION_PAYMENT_PROOF
+        assert vision.await_count == 1
+    finally:
+        await _cleanup(merchant.id)
+
+
+@pytest.mark.asyncio
+async def test_escalated_photos_notify_once_until_read(tmp_path: Path) -> None:
+    merchant, product, _clerk = await _seed_shop(tmp_path)
+    phone = PHONE
+    try:
+        conversation = await _add_conversation(
+            merchant.id, phone, status=STATUS_ESCALATED
+        )
+        media = str(tmp_path / "media")
+        vision = AsyncMock(return_value=ImageAnalysis(True, Decimal("4000")))
+        send = AsyncMock()
+
+        async def _photo(message_id: str, caption: str | None = None):
+            with (
+                patch("app.core.config.settings.media_dir", media),
+                patch(
+                    "app.proofs.service.telecharger_media_whatsapp",
+                    new=AsyncMock(return_value=(TINY_PNG, "image/png")),
+                ),
+                patch("app.proofs.service.classer_image_entrante", vision),
+                patch("app.proofs.service.envoyer_message_commercant", send),
+            ):
+                async with AsyncSessionLocal() as db:
+                    return await traiter_image_entrante(
+                        db, merchant, phone, message_id, "m", "image/png", caption
+                    )
+
+        unmatched = await _photo("wamid.esc-not-analyzed")
+        assert unmatched is not None
+        assert unmatched.classification == CLASSIFICATION_NOT_ANALYZED
+        vision.assert_not_awaited()
+
+        async with AsyncSessionLocal() as db:
+            notes = list(
+                (
+                    await db.execute(
+                        select(Notification).where(
+                            Notification.merchant_id == merchant.id
+                        )
+                    )
+                ).scalars().all()
+            )
+        escalated_notes = [
+            row for row in notes if row.type == "escalated_customer_message"
+        ]
+        proof_notes = [
+            row for row in notes if row.type == "payment_proof_received"
+        ]
+        assert len(escalated_notes) == 1
+        assert escalated_notes[0].related_id == conversation.id
+        assert escalated_notes[0].read_at is None
+        assert proof_notes == []
+        first_id = escalated_notes[0].id
+
+        await _photo("wamid.esc-second")
+        async with AsyncSessionLocal() as db:
+            await traiter_message_entrant(db, merchant.id, phone, "un texte")
+            notes = list(
+                (
+                    await db.execute(
+                        select(Notification).where(
+                            Notification.merchant_id == merchant.id,
+                            Notification.type == "escalated_customer_message",
+                        )
+                    )
+                ).scalars().all()
+            )
+        assert len(notes) == 1
+        assert notes[0].id == first_id
+
+        async with AsyncSessionLocal() as db:
+            await marquer_comme_lue(db, merchant.id, first_id)
+
+        order = await _place(merchant.id, product.id)
+        await _mark_link_sent(order.id, conversation.id)
+        proof = await _photo("wamid.esc-proof", caption=f"n°{order.order_number}")
+        assert proof is not None
+        assert proof.classification == CLASSIFICATION_PAYMENT_PROOF
+        async with AsyncSessionLocal() as db:
+            notes = list(
+                (
+                    await db.execute(
+                        select(Notification).where(
+                            Notification.merchant_id == merchant.id
+                        )
+                    )
+                ).scalars().all()
+            )
+        escalated_notes = [
+            row for row in notes if row.type == "escalated_customer_message"
+        ]
+        proof_notes = [
+            row for row in notes if row.type == "payment_proof_received"
+        ]
+        unread_escalated = [row for row in escalated_notes if row.read_at is None]
+        assert len(escalated_notes) == 2
+        assert len(unread_escalated) == 1
+        assert len(proof_notes) == 1
+        print(
+            "ESCALATED_PHOTO_NOTIFY",
+            f"not_analyzed={first_id}",
+            f"proof_also_escalated={unread_escalated[0].id}",
+            f"payment_proof_received={proof_notes[0].id}",
+        )
     finally:
         await _cleanup(merchant.id)
