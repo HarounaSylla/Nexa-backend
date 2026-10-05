@@ -9,6 +9,7 @@ from sqlalchemy import (
     DateTime,
     Enum,
     ForeignKey,
+    Index,
     Integer,
     Numeric,
     String,
@@ -53,6 +54,14 @@ def _pg_enum(enum_cls: type[enum.Enum], name: str) -> Enum:
 
 class Deliverer(Base):
     __tablename__ = "deliverers"
+    __table_args__ = (
+        Index(
+            "uq_deliverers_merchant_phone",
+            "merchant_id",
+            "phone",
+            unique=True,
+        ),
+    )
 
     id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),

@@ -395,6 +395,14 @@ POST /deliverers
 200
 {"id": "6dbab944-8535-44a6-a84c-736a6aa80504", "name": "Ibrahima Diop", "phone": "+221771112233"}
 
+Local `77 123 45 67` is stored as `+221771234567`. A second deliverer with the
+same number in another spelling returns 409
+`A deliverer with this phone number already exists`.
+
+PUT /deliverers/{id}
+{"name": "Ibrahima Diop", "phone": "771112233"}
+200 — canonical phone, orders already assigned show the new name/phone live.
+
 GET /deliverers
 200
 [{"id": "6dbab944-…", "name": "Ibrahima Diop", "phone": "+221771112233"}]

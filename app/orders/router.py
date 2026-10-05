@@ -22,6 +22,7 @@ from app.whatsapp.service import WhatsAppSendError
 from app.merchants.service import ConfiguredPaymentLinkNotFoundError
 from app.orders.service import (
     DeliveryNotAvailableError,
+    DuplicateDelivererPhoneError,
     InsufficientStockError,
     InvalidOrderStateError,
     NotFoundError,
@@ -41,6 +42,7 @@ from app.orders.service import (
     lister_livreurs,
     lister_zones_livraison,
     marquer_commande_payee,
+    modifier_livreur,
     obtenir_commande_commercant,
     obtenir_disponibilite,
     order_total,
@@ -182,8 +184,28 @@ class PaymentLinkRequest(BaseModel):
 
 
 class DelivererCreate(BaseModel):
-    name: str = Field(min_length=1)
-    phone: str = Field(min_length=1)
+    name: str
+    phone: str
+
+    @field_validator("name")
+    @classmethod
+    def trim_name(cls, value: object) -> str:
+        if not isinstance(value, str):
+            raise ValueError("must be a string")
+        trimmed = value.strip()
+        if not 1 <= len(trimmed) <= 60:
+            raise ValueError("must be 1–60 characters")
+        return trimmed
+
+    @field_validator("phone")
+    @classmethod
+    def canonicalize_phone(cls, value: object) -> str:
+        if not isinstance(value, str):
+            raise ValueError("must be a string")
+        try:
+            return normalize_phone(value)
+        except InvalidPhoneNumberError as exc:
+            raise ValueError(str(exc)) from exc
 
 
 class DelivererOut(BaseModel):
@@ -285,6 +307,10 @@ async def _detail_for(
 
 def _not_found_order() -> HTTPException:
     return HTTPException(status_code=404, detail="Order was not found")
+
+
+def _not_found_deliverer() -> HTTPException:
+    return HTTPException(status_code=404, detail="Deliverer was not found")
 
 
 def _map_error(exc: Exception) -> HTTPException:
@@ -539,5 +565,26 @@ async def create_merchant_deliverer(
     merchant: Merchant = Depends(get_current_merchant),
     db: AsyncSession = Depends(get_db),
 ) -> DelivererOut:
-    deliverer = await creer_livreur(db, merchant.id, body.name, body.phone)
+    try:
+        deliverer = await creer_livreur(db, merchant.id, body.name, body.phone)
+    except DuplicateDelivererPhoneError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return DelivererOut(id=deliverer.id, name=deliverer.name, phone=deliverer.phone)
+
+
+@deliverers_router.put("/{deliverer_id}", response_model=DelivererOut)
+async def update_merchant_deliverer(
+    deliverer_id: uuid.UUID,
+    body: DelivererCreate,
+    merchant: Merchant = Depends(get_current_merchant),
+    db: AsyncSession = Depends(get_db),
+) -> DelivererOut:
+    try:
+        deliverer = await modifier_livreur(
+            db, merchant.id, deliverer_id, body.name, body.phone
+        )
+    except NotFoundError as exc:
+        raise _not_found_deliverer() from exc
+    except DuplicateDelivererPhoneError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     return DelivererOut(id=deliverer.id, name=deliverer.name, phone=deliverer.phone)

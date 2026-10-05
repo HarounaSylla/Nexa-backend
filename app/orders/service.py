@@ -4,7 +4,8 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -35,6 +36,11 @@ PROOF_ACCEPTANCE_WINDOW = timedelta(days=14)
 
 class NotFoundError(LookupError):
     """Raised when a product, order, or deliverer does not exist."""
+
+
+class DuplicateDelivererPhoneError(ValueError):
+    def __init__(self) -> None:
+        super().__init__("A deliverer with this phone number already exists")
 
 
 class InsufficientStockError(Exception):
@@ -833,17 +839,79 @@ async def lister_livreurs(
     result = await db.execute(
         select(Deliverer)
         .where(Deliverer.merchant_id == merchant_id)
-        .order_by(Deliverer.name, Deliverer.created_at)
+        .order_by(func.lower(Deliverer.name), Deliverer.id)
     )
     return list(result.scalars().all())
+
+
+async def _phone_taken(
+    db: AsyncSession,
+    merchant_id: uuid.UUID,
+    phone: str,
+    *,
+    exclude_id: uuid.UUID | None = None,
+) -> bool:
+    query = select(Deliverer.id).where(
+        Deliverer.merchant_id == merchant_id,
+        Deliverer.phone == phone,
+    )
+    if exclude_id is not None:
+        query = query.where(Deliverer.id != exclude_id)
+    return (await db.execute(query)).scalar_one_or_none() is not None
+
+
+async def _obtenir_livreur(
+    db: AsyncSession, merchant_id: uuid.UUID, deliverer_id: uuid.UUID
+) -> Deliverer:
+    result = await db.execute(
+        select(Deliverer).where(
+            Deliverer.id == deliverer_id,
+            Deliverer.merchant_id == merchant_id,
+        )
+    )
+    deliverer = result.scalar_one_or_none()
+    if deliverer is None:
+        raise NotFoundError(f"Deliverer {deliverer_id} was not found")
+    return deliverer
 
 
 async def creer_livreur(
     db: AsyncSession, merchant_id: uuid.UUID, name: str, phone: str
 ) -> Deliverer:
+    if await _phone_taken(db, merchant_id, phone):
+        raise DuplicateDelivererPhoneError()
     deliverer = Deliverer(merchant_id=merchant_id, name=name, phone=phone)
     db.add(deliverer)
-    await db.commit()
+    try:
+        async with db.begin_nested():
+            await db.flush()
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise DuplicateDelivererPhoneError() from None
+    await db.refresh(deliverer)
+    return deliverer
+
+
+async def modifier_livreur(
+    db: AsyncSession,
+    merchant_id: uuid.UUID,
+    deliverer_id: uuid.UUID,
+    name: str,
+    phone: str,
+) -> Deliverer:
+    deliverer = await _obtenir_livreur(db, merchant_id, deliverer_id)
+    if await _phone_taken(db, merchant_id, phone, exclude_id=deliverer.id):
+        raise DuplicateDelivererPhoneError()
+    deliverer.name = name
+    deliverer.phone = phone
+    try:
+        async with db.begin_nested():
+            await db.flush()
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise DuplicateDelivererPhoneError() from None
     await db.refresh(deliverer)
     return deliverer
 
