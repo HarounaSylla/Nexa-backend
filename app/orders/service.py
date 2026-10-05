@@ -519,14 +519,17 @@ def build_payment_link_message(
     total: Decimal,
     payment_link: str,
     updated: bool,
+    label: str | None = None,
 ) -> str:
     amount = format_fcfa(total)
+    label_word = (label or "").strip()
+    named = f" {label_word}" if label_word else ""
     first = (
-        f"Bonjour, voici le lien mis à jour pour régler votre commande "
+        f"Bonjour, voici à nouveau le lien{named} pour régler votre commande "
         f"n°{order_number} ({amount}) :"
         if updated
         else (
-            f"Bonjour, voici le lien pour régler votre commande "
+            f"Bonjour, voici le lien{named} pour régler votre commande "
             f"n°{order_number} ({amount}) :"
         )
     )
@@ -736,9 +739,10 @@ async def envoyer_lien_paiement(
     db: AsyncSession,
     merchant: Merchant,
     order_id: uuid.UUID,
-    payment_link: str,
+    payment_link_id: uuid.UUID,
 ) -> Order:
     from app.agent.service import enregistrer_message_commercant
+    from app.merchants.service import obtenir_lien_paiement
     from app.whatsapp.service import envoyer_message_commercant
 
     merchant_id = merchant.id
@@ -753,8 +757,12 @@ async def envoyer_lien_paiement(
     if order.payment_status == PaymentStatus.paid:
         raise OrderAlreadyPaidError()
 
+    link = await obtenir_lien_paiement(db, merchant_id, payment_link_id)
+    snapshot_url = link.url
+    snapshot_label = link.label
     updated = order.payment_link_sent_at is not None
-    order.payment_link = payment_link
+    order.payment_link = snapshot_url
+    order.payment_link_label = snapshot_label
     await db.commit()
 
     result = await db.execute(
@@ -766,8 +774,9 @@ async def envoyer_lien_paiement(
     text = build_payment_link_message(
         order.order_number,
         order_total(list(order.items)),
-        payment_link,
+        snapshot_url,
         updated,
+        snapshot_label,
     )
     await db.rollback()
 

@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -20,12 +21,19 @@ from app.catalogue.models import Merchant
 from app.core.db import get_db
 from app.merchants.models import DEFAULT_SHOP_TIMEZONE
 from app.merchants.service import (
+    ConfiguredPaymentLinkNotFoundError,
     DemoMerchantAlreadyLinkedError,
     DemoMerchantNotFoundError,
+    DuplicatePaymentLinkLabelError,
     MerchantPreferencesData,
+    PaymentLinkLimitExceededError,
+    creer_lien_paiement,
     get_preferences,
     link_demo_merchant,
+    lister_liens_paiement,
+    modifier_lien_paiement,
     onboard_merchant,
+    supprimer_lien_paiement,
     update_preferences,
 )
 
@@ -191,3 +199,106 @@ async def replace_my_preferences(
         ),
     )
     return _preferences_out(updated)
+
+
+PAYMENT_LINK_LABEL_MAX = 40
+PAYMENT_LINK_URL_MAX = 500
+
+
+class PaymentLinkIn(BaseModel):
+    label: str
+    url: str
+
+    @field_validator("label")
+    @classmethod
+    def trim_label(cls, value: object) -> str:
+        if not isinstance(value, str):
+            raise ValueError("must be a string")
+        trimmed = value.strip()
+        if not 1 <= len(trimmed) <= PAYMENT_LINK_LABEL_MAX:
+            raise ValueError("must be 1–40 characters")
+        return trimmed
+
+    @field_validator("url")
+    @classmethod
+    def https_only(cls, value: object) -> str:
+        if not isinstance(value, str):
+            raise ValueError("must be a string")
+        trimmed = value.strip()
+        if len(trimmed) > PAYMENT_LINK_URL_MAX:
+            raise ValueError("must be at most 500 characters")
+        parsed = urlparse(trimmed)
+        if (
+            parsed.scheme != "https"
+            or not parsed.netloc
+            or " " in trimmed
+            or "\n" in trimmed
+            or "\r" in trimmed
+        ):
+            raise ValueError("must be a valid https:// URL")
+        return trimmed
+
+
+class PaymentLinkOut(BaseModel):
+    id: uuid.UUID
+    label: str
+    url: str
+
+
+def _link_out(row) -> PaymentLinkOut:
+    return PaymentLinkOut(id=row.id, label=row.label, url=row.url)
+
+
+@router.get("/me/payment-links", response_model=list[PaymentLinkOut])
+async def list_my_payment_links(
+    merchant: Merchant = Depends(get_current_merchant),
+    db: AsyncSession = Depends(get_db),
+) -> list[PaymentLinkOut]:
+    rows = await lister_liens_paiement(db, merchant.id)
+    return [_link_out(row) for row in rows]
+
+
+@router.post("/me/payment-links", response_model=PaymentLinkOut, status_code=201)
+async def create_my_payment_link(
+    body: PaymentLinkIn,
+    merchant: Merchant = Depends(get_current_merchant),
+    db: AsyncSession = Depends(get_db),
+) -> PaymentLinkOut:
+    try:
+        row = await creer_lien_paiement(db, merchant.id, body.label, body.url)
+    except DuplicatePaymentLinkLabelError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except PaymentLinkLimitExceededError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return _link_out(row)
+
+
+@router.put("/me/payment-links/{link_id}", response_model=PaymentLinkOut)
+async def update_my_payment_link(
+    link_id: uuid.UUID,
+    body: PaymentLinkIn,
+    merchant: Merchant = Depends(get_current_merchant),
+    db: AsyncSession = Depends(get_db),
+) -> PaymentLinkOut:
+    try:
+        row = await modifier_lien_paiement(
+            db, merchant.id, link_id, body.label, body.url
+        )
+    except ConfiguredPaymentLinkNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except DuplicatePaymentLinkLabelError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return _link_out(row)
+
+
+@router.delete("/me/payment-links/{link_id}", status_code=204)
+async def delete_my_payment_link(
+    link_id: uuid.UUID,
+    merchant: Merchant = Depends(get_current_merchant),
+    db: AsyncSession = Depends(get_db),
+) -> Response:
+    try:
+        await supprimer_lien_paiement(db, merchant.id, link_id)
+    except ConfiguredPaymentLinkNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return Response(status_code=204)

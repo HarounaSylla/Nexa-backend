@@ -10,6 +10,7 @@ from app.agent.models import Conversation, Message
 from app.catalogue.models import Merchant, Product
 from app.core.db import AsyncSessionLocal
 from app.main import app
+from app.merchants.models import MerchantPaymentLink
 from app.notifications.models import Notification
 from app.orders.models import (
     Deliverer,
@@ -79,6 +80,11 @@ async def _cleanup(*merchant_ids: uuid.UUID) -> None:
         )
         await db.execute(
             delete(DeliveryZone).where(DeliveryZone.merchant_id.in_(merchant_ids))
+        )
+        await db.execute(
+            delete(MerchantPaymentLink).where(
+                MerchantPaymentLink.merchant_id.in_(merchant_ids)
+            )
         )
         await db.execute(delete(Product).where(Product.merchant_id.in_(merchant_ids)))
         await db.execute(delete(Merchant).where(Merchant.id.in_(merchant_ids)))
@@ -305,10 +311,10 @@ def test_build_payment_link_message_exact_text() -> None:
     from app.orders.service import build_payment_link_message
 
     first = build_payment_link_message(
-        12, Decimal("25000.00"), "https://pay.example.com/x", updated=False
+        12, Decimal("25000.00"), "https://pay.example.com/x", False, "Wave"
     )
     assert first == (
-        "Bonjour, voici le lien pour régler votre commande n°12 (25 000 FCFA) :\n"
+        "Bonjour, voici le lien Wave pour régler votre commande n°12 (25 000 FCFA) :\n"
         "https://pay.example.com/x\n"
         "\n"
         "Après le paiement, envoyez-nous ici une photo ou une capture "
@@ -317,14 +323,38 @@ def test_build_payment_link_message_exact_text() -> None:
         "c'est cette preuve qui nous permet de retrouver votre paiement."
     )
     updated = build_payment_link_message(
-        12, Decimal("25000.00"), "https://pay.example.com/y", updated=True
+        12, Decimal("25000.00"), "https://pay.example.com/y", True, "Orange Money"
     )
     assert updated.startswith(
-        "Bonjour, voici le lien mis à jour pour régler votre commande "
+        "Bonjour, voici à nouveau le lien Orange Money pour régler votre commande "
         "n°12 (25 000 FCFA) :"
     )
     assert "https://pay.example.com/y" in updated
     assert "preuve de paiement" in updated
+    unnamed = build_payment_link_message(
+        12, Decimal("25000.00"), "https://pay.example.com/z", False, None
+    )
+    assert unnamed.startswith(
+        "Bonjour, voici le lien pour régler votre commande n°12 (25 000 FCFA) :"
+    )
+    unnamed_again = build_payment_link_message(
+        12, Decimal("25000.00"), "https://pay.example.com/z", True, None
+    )
+    assert unnamed_again.startswith(
+        "Bonjour, voici à nouveau le lien pour régler votre commande "
+        "n°12 (25 000 FCFA) :"
+    )
+
+
+async def _add_link(
+    merchant_id: uuid.UUID, label: str, url: str
+) -> MerchantPaymentLink:
+    async with AsyncSessionLocal() as db:
+        row = MerchantPaymentLink(merchant_id=merchant_id, label=label, url=url)
+        db.add(row)
+        await db.commit()
+        await db.refresh(row)
+        return row
 
 
 async def _attach_conversation(
@@ -366,8 +396,12 @@ async def test_send_payment_link_success_resend_and_no_conversation() -> None:
         orphan = await _place(
             merchant.id, product.id, payment_method=PaymentMethod.online
         )
-        first_link = "https://pay.example.com/nexa-test"
-        second_link = "https://pay.example.com/nexa-updated"
+        first = await _add_link(
+            merchant.id, "Wave", "https://pay.example.com/nexa-test"
+        )
+        second = await _add_link(
+            merchant.id, "Orange Money", "https://pay.example.com/nexa-updated"
+        )
 
         with (
             _auth(clerk_user_id),
@@ -377,30 +411,39 @@ async def test_send_payment_link_success_resend_and_no_conversation() -> None:
             ) as send,
         ):
             async with await _client() as client:
+                rejected_old = await client.post(
+                    f"/orders/{online.id}/send-payment-link",
+                    headers=_headers(),
+                    json={"payment_link": first.url},
+                )
+                assert rejected_old.status_code == 422
+
                 accepted = await client.post(
                     f"/orders/{online.id}/send-payment-link",
                     headers=_headers(),
-                    json={"payment_link": first_link},
+                    json={"payment_link_id": str(first.id)},
                 )
                 assert accepted.status_code == 200, accepted.text
                 body = accepted.json()
-                assert body["payment_link"] == first_link
+                assert body["payment_link"] == first.url
+                assert body["payment_link_label"] == "Wave"
                 assert body["payment_status"] == PaymentStatus.pending.value
                 assert body["payment_link_sent_at"] is not None
 
                 resent = await client.post(
                     f"/orders/{online.id}/send-payment-link",
                     headers=_headers(),
-                    json={"payment_link": second_link},
+                    json={"payment_link_id": str(second.id)},
                 )
                 assert resent.status_code == 200, resent.text
-                assert resent.json()["payment_link"] == second_link
+                assert resent.json()["payment_link"] == second.url
+                assert resent.json()["payment_link_label"] == "Orange Money"
                 assert resent.json()["payment_link_sent_at"] is not None
 
                 orphaned = await client.post(
                     f"/orders/{orphan.id}/send-payment-link",
                     headers=_headers(),
-                    json={"payment_link": first_link},
+                    json={"payment_link_id": str(first.id)},
                 )
                 assert orphaned.status_code == 200, orphaned.text
                 assert orphaned.json()["payment_link_sent_at"] is not None
@@ -409,12 +452,16 @@ async def test_send_payment_link_success_resend_and_no_conversation() -> None:
         first_text = send.await_args_list[0].args[1]
         assert str(online.order_number) in first_text
         assert "25 000 FCFA" in first_text
-        assert first_link in first_text
+        assert first.url in first_text
+        assert "Wave" in first_text
         assert "preuve de paiement" in first_text
-        assert "mis à jour" not in first_text
+        assert "à nouveau" not in first_text
         second_text = send.await_args_list[1].args[1]
-        assert "mis à jour" in second_text
-        assert second_link in second_text
+        assert second_text.startswith(
+            f"Bonjour, voici à nouveau le lien Orange Money pour régler "
+            f"votre commande n°{online.order_number}"
+        )
+        assert second.url in second_text
 
         async with AsyncSessionLocal() as db:
             stored = list(
@@ -430,9 +477,11 @@ async def test_send_payment_link_success_resend_and_no_conversation() -> None:
             assert stored[0].turn_role == "merchant"
             assert stored[0].items == []
             assert str(online.order_number) in stored[0].display_text
-            assert first_link in stored[0].display_text
+            assert first.url in stored[0].display_text
+            assert "Wave" in stored[0].display_text
             assert "preuve de paiement" in stored[0].display_text
-            assert "mis à jour" in stored[1].display_text
+            assert "à nouveau" in stored[1].display_text
+            assert "Orange Money" in stored[1].display_text
     finally:
         await _cleanup(merchant.id)
 
@@ -488,7 +537,13 @@ async def test_send_payment_link_failures_and_rules() -> None:
         theirs = await _place(
             other.id, other_product.id, payment_method=PaymentMethod.online
         )
-        link = "https://pay.example.com/nexa-fail"
+        configured = await _add_link(
+            merchant.id, "Wave", "https://pay.example.com/nexa-fail"
+        )
+        theirs_link = await _add_link(
+            other.id, "Wave", "https://pay.example.com/other"
+        )
+        unknown_id = uuid.uuid4()
 
         with _auth(clerk_user_id):
             async with await _client() as client:
@@ -514,10 +569,26 @@ async def test_send_payment_link_failures_and_rules() -> None:
             ) as send,
         ):
             async with await _client() as client:
+                missing = await client.post(
+                    f"/orders/{online.id}/send-payment-link",
+                    headers=_headers(),
+                    json={"payment_link_id": str(unknown_id)},
+                )
+                assert missing.status_code == 404
+                assert missing.json()["detail"] == "Payment link was not found"
+
+                foreign = await client.post(
+                    f"/orders/{online.id}/send-payment-link",
+                    headers=_headers(),
+                    json={"payment_link_id": str(theirs_link.id)},
+                )
+                assert foreign.status_code == 404
+                assert foreign.json()["detail"] == "Payment link was not found"
+
                 closed = await client.post(
                     f"/orders/{window.id}/send-payment-link",
                     headers=_headers(),
-                    json={"payment_link": link},
+                    json={"payment_link_id": str(configured.id)},
                 )
                 assert closed.status_code == 502, closed.text
                 assert closed.json()["detail"] == "whatsapp_window_closed"
@@ -525,7 +596,7 @@ async def test_send_payment_link_failures_and_rules() -> None:
                 failed = await client.post(
                     f"/orders/{generic.id}/send-payment-link",
                     headers=_headers(),
-                    json={"payment_link": link},
+                    json={"payment_link_id": str(configured.id)},
                 )
                 assert failed.status_code == 502
                 assert failed.json()["detail"] == "whatsapp_send_failed"
@@ -533,7 +604,7 @@ async def test_send_payment_link_failures_and_rules() -> None:
                 on_cod = await client.post(
                     f"/orders/{cod.id}/send-payment-link",
                     headers=_headers(),
-                    json={"payment_link": link},
+                    json={"payment_link_id": str(configured.id)},
                 )
                 assert on_cod.status_code == 409
                 assert "online-payment" in on_cod.json()["detail"]
@@ -541,7 +612,7 @@ async def test_send_payment_link_failures_and_rules() -> None:
                 on_cancelled = await client.post(
                     f"/orders/{cancelled.id}/send-payment-link",
                     headers=_headers(),
-                    json={"payment_link": link},
+                    json={"payment_link_id": str(configured.id)},
                 )
                 assert on_cancelled.status_code == 409
                 assert "send a payment link for" in on_cancelled.json()["detail"]
@@ -549,7 +620,7 @@ async def test_send_payment_link_failures_and_rules() -> None:
                 on_paid = await client.post(
                     f"/orders/{paid.id}/send-payment-link",
                     headers=_headers(),
-                    json={"payment_link": link},
+                    json={"payment_link_id": str(configured.id)},
                 )
                 assert on_paid.status_code == 409
                 assert on_paid.json()["detail"] == "This order is already paid"
@@ -557,9 +628,10 @@ async def test_send_payment_link_failures_and_rules() -> None:
                 stolen = await client.post(
                     f"/orders/{theirs.id}/send-payment-link",
                     headers=_headers(),
-                    json={"payment_link": link},
+                    json={"payment_link_id": str(configured.id)},
                 )
                 assert stolen.status_code == 404
+                assert stolen.json()["detail"] == "Order was not found"
 
         assert send.await_count == 2
 
@@ -567,10 +639,12 @@ async def test_send_payment_link_failures_and_rules() -> None:
             window_row = await db.get(Order, window.id)
             generic_row = await db.get(Order, generic.id)
             assert window_row is not None
-            assert window_row.payment_link == link
+            assert window_row.payment_link == configured.url
+            assert window_row.payment_link_label == "Wave"
             assert window_row.payment_link_sent_at is None
             assert generic_row is not None
-            assert generic_row.payment_link == link
+            assert generic_row.payment_link == configured.url
+            assert generic_row.payment_link_label == "Wave"
             assert generic_row.payment_link_sent_at is None
             stored = list(
                 (
@@ -583,12 +657,15 @@ async def test_send_payment_link_failures_and_rules() -> None:
             )
             assert stored == []
 
+        bare_link = await _add_link(
+            bare.id, "Wave", "https://pay.example.com/nexa-fail"
+        )
         with _auth(bare.clerk_user_id):
             async with await _client() as client:
                 unconfigured = await client.post(
                     f"/orders/{bare_online.id}/send-payment-link",
                     headers=_headers(),
-                    json={"payment_link": link},
+                    json={"payment_link_id": str(bare_link.id)},
                 )
                 assert unconfigured.status_code == 502
                 assert unconfigured.json()["detail"] == "whatsapp_not_configured"
@@ -596,7 +673,7 @@ async def test_send_payment_link_failures_and_rules() -> None:
         async with await _client() as client:
             unauth = await client.post(
                 f"/orders/{online.id}/send-payment-link",
-                json={"payment_link": link},
+                json={"payment_link_id": str(configured.id)},
             )
             assert unauth.status_code == 401
     finally:

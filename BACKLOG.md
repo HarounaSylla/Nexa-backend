@@ -77,6 +77,10 @@ Jalon 3 part 2+ items get added only once that work actually starts.
 - Automatic online payment confirmation via a provider webhook
 - Un-marking a payment marked by mistake
 - [x] Inbound payment-proof photos: WhatsApp images stored privately, vision only when an online order is awaiting a proof (`payment_link_sent_at` set). Status becomes `proof_received` (never `paid`). Alembic `0015_payment_proofs`. `POST /orders/{id}/reject-proof`. Conversation ↔ order links on the merchant APIs.
+- [x] Reusable payment links in Préférences; `POST /orders/{id}/send-payment-link` takes a configured `payment_link_id` (Alembic `0016_merchant_payment_links`). Order stores a URL + label snapshot.
+- Per-order custom link / amount-prefilled links
+- Payment-link ordering
+- Deactivating a payment link without deleting it
 - WhatsApp message templates for sending after the 24 h window
 - A "Renvoyer" retry queue for failed merchant sends
 - PDF/document proofs and image questions from customers (non-proof images get no agent reply today)

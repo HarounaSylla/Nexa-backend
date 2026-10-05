@@ -5,12 +5,19 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass
 
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.catalogue.models import Merchant
-from app.merchants.models import DEFAULT_SHOP_TIMEZONE, MerchantPreferences
+from app.merchants.models import (
+    DEFAULT_SHOP_TIMEZONE,
+    MerchantPaymentLink,
+    MerchantPreferences,
+)
 from app.orders.models import PaymentMethod
+
+MAX_PAYMENT_LINKS_PER_MERCHANT = 10
 
 DEMO_MERCHANT_NAME = "Boutique Awa"
 
@@ -183,6 +190,105 @@ def accepted_payment_method_values(prefs: MerchantPreferencesData) -> list[str]:
     if prefs.accepts_online_payment:
         accepted.append(PaymentMethod.online.value)
     return accepted
+
+
+class DuplicatePaymentLinkLabelError(ValueError):
+    def __init__(self) -> None:
+        super().__init__("A payment link with this label already exists")
+
+
+class PaymentLinkLimitExceededError(ValueError):
+    def __init__(self) -> None:
+        super().__init__("At most 10 payment links are allowed")
+
+
+class ConfiguredPaymentLinkNotFoundError(LookupError):
+    def __init__(self) -> None:
+        super().__init__("Payment link was not found")
+
+
+async def lister_liens_paiement(
+    db: AsyncSession, merchant_id: uuid.UUID
+) -> list[MerchantPaymentLink]:
+    result = await db.execute(
+        select(MerchantPaymentLink)
+        .where(MerchantPaymentLink.merchant_id == merchant_id)
+        .order_by(MerchantPaymentLink.created_at.asc(), MerchantPaymentLink.id.asc())
+    )
+    return list(result.scalars().all())
+
+
+async def obtenir_lien_paiement(
+    db: AsyncSession, merchant_id: uuid.UUID, link_id: uuid.UUID
+) -> MerchantPaymentLink:
+    link = await db.get(MerchantPaymentLink, link_id)
+    if link is None or link.merchant_id != merchant_id:
+        raise ConfiguredPaymentLinkNotFoundError()
+    return link
+
+
+async def _label_taken(
+    db: AsyncSession,
+    merchant_id: uuid.UUID,
+    label: str,
+    *,
+    exclude_id: uuid.UUID | None = None,
+) -> bool:
+    query = select(MerchantPaymentLink.id).where(
+        MerchantPaymentLink.merchant_id == merchant_id,
+        func.lower(MerchantPaymentLink.label) == label.lower(),
+    )
+    if exclude_id is not None:
+        query = query.where(MerchantPaymentLink.id != exclude_id)
+    return (await db.execute(query)).scalar_one_or_none() is not None
+
+
+async def creer_lien_paiement(
+    db: AsyncSession, merchant_id: uuid.UUID, label: str, url: str
+) -> MerchantPaymentLink:
+    existing = await lister_liens_paiement(db, merchant_id)
+    if len(existing) >= MAX_PAYMENT_LINKS_PER_MERCHANT:
+        raise PaymentLinkLimitExceededError()
+    if await _label_taken(db, merchant_id, label):
+        raise DuplicatePaymentLinkLabelError()
+    row = MerchantPaymentLink(merchant_id=merchant_id, label=label, url=url)
+    db.add(row)
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise DuplicatePaymentLinkLabelError() from None
+    await db.refresh(row)
+    return row
+
+
+async def modifier_lien_paiement(
+    db: AsyncSession,
+    merchant_id: uuid.UUID,
+    link_id: uuid.UUID,
+    label: str,
+    url: str,
+) -> MerchantPaymentLink:
+    row = await obtenir_lien_paiement(db, merchant_id, link_id)
+    if await _label_taken(db, merchant_id, label, exclude_id=link_id):
+        raise DuplicatePaymentLinkLabelError()
+    row.label = label
+    row.url = url
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise DuplicatePaymentLinkLabelError() from None
+    await db.refresh(row)
+    return row
+
+
+async def supprimer_lien_paiement(
+    db: AsyncSession, merchant_id: uuid.UUID, link_id: uuid.UUID
+) -> None:
+    row = await obtenir_lien_paiement(db, merchant_id, link_id)
+    await db.delete(row)
+    await db.commit()
 
 
 def reject_unaccepted_payment_method(

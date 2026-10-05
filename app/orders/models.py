@@ -131,6 +131,7 @@ class Order(Base):
         server_default=text("'pending'"),
     )
     payment_link: Mapped[str | None] = mapped_column(String, nullable=True)
+    payment_link_label: Mapped[str | None] = mapped_column(Text, nullable=True)
     payment_link_sent_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True),
         nullable=True,

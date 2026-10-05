@@ -3,7 +3,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field, HttpUrl, model_validator
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.deps import get_current_merchant
@@ -18,6 +18,7 @@ from app.orders.models import (
 )
 from app.proofs.service import lister_preuves_commande
 from app.whatsapp.service import WhatsAppSendError
+from app.merchants.service import ConfiguredPaymentLinkNotFoundError
 from app.orders.service import (
     DeliveryNotAvailableError,
     InsufficientStockError,
@@ -161,12 +162,13 @@ class MerchantOrderDetail(MerchantOrderListItem):
     items: list[MerchantOrderItemOut]
     deliverer: AssignedDelivererOut | None
     payment_link_sent_at: datetime | None
+    payment_link_label: str | None = None
     conversation_id: uuid.UUID | None = None
     proofs: list[OrderProofOut] = []
 
 
 class PaymentLinkRequest(BaseModel):
-    payment_link: HttpUrl
+    payment_link_id: uuid.UUID
 
 
 class DelivererCreate(BaseModel):
@@ -246,6 +248,7 @@ def _to_detail(
         ],
         deliverer=deliverer,
         payment_link_sent_at=order.payment_link_sent_at,
+        payment_link_label=order.payment_link_label,
         conversation_id=order.conversation_id,
         proofs=[],
     )
@@ -380,9 +383,11 @@ async def send_merchant_payment_link(
     merchant_id = merchant.id
     try:
         await envoyer_lien_paiement(
-            db, merchant, order_id, str(body.payment_link)
+            db, merchant, order_id, body.payment_link_id
         )
         return await _detail_for(db, merchant_id, order_id)
+    except ConfiguredPaymentLinkNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
     except NotFoundError as exc:
         raise _not_found_order() from exc
     except (
