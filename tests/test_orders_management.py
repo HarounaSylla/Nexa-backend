@@ -475,7 +475,10 @@ async def test_send_payment_link_success_resend_and_no_conversation() -> None:
             )
             assert len(stored) == 2
             assert stored[0].turn_role == "merchant"
-            assert stored[0].items == []
+            assert stored[0].items
+            assert stored[0].items[0]["role"] == "assistant"
+            assert "lien de paiement Wave envoyé" in stored[0].items[0]["content"]
+            assert first.url not in stored[0].items[0]["content"]
             assert str(online.order_number) in stored[0].display_text
             assert first.url in stored[0].display_text
             assert "Wave" in stored[0].display_text

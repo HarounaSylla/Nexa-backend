@@ -1,4 +1,6 @@
 import asyncio
+import logging
+import unicodedata
 import uuid
 from decimal import Decimal
 from pathlib import Path
@@ -10,6 +12,8 @@ from app.catalogue.embeddings import embed_documents, embed_query, product_index
 from app.catalogue.models import Product, ProductImage
 from app.core.config import settings
 from app.orders.models import Order, OrderItem, OrderStatus
+
+logger = logging.getLogger(__name__)
 
 PRODUCT_IMAGES_DIR = (
     Path(__file__).resolve().parent.parent / "static" / "product_images"
@@ -75,6 +79,71 @@ async def index_product(db: AsyncSession, product: Product) -> None:
 _FRENCH_TS_CONFIG = literal_column("'french'")
 
 
+def _normalize_category_key(value: str) -> str:
+    """Same fold as `normalize_city`: strip, casefold, drop accents.
+
+    Categories stay stored as the merchant typed them. We only fold a
+    copy for matching, then filter with exact equality on the stored
+    value so `ix_products_category` stays usable.
+    """
+    collapsed = " ".join(value.split())
+    decomposed = unicodedata.normalize("NFKD", collapsed)
+    without_accents = "".join(
+        char for char in decomposed if not unicodedata.combining(char)
+    )
+    return without_accents.casefold()
+
+
+def _plural_variants(key: str) -> set[str]:
+    variants = {key}
+    if len(key) > 1 and key.endswith("s"):
+        variants.add(key[:-1])
+    elif key:
+        variants.add(key + "s")
+    return variants
+
+
+def resolve_stored_category(
+    requested: str, stored_categories: list[str]
+) -> str | None:
+    """Map a guessed category string to one stored `Product.category`.
+
+    Exact normalized match first, then a trivial singular/plural `s`.
+    Ambiguous matches return None (caller falls back to an unfiltered search).
+    """
+    key = _normalize_category_key(requested)
+    if not key:
+        return None
+    by_key: dict[str, str] = {}
+    for category in stored_categories:
+        if not category:
+            continue
+        folded = _normalize_category_key(category)
+        by_key.setdefault(folded, category)
+    if key in by_key:
+        return by_key[key]
+    matches = {
+        by_key[variant] for variant in _plural_variants(key) if variant in by_key
+    }
+    if len(matches) == 1:
+        return next(iter(matches))
+    return None
+
+
+async def _merchant_category_names(
+    db: AsyncSession, merchant_id: uuid.UUID
+) -> list[str]:
+    result = await db.execute(
+        select(Product.category)
+        .where(
+            Product.merchant_id == merchant_id,
+            Product.category.is_not(None),
+        )
+        .distinct()
+    )
+    return [row[0] for row in result.all() if row[0]]
+
+
 def _product_french_tsvector():
     """Same expression as the GIN index on products (migration 0006)."""
     document = (
@@ -111,28 +180,19 @@ async def _rechercher_produits_lexical(
     return list(result.scalars().all())
 
 
-async def rechercher_produits(
+async def _search_with_optional_category(
     db: AsyncSession,
     merchant_id: uuid.UUID,
     requete: str,
-    categorie: str | None = None,
-    limit: int = 5,
-    max_distance: float | None = None,
+    categorie: str | None,
+    limit: int,
+    cutoff: float,
+    query_embedding: list[float],
 ) -> list[Product]:
-    """Embed `requete` with embed_query(), then order products for this
-    merchant by cosine distance. Rows farther than `max_distance`
-    (default: settings.rag_max_distance) are dropped, so an out-of-
-    catalogue query returns [] rather than weak matches.
+    """Vector search then lexical fallback, both with the same category filter.
 
-    Vector search runs first (meaning and synonyms). If it returns
-    nothing under the threshold, fall back to PostgreSQL French
-    full-text search — a safety net for short/generic queries whose
-    embedding misses the semantic cutoff. Do not apply this fallback
-    to trouver_produits_similaires: that starts from a known
-    produit_id, not a customer text query.
+    `categorie` is already a stored value or None — never a guessed spelling.
     """
-    cutoff = settings.rag_max_distance if max_distance is None else max_distance
-    query_embedding = await asyncio.to_thread(embed_query, requete)
     distance = Product.embedding.cosine_distance(query_embedding)
     stmt = (
         select(Product)
@@ -152,6 +212,82 @@ async def rechercher_produits(
         return products
     return await _rechercher_produits_lexical(
         db, merchant_id, requete, categorie, limit
+    )
+
+
+async def rechercher_produits(
+    db: AsyncSession,
+    merchant_id: uuid.UUID,
+    requete: str,
+    categorie: str | None = None,
+    limit: int = 5,
+    max_distance: float | None = None,
+) -> list[Product]:
+    """Embed `requete` with embed_query(), then order products for this
+    merchant by cosine distance. Rows farther than `max_distance`
+    (default: settings.rag_max_distance) are dropped, so an out-of-
+    catalogue query returns [] rather than weak matches.
+
+    Vector search runs first (meaning and synonyms). If it returns
+    nothing under the threshold, fall back to PostgreSQL French
+    full-text search — a safety net for short/generic queries whose
+    embedding misses the semantic cutoff. Do not apply this fallback
+    to trouver_produits_similaires: that starts from a known
+    produit_id, not a customer text query.
+
+    A guessed `categorie` is resolved against the merchant's stored
+    category names (accent/case/trivial plural) and applied as exact
+    equality. If that filtered search is empty, the same search runs
+    once more without a category.
+    """
+    cutoff = settings.rag_max_distance if max_distance is None else max_distance
+    requested = (categorie or "").strip() or None
+    stored: str | None = None
+    if requested is not None:
+        names = await _merchant_category_names(db, merchant_id)
+        stored = resolve_stored_category(requested, names)
+    filter_value = stored if stored is not None else requested
+
+    query_embedding = await asyncio.to_thread(embed_query, requete)
+    products = await _search_with_optional_category(
+        db,
+        merchant_id,
+        requete,
+        filter_value,
+        limit,
+        cutoff,
+        query_embedding,
+    )
+    if products:
+        if (
+            requested is not None
+            and stored is not None
+            and stored != requested
+        ):
+            logger.info(
+                "rechercher_produits category resolved merchant_id=%s "
+                "requested=%s resolved=%s",
+                merchant_id,
+                requested,
+                stored,
+            )
+        return products
+    if requested is None:
+        return []
+    logger.info(
+        "rechercher_produits category dropped merchant_id=%s "
+        "requested=%s resolved=dropped",
+        merchant_id,
+        requested,
+    )
+    return await _search_with_optional_category(
+        db,
+        merchant_id,
+        requete,
+        None,
+        limit,
+        cutoff,
+        query_embedding,
     )
 
 

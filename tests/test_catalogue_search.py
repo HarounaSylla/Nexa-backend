@@ -13,7 +13,9 @@ from app.catalogue.service import (
     lister_categories_dashboard,
     lister_produits_populaires,
     rechercher_produits,
+    resolve_stored_category,
     trouver_produits_similaires,
+    _search_with_optional_category,
 )
 from app.core.db import AsyncSessionLocal
 from app.orders.models import Order, OrderItem, OrderStatus, PaymentMethod
@@ -266,6 +268,237 @@ async def test_rechercher_produits_lexical_fallback_still_rejects_ood() -> None:
             assert results == []
         finally:
             await db.delete(product)
+            await db.delete(merchant)
+            await db.commit()
+
+
+def test_resolve_stored_category_case_accent_and_plural() -> None:
+    stored = ["Robes"]
+    assert resolve_stored_category("robes", stored) == "Robes"
+    assert resolve_stored_category("Robes", stored) == "Robes"
+    assert resolve_stored_category("ROBE", stored) == "Robes"
+    assert resolve_stored_category("robés", stored) == "Robes"
+    assert resolve_stored_category(" Robes ", stored) == "Robes"
+    assert resolve_stored_category("chaussures-inexistantes", stored) is None
+
+
+@pytest.mark.asyncio
+async def test_rechercher_produits_resolves_wrong_category_spellings() -> None:
+    query = _vector(0)
+    async with AsyncSessionLocal() as db:
+        merchant = Merchant(name=f"pytest-cat-resolve-{uuid.uuid4()}")
+        db.add(merchant)
+        await db.flush()
+        robe = Product(
+            merchant_id=merchant.id,
+            name="Robe longue rouge",
+            description="soirée",
+            category="Robes",
+            price=Decimal("25000.00"),
+            embedding=query,
+        )
+        shoe = Product(
+            merchant_id=merchant.id,
+            name="Baskets blanches",
+            description="homme",
+            category="chaussures",
+            price=Decimal("15000.00"),
+            embedding=query,
+        )
+        db.add_all([robe, shoe])
+        await db.flush()
+        try:
+            with patch(
+                "app.catalogue.service.embed_query",
+                return_value=query,
+            ):
+                for guessed in ("robes", "Robes", "ROBE", "robés"):
+                    results = await rechercher_produits(
+                        db,
+                        merchant.id,
+                        "robe rouge",
+                        categorie=guessed,
+                    )
+                    assert [product.name for product in results] == [
+                        "Robe longue rouge"
+                    ], guessed
+        finally:
+            await db.delete(shoe)
+            await db.delete(robe)
+            await db.delete(merchant)
+            await db.commit()
+
+
+@pytest.mark.asyncio
+async def test_rechercher_produits_unknown_category_matches_unfiltered() -> None:
+    query = _vector(0)
+    async with AsyncSessionLocal() as db:
+        merchant = Merchant(name=f"pytest-cat-unknown-{uuid.uuid4()}")
+        db.add(merchant)
+        await db.flush()
+        robe = Product(
+            merchant_id=merchant.id,
+            name="Robe longue rouge",
+            category="Robes",
+            price=Decimal("25000.00"),
+            embedding=query,
+        )
+        shoe = Product(
+            merchant_id=merchant.id,
+            name="Baskets blanches",
+            category="chaussures",
+            price=Decimal("15000.00"),
+            embedding=query,
+        )
+        db.add_all([robe, shoe])
+        await db.flush()
+        try:
+            with patch(
+                "app.catalogue.service.embed_query",
+                return_value=query,
+            ):
+                unfiltered = await rechercher_produits(
+                    db, merchant.id, "robe rouge", categorie=None
+                )
+                dropped = await rechercher_produits(
+                    db,
+                    merchant.id,
+                    "robe rouge",
+                    categorie="chaussures-inexistantes",
+                )
+            assert [product.name for product in dropped] == [
+                product.name for product in unfiltered
+            ]
+            assert {product.name for product in dropped} == {
+                "Robe longue rouge",
+                "Baskets blanches",
+            }
+        finally:
+            await db.delete(shoe)
+            await db.delete(robe)
+            await db.delete(merchant)
+            await db.commit()
+
+
+@pytest.mark.asyncio
+async def test_rechercher_produits_wrong_category_still_rejects_ood() -> None:
+    query = _vector(0)
+    far = _vector(20)
+    async with AsyncSessionLocal() as db:
+        merchant = Merchant(name=f"pytest-cat-ood-{uuid.uuid4()}")
+        db.add(merchant)
+        await db.flush()
+        product = Product(
+            merchant_id=merchant.id,
+            name="Robe longue rouge de soirée",
+            description="pour un mariage",
+            category="Robes",
+            price=Decimal("25000.00"),
+            embedding=far,
+        )
+        db.add(product)
+        await db.flush()
+        try:
+            with patch(
+                "app.catalogue.service.embed_query",
+                return_value=query,
+            ):
+                results = await rechercher_produits(
+                    db,
+                    merchant.id,
+                    "ciment 50kg pour chantier",
+                    categorie="robes",
+                )
+            assert results == []
+        finally:
+            await db.delete(product)
+            await db.delete(merchant)
+            await db.commit()
+
+
+@pytest.mark.asyncio
+async def test_rechercher_produits_correct_category_still_filters() -> None:
+    query = _vector(0)
+    async with AsyncSessionLocal() as db:
+        merchant = Merchant(name=f"pytest-cat-filter-{uuid.uuid4()}")
+        db.add(merchant)
+        await db.flush()
+        robe = Product(
+            merchant_id=merchant.id,
+            name="Robe longue rouge",
+            category="Robes",
+            price=Decimal("25000.00"),
+            embedding=query,
+        )
+        shoe = Product(
+            merchant_id=merchant.id,
+            name="Baskets blanches",
+            category="chaussures",
+            price=Decimal("15000.00"),
+            embedding=query,
+        )
+        db.add_all([robe, shoe])
+        await db.flush()
+        try:
+            with patch(
+                "app.catalogue.service.embed_query",
+                return_value=query,
+            ):
+                results = await rechercher_produits(
+                    db, merchant.id, "robe rouge", categorie="Robes"
+                )
+            assert [product.name for product in results] == ["Robe longue rouge"]
+            assert all(product.category == "Robes" for product in results)
+        finally:
+            await db.delete(shoe)
+            await db.delete(robe)
+            await db.delete(merchant)
+            await db.commit()
+
+
+@pytest.mark.asyncio
+async def test_rechercher_produits_category_fallback_runs_at_most_once() -> None:
+    query = _vector(0)
+    async with AsyncSessionLocal() as db:
+        merchant = Merchant(name=f"pytest-cat-once-{uuid.uuid4()}")
+        db.add(merchant)
+        await db.flush()
+        robe = Product(
+            merchant_id=merchant.id,
+            name="Robe longue rouge",
+            category="Robes",
+            price=Decimal("25000.00"),
+            embedding=query,
+        )
+        db.add(robe)
+        await db.flush()
+        try:
+            with (
+                patch(
+                    "app.catalogue.service.embed_query",
+                    return_value=query,
+                ),
+                patch(
+                    "app.catalogue.service._search_with_optional_category",
+                    wraps=_search_with_optional_category,
+                ) as inner,
+            ):
+                missed = await rechercher_produits(
+                    db,
+                    merchant.id,
+                    "robe rouge",
+                    categorie="chaussures-inexistantes",
+                )
+                assert [product.name for product in missed] == ["Robe longue rouge"]
+                assert inner.await_count == 2
+                inner.reset_mock()
+                hit = await rechercher_produits(
+                    db, merchant.id, "robe rouge", categorie="Robes"
+                )
+                assert [product.name for product in hit] == ["Robe longue rouge"]
+                assert inner.await_count == 1
+        finally:
+            await db.delete(robe)
             await db.delete(merchant)
             await db.commit()
 

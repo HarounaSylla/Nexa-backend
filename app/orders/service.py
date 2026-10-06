@@ -780,6 +780,7 @@ async def envoyer_lien_paiement(
     order_id: uuid.UUID,
     payment_link_id: uuid.UUID,
 ) -> Order:
+    from app.agent.handover import item_automatic_payment_link
     from app.agent.service import enregistrer_message_commercant
     from app.merchants.service import obtenir_lien_paiement
     from app.whatsapp.service import envoyer_message_commercant
@@ -824,7 +825,12 @@ async def envoyer_lien_paiement(
     order = await _owned_order(db, merchant_id, order_id)
     order.payment_link_sent_at = datetime.now(timezone.utc)
     if conversation_id is not None:
-        await enregistrer_message_commercant(db, conversation_id, text)
+        await enregistrer_message_commercant(
+            db,
+            conversation_id,
+            text,
+            items=[item_automatic_payment_link(snapshot_label, order.order_number)],
+        )
     await db.commit()
 
     result = await db.execute(

@@ -153,6 +153,7 @@ async def test_webhook_post_enqueues_text_and_ignores_statuses() -> None:
         with (
             patch("app.whatsapp.router.enqueue_inbound_text") as enqueue,
             patch("app.whatsapp.router.enqueue_inbound_image") as enqueue_image,
+            patch.object(settings, "whatsapp_app_secret", ""),
         ):
             async with await _client() as client:
                 statuses = await client.post(
@@ -656,7 +657,9 @@ async def test_worker_sends_text_then_caps_images_at_three(caplog: pytest.LogCap
 
 
 @pytest.mark.asyncio
-async def test_worker_skips_already_sent_photos_but_still_sends_description() -> None:
+async def test_worker_skips_already_sent_photos_but_still_sends_description(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     from app.agent.models import SentProductImage
 
     merchant = await _seed_linked_merchant()
@@ -736,12 +739,14 @@ async def test_worker_skips_already_sent_photos_but_still_sends_description() ->
                 new_callable=AsyncMock,
             ) as send_image,
         ):
-            await process_inbound_whatsapp_text_async(
-                "wamid.images-repeat",
-                "221770001308",
-                "et les robes ?",
-                merchant.whatsapp_phone_number_id or "",
-            )
+            with caplog.at_level(logging.INFO, logger="app.workers.whatsapp"):
+                await process_inbound_whatsapp_text_async(
+                    "wamid.images-repeat",
+                    "221770001308",
+                    "et les robes ?",
+                    merchant.whatsapp_phone_number_id or "",
+                )
+            assert "Skipping already-sent product photo" in caplog.text
             bodies = [call.args[1] for call in send_text.await_args_list]
             assert bodies[0] == "Encore les mêmes."
             assert bodies[1:] == [
@@ -754,7 +759,9 @@ async def test_worker_skips_already_sent_photos_but_still_sends_description() ->
 
 
 @pytest.mark.asyncio
-async def test_worker_single_image_uses_caption_and_skips_resend() -> None:
+async def test_worker_single_image_uses_caption_and_skips_resend(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     from app.agent.models import SentProductImage
 
     merchant = await _seed_linked_merchant()
@@ -862,13 +869,15 @@ async def test_worker_single_image_uses_caption_and_skips_resend() -> None:
                 new_callable=AsyncMock,
             ) as send_image_again,
         ):
-            await process_inbound_whatsapp_text_async(
-                "wamid.single-2",
-                "221770001309",
-                "la robe rouge encore ?",
-                merchant.whatsapp_phone_number_id or "",
-            )
+            with caplog.at_level(logging.INFO, logger="app.workers.whatsapp"):
+                await process_inbound_whatsapp_text_async(
+                    "wamid.single-2",
+                    "221770001309",
+                    "la robe rouge encore ?",
+                    merchant.whatsapp_phone_number_id or "",
+                )
             send_text_again.assert_awaited_once()
             send_image_again.assert_not_awaited()
+            assert "Skipping already-sent product photo" in caplog.text
     finally:
         await _cleanup(merchant.id)

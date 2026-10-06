@@ -56,8 +56,23 @@ TikTok comment classifier (Jalon 7) remains a separate model decision.
 - [x] WhatsApp outbound product photos: worker uploads local files via Graph `/media` then sends `type=image` with `media_id` (not a public `link`). Cap 3 per turn. `extract_product_images` lives in `app/agent/images.py` (simulate unchanged).
 - [x] Close conversations on delivery (`confirmer_livraison`) and 48h inactivity (lazy inbound + RQ `close_stale_conversations` on `maintenance` every 15 min). Sweep preserves `updated_at` so the 15-min reopen grace does not revive a swept thread.
 - [x] WhatsApp inbound images (payment proofs) — stored privately, vision only when an order is awaiting a proof. Voice / PDF still skipped.
+- [x] Agent sees human-handover and inbound-photo turns as replayable text markers (`app/agent/handover.py`); a developer note is injected at replay when a `[Boutique]` reply follows the last native agent turn. Tool outputs carry `photo_status` (`will_be_sent` / `already_sent_earlier` / `none`) using the same plan as the WhatsApp worker. Prompt rules 14–15. No schema change.
+
+- [x] `rechercher_produits` resolves a guessed `categorie` against stored names (case / accents / trivial singular-plural) then exact-equality filter; if that search is empty it retries once without a category (`rag_max_distance` still applies).
 
 Jalon 3 part 2+ items get added only once that work actually starts.
+
+## Agent context — remaining risks (audit 2026-10-06)
+
+These were listed in `Nexa/proofs/audit-agent-context.md` and are **not** in this change (conversation lifetime, vision, and embeddings stay untouched).
+
+- The 48 h `active` conversation is shared across calendar days, so last night's order, product UUIDs, and `sent_product_images` stay in play the next afternoon.
+- `sent_product_images` is unique on `(conversation_id, product_id)` for the whole conversation lifetime — a product photo is never re-sent even after a new intent.
+- Inbound WhatsApp audio / document types are not handled (`app/whatsapp`); those messages never enter this pipeline.
+- `obtenir_dernier_message_agent` is the latest agent turn for this **merchant + phone**, not strictly this conversation — wrong-thread risk if two conversations ever exist for the same phone.
+- No history truncation; replayed `input_list` grows for the whole conversation.
+- Return the merchant's real category names in the `rechercher_produits` tool result when a guessed `categorie` is dropped, so the model can retry with an exact value.
+- Merchant-side category normalisation in the dashboard (typos / accents / casing when creating or renaming a category).
 
 ## Jalon 4 — Dashboard
 
@@ -85,7 +100,7 @@ Jalon 3 part 2+ items get added only once that work actually starts.
 - Deactivating a payment link without deleting it
 - WhatsApp message templates for sending after the 24 h window
 - A "Renvoyer" retry queue for failed merchant sends
-- PDF/document proofs and image questions from customers (non-proof images get no agent reply today)
+- PDF/document proofs and image questions from customers (non-proof inbound photos now leave a text marker for the agent; the model still cannot see pixels)
 - Notification when a customer sends a photo before any link was sent (currently stored and visible in the thread only)
 - Merchant "attach this photo to an order" action for ambiguous cases
 - [x] Inbound image file retention (Alembic `0019`, 90 days after reception once unpaid/pending proofs are done; row kept, file deleted)

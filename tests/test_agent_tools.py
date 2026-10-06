@@ -147,6 +147,7 @@ async def test_execute_tool_routes_obtenir_disponibilite() -> None:
             assert payload["stock_status"] == "disponible"
             assert "stock_qty" not in payload
             assert payload["product_id"] == str(product.id)
+            assert payload["photo_status"] == "none"
             assert '"stock_qty"' not in raw
         finally:
             await _cleanup_merchant(db, merchant.id)
@@ -330,6 +331,7 @@ async def test_execute_tool_popular_omits_stock_qty_service_keeps_it() -> None:
             assert payload["products"][0]["stock_status"] == "stock_faible"
             assert "stock_qty" not in payload["products"][0]
             assert payload["products"][0]["image_url"] is None
+            assert payload["products"][0]["photo_status"] == "none"
         finally:
             await _cleanup_merchant(db, merchant.id)
 
@@ -418,6 +420,7 @@ async def test_execute_tool_includes_image_url_when_photo_exists() -> None:
             assert search["products"][0]["image_url"] == (
                 f"/static/product_images/{product.id}.jpg"
             )
+            assert search["products"][0]["photo_status"] == "will_be_sent"
 
             similar_raw = await execute_tool(
                 db,
@@ -440,6 +443,7 @@ async def test_execute_tool_includes_image_url_when_photo_exists() -> None:
             assert popular["products"][0]["image_url"] == (
                 f"/static/product_images/{product.id}.jpg"
             )
+            assert popular["products"][0]["photo_status"] == "will_be_sent"
 
             avail_raw = await execute_tool(
                 db,
@@ -451,6 +455,7 @@ async def test_execute_tool_includes_image_url_when_photo_exists() -> None:
             avail = json.loads(avail_raw)
             assert avail["image_url"] == f"/static/product_images/{product.id}.jpg"
             assert avail["stock_status"] == "disponible"
+            assert avail["photo_status"] == "will_be_sent"
         finally:
             await _cleanup_merchant(db, merchant.id)
 

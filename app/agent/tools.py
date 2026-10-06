@@ -15,6 +15,10 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agent.images import (
+    PHOTO_STATUS_NONE,
+    photo_delivery_plan,
+)
 from app.catalogue.models import Product
 from app.catalogue.service import (
     ProductNotFoundError,
@@ -60,7 +64,11 @@ TOOLS: list[dict[str, Any]] = [
                 },
                 "categorie": {
                     "type": ["string", "null"],
-                    "description": "Optional category filter, or null.",
+                    "description": (
+                        "Exact category name as returned by "
+                        "lister_categories, or null when unsure. "
+                        "Do not guess or translate the category."
+                    ),
                 },
             },
             "required": ["requete", "categorie"],
@@ -292,6 +300,57 @@ def _parse_uuid(value: str, field: str) -> uuid.UUID:
         raise ValueError(f"Invalid {field}: {value}") from exc
 
 
+def _product_id_from_entry(entry: dict[str, Any]) -> uuid.UUID | None:
+    raw = entry.get("id") or entry.get("product_id")
+    if not raw:
+        return None
+    try:
+        return uuid.UUID(str(raw))
+    except ValueError:
+        return None
+
+
+async def _attach_photo_status(
+    db: AsyncSession,
+    conversation_id: uuid.UUID,
+    payload: dict[str, Any],
+) -> None:
+    """Annotate tool payloads that carry product image_url (in place)."""
+    from app.agent.service import already_sent_product_ids
+
+    entries: list[dict[str, Any]] = []
+    if isinstance(payload.get("products"), list):
+        entries.extend(
+            product for product in payload["products"] if isinstance(product, dict)
+        )
+    if payload.get("product_id") is not None and "image_url" in payload:
+        entries.append(payload)
+    if not entries:
+        return
+
+    ids: list[uuid.UUID] = []
+    queue: list[uuid.UUID] = []
+    for entry in entries:
+        product_id = _product_id_from_entry(entry)
+        if product_id is None:
+            entry["photo_status"] = PHOTO_STATUS_NONE
+            continue
+        ids.append(product_id)
+        if entry.get("image_url"):
+            queue.append(product_id)
+
+    already_sent = await already_sent_product_ids(db, conversation_id, ids)
+    plan = photo_delivery_plan(queue, already_sent)
+    for entry in entries:
+        product_id = _product_id_from_entry(entry)
+        if product_id is None:
+            continue
+        if not entry.get("image_url"):
+            entry["photo_status"] = PHOTO_STATUS_NONE
+        else:
+            entry["photo_status"] = plan.get(product_id, PHOTO_STATUS_NONE)
+
+
 def _payment_method(raw: str) -> PaymentMethod:
     normalized = raw.strip().lower().replace("é", "e").replace(" ", "_")
     aliases = {
@@ -322,6 +381,7 @@ async def execute_tool(
         payload = await _dispatch(
             db, tool_name, tool_args, merchant_id, conversation_id
         )
+        await _attach_photo_status(db, conversation_id, payload)
         return json.dumps(payload, default=str)
     except (
         InsufficientStockError,

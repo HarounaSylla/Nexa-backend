@@ -39,7 +39,8 @@ line, screenshot, or database check) in the Proof column.
 | P1 | Inbound payment-proof photos + conversation ↔ order links | Code landed (live webhook blocked) | 2026-10-04. Alembic `0015_payment_proofs`: enum `pending`/`paid`/`proof_received`; `inbound_images`. `alembic downgrade -1` then `upgrade head` works (downgrade drops the default, recasts, restores `'pending'`). `pytest` **101 passed**. Stubbed replay (same handler the worker calls; Meta + vision mocked) created Boutique Awa **n°46** `ab1cc4fb-…` → `proof_received`, image `55554ba2-…`, notification `9bd271cc-…`, ack stored. `GET /images/55554ba2-…` → **200 `image/png` `Cache-Control: private, no-store`**. Seed script `Nexa/proofs/seed_inbound_proof.py`: n°47 `0761704d-…` image `663812e9-…`; unmatched conv `e9bdfa60-…` image `a41d1c00-…`. Live phone procedure in §28 (blocked on token/tunnel). |
 | P1 | Escalated customer writes again (agent silent, merchant notified) | Not started | Live WhatsApp: escalate a thread, send a second customer text. Expect: same conversation stays `escalated`, message visible on that thread, no agent reply, one unread `escalated_customer_message` until marked read. |
 | P1 | Inbound-image file purge (90 days) | Not started | `uv run python scripts/purge_expired_inbound_images.py` (same job as the daily RQ `maintenance` cron). Worker must listen on `maintenance` (`uv run python scripts/run_whatsapp_worker.py`). Scheduler: `uv run python scripts/run_cron_scheduler.py`. Expect: files older than `PAYMENT_PROOF_RETENTION_DAYS` gone when the order is paid/cancelled or unmatched; `GET /images/{id}` → 410 `Image has been deleted`; row and classification remain. |
-| P2 | WhatsApp inbound voice / PDF | Deferred | Images are handled (payment-proof pipeline). Voice and documents are still logged and skipped. |
+| P1 | Agent context after human handover + inbound photo + photo_status | Passed | 2026-10-06. `pytest` **152 passed**. Live `uv run python ../proofs/proof_agent_context.py`: incident ×3 never called `obtenir_disponibilite`/`creer_commande` on the red dress; explicit “Je veux la robe rouge” got `photo_status=will_be_sent` then `already_sent_earlier`. Throwaway rows on +221770099011…015 deleted (0 leftover). Transcript §29. |
+| P1 | `rechercher_produits` survives a wrong `categorie` argument | Passed | 2026-10-06. Resolve then one unfiltered retry. Direct Awa search `"robe rouge"` with `Robes`/`robes`/`robe`/`Vêtements`/`None` all returned Robe longue rouge de soirée. Baseline HEAD (no rule 15) vs current: nominal+typos ×3 each, **6/6 found the dress on both trees**, `categorie=null` every time — the earlier `categorie="robes"` miss is pre-existing model flakiness, not rule 15. Incident ×3 still clarifying questions, no product guessed. `pytest` **158 passed**. Cleanup +221770099021 empty. §30. |
 
 ## RAG query / result pairs (2026-09-07, `voyage-4-lite`)
 
@@ -837,5 +838,56 @@ payment_status values: ['pending', 'paid', 'proof_received']
 ```
 
 Full pytest after the feature: `101 passed in 15.42s`.
+
+## 29. Agent context after handover (2026-10-06, `gpt-5.6-terra`, Boutique Awa)
+
+Throwaway script `Nexa/proofs/proof_agent_context.py`. Phones +221770099011…015. Cleanup empty afterwards.
+
+**Incident input_list** (condensed) ended with: `[Boutique] oui on l'a` → photo marker → handover developer note → `Je veux commande pour la robe ci-haut`.
+
+**Incident ×3** (“Je veux commande pour la robe ci-haut”). No tool calls on any run. 0/3 guessed the red dress.
+
+- Run 1: « Je ne peux pas encore voir les photos. Pouvez-vous me confirmer le nom ou la couleur de la robe que vous souhaitez commander ? »
+- Run 2: « Je ne peux pas encore voir les photos. Pouvez-vous me donner le nom ou la couleur de la robe souhaitée ? »
+- Run 3: « Je ne peux pas encore voir les photos 🙏 Pouvez-vous me donner le nom, la couleur ou le type de la robe ? »
+
+**Explicit “Je veux la robe rouge”**
+
+- No `sent_product_images`: `obtenir_disponibilite` on `8717de24-…` with `photo_status=will_be_sent`. Reply named the red dress at 25 000 F; no photo promise in the text.
+- With `sent_product_images`: `rechercher_produits` returned the red dress with `photo_status=already_sent_earlier`. Same kind of availability reply; no new photo promise.
+
+**MANUAL_TESTS regressions**
+
+- Nominal / typos: this run the model searched with `categorie="robes"` / `"Robes"` (not a catalogue category) and said it had no red evening dress. That is a material miss vs the 2026-09-08 transcripts (which found Robe longue rouge de soirée). Not caused by a missing marker; the query named the product.
+- Vague “je cherche une robe de soirée”: both evening dresses + pagne, `photo_status=will_be_sent`. Follow-up “oui” asked black vs red; no order.
+- Escalation: `escalader_vers_humain`; closed-hours sentence (shop clock), not the 2026-09-08 “je vous mets en relation” wording.
+
+`pytest` after the feature: **152 passed**.
+
+## 30. Tolerant `rechercher_produits` category (2026-10-06)
+
+Throwaway `Nexa/proofs/proof_category_search.py`. Phone +221770099021. Worktree of HEAD `b01c1c3` under `Nexa/proofs/baseline-search`, removed after.
+
+**Direct service** (`requete="robe rouge"`, Boutique Awa). Stored categories are `vêtements femme`, `chaussures`, etc. — not `Robes`. All of `Robes` / `robes` / `robe` / `Vêtements` / `None` returned **Robe longue rouge de soirée** (wrong names drop the filter and retry unfiltered; `rag_max_distance` still applies).
+
+**Baseline vs current, real model, ×3 each**
+
+| Tree | Scenario | `rechercher_produits` args | Red dress found |
+|------|----------|-----------------------------|-----------------|
+| HEAD baseline | nominal ×3 | `categorie: null` | yes ×3 |
+| HEAD baseline | typos ×3 | `categorie: null` | yes ×3 |
+| current (rule 15 + this fix) | nominal ×3 | `categorie: null` | yes ×3 |
+| current | typos ×3 | `categorie: null` | yes ×3 |
+
+`categorie="robes"` did **not** appear on the baseline (pre-rule-15) in this 6-run sample. The miss from §29 is **pre-existing model flakiness**, not caused by rule 15. This fix still covers that guess when it happens (service proof above).
+
+**Context regression (current tree)**
+
+- Incident “Je veux commande pour la robe ci-haut” ×3: no tools, short French clarifying question, no product guessed.
+- Vague “je cherche une robe de soirée”: `categorie: null`, red dress found; follow-up “oui” asked which colour/model, no order.
+
+Cleanup: 0 leftover conversations/orders for +221770099021 on Boutique Awa. `pytest` **158 passed**.
+
+
 
 

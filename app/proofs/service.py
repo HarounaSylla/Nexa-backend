@@ -10,6 +10,7 @@ from decimal import Decimal
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agent.handover import item_automatic_proof_ack, item_customer_photo
 from app.agent.models import Conversation, Message
 from app.agent.orchestrator import _get_or_create_conversation
 from app.agent.service import (
@@ -262,11 +263,16 @@ async def traiter_image_entrante(
         db, merchant.id, customer_phone, matched
     )
     display = (caption or "").strip() or "Photo"
+    photo_item = item_customer_photo(
+        caption=caption,
+        classification=classification,
+        order_number=matched.order_number if matched is not None else None,
+    )
     row = Message(
         conversation_id=conversation.id,
         turn_role=TURN_ROLE_CUSTOMER,
         display_text=display,
-        items=[],
+        items=[photo_item],
     )
     db.add(row)
     await db.flush()
@@ -341,7 +347,7 @@ async def traiter_image_entrante(
                         conversation_id=conversation_id,
                         turn_role=TURN_ROLE_MERCHANT,
                         display_text=ACK_TEXT,
-                        items=[],
+                        items=[item_automatic_proof_ack()],
                     )
                 )
                 # A closed order thread must not gain reopen-grace from the ack.

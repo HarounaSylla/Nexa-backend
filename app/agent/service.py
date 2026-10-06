@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import case, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agent.handover import item_human_reply
 from app.agent.models import Conversation, Message, SentProductImage
 from app.catalogue.models import Merchant
 from app.notifications.service import (
@@ -363,9 +364,17 @@ async def lister_messages_commercant(
 
 
 async def enregistrer_message_commercant(
-    db: AsyncSession, conversation_id: uuid.UUID, text: str
+    db: AsyncSession,
+    conversation_id: uuid.UUID,
+    text: str,
+    items: list | None = None,
 ) -> None:
-    """Persist a merchant message already delivered. Does not commit."""
+    """Persist a merchant message already delivered. Does not commit.
+
+    `items` is the replayable Responses API input for the agent. Pass a
+    handover builder (never a raw URL). `display_text` stays the WhatsApp
+    text the customer actually received.
+    """
     conversation = await db.get(Conversation, conversation_id)
     if conversation is None:
         return
@@ -374,7 +383,7 @@ async def enregistrer_message_commercant(
             conversation_id=conversation.id,
             turn_role=TURN_ROLE_MERCHANT,
             display_text=text,
-            items=[],
+            items=list(items or []),
         )
     )
     conversation.updated_at = datetime.now(timezone.utc)
@@ -403,7 +412,7 @@ async def repondre_en_humain(
         conversation_id=conversation.id,
         turn_role=TURN_ROLE_MERCHANT,
         display_text=text,
-        items=[],
+        items=[item_human_reply(text)],
     )
     db.add(row)
     conversation.updated_at = datetime.now(timezone.utc)

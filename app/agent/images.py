@@ -8,11 +8,18 @@ from __future__ import annotations
 
 import json
 import uuid
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel
 
 from app.core.formatting import format_fcfa
+
+MAX_WHATSAPP_IMAGES = 3
+
+PhotoStatus = Literal["will_be_sent", "already_sent_earlier", "none"]
+PHOTO_STATUS_WILL_BE_SENT: PhotoStatus = "will_be_sent"
+PHOTO_STATUS_ALREADY_SENT: PhotoStatus = "already_sent_earlier"
+PHOTO_STATUS_NONE: PhotoStatus = "none"
 
 
 class ProductImageRef(BaseModel):
@@ -119,3 +126,30 @@ def product_descriptions_from_items(items: list[Any] | None) -> dict[uuid.UUID, 
                 f"{name} — {format_fcfa(price)}"
             )
     return descriptions
+
+
+def photo_delivery_plan(
+    product_ids: list[uuid.UUID],
+    already_sent: set[uuid.UUID],
+    max_images: int = MAX_WHATSAPP_IMAGES,
+) -> dict[uuid.UUID, PhotoStatus]:
+    """Per-product send/skip decision used by the WhatsApp worker and tools.
+
+    `product_ids` must be the same ordered list the worker would extract
+    (products that have a non-null image_url). Single-product turns ignore
+    the cap; multi-product turns send at most `max_images` new photos.
+    Already-sent products do not consume the cap.
+    """
+    plan: dict[uuid.UUID, PhotoStatus] = {}
+    multi_mode = len(product_ids) > 1
+    photos_sent = 0
+    for product_id in product_ids:
+        if product_id in already_sent:
+            plan[product_id] = PHOTO_STATUS_ALREADY_SENT
+            continue
+        if multi_mode and photos_sent >= max_images:
+            plan[product_id] = PHOTO_STATUS_NONE
+            continue
+        plan[product_id] = PHOTO_STATUS_WILL_BE_SENT
+        photos_sent += 1
+    return plan

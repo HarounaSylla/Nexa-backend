@@ -11,7 +11,11 @@ import logging
 import uuid
 
 from app.agent.images import (
+    MAX_WHATSAPP_IMAGES,
+    PHOTO_STATUS_ALREADY_SENT,
+    PHOTO_STATUS_WILL_BE_SENT,
     extract_product_images,
+    photo_delivery_plan,
     product_descriptions_from_items,
     product_names_from_items,
 )
@@ -30,8 +34,6 @@ from app.whatsapp.service import (
     envoyer_image_whatsapp,
     envoyer_texte_whatsapp,
 )
-
-MAX_WHATSAPP_IMAGES = 3
 
 logger = logging.getLogger(__name__)
 
@@ -137,8 +139,11 @@ async def process_inbound_whatsapp_text_async(
                 )
 
         multi_mode = len(images) > 1
+        plan = photo_delivery_plan(
+            [image.product_id for image in images],
+            already_sent,
+        )
         if multi_mode:
-            photos_sent = 0
             cap_logged = False
             for image in images:
                 description = descriptions.get(image.product_id)
@@ -146,9 +151,17 @@ async def process_inbound_whatsapp_text_async(
                     await envoyer_texte_whatsapp(
                         customer_phone, description, phone_number_id
                     )
-                if image.product_id in already_sent:
+                status = plan.get(image.product_id)
+                if status == PHOTO_STATUS_ALREADY_SENT:
+                    logger.info(
+                        "Skipping already-sent product photo product_id=%s "
+                        "conversation_id=%s message_id=%s",
+                        image.product_id,
+                        conversation_id,
+                        message_id,
+                    )
                     continue
-                if photos_sent >= MAX_WHATSAPP_IMAGES:
+                if status != PHOTO_STATUS_WILL_BE_SENT:
                     if not cap_logged:
                         logger.info(
                             "Capping WhatsApp images from %s to %s message_id=%s",
@@ -163,7 +176,6 @@ async def process_inbound_whatsapp_text_async(
                     image.product_id,
                     phone_number_id,
                 )
-                photos_sent += 1
                 if conversation_id is not None:
                     async with AsyncSessionLocal() as db:
                         await record_sent_product_image(
@@ -171,7 +183,8 @@ async def process_inbound_whatsapp_text_async(
                         )
         elif len(images) == 1:
             image = images[0]
-            if image.product_id not in already_sent:
+            status = plan.get(image.product_id)
+            if status == PHOTO_STATUS_WILL_BE_SENT:
                 await envoyer_image_whatsapp(
                     customer_phone,
                     image.product_id,
@@ -183,6 +196,14 @@ async def process_inbound_whatsapp_text_async(
                         await record_sent_product_image(
                             db, conversation_id, image.product_id
                         )
+            elif status == PHOTO_STATUS_ALREADY_SENT:
+                logger.info(
+                    "Skipping already-sent product photo product_id=%s "
+                    "conversation_id=%s message_id=%s",
+                    image.product_id,
+                    conversation_id,
+                    message_id,
+                )
     finally:
         await engine.dispose()
 

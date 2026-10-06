@@ -317,7 +317,10 @@ async def test_escalated_inbound_stores_silences_and_notifies_once() -> None:
                 "deuxième message",
             ]
             assert all(row.turn_role == "customer" for row in messages)
-            assert all(row.items == [] for row in messages)
+            assert all(
+                row.items == [{"role": "user", "content": row.display_text}]
+                for row in messages
+            )
             notes = list(
                 (
                     await db.execute(

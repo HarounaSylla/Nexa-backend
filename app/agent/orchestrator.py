@@ -13,6 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.agent.handover import handover_developer_item, item_customer_text
 from app.agent.models import Conversation, Message
 from app.agent.prompts import build_system_prompt
 from app.agent.service import (
@@ -62,8 +63,17 @@ def history_items_from_messages(messages: list[Message]) -> list[Any]:
     return prior_items
 
 
+def prior_items_for_agent(messages: list[Message]) -> list[Any]:
+    """Replayable history plus at most one handover developer note."""
+    prior_items = history_items_from_messages(messages)
+    note = handover_developer_item(prior_items)
+    if note is not None:
+        prior_items.append(note)
+    return prior_items
+
+
 def _is_replayable_history_item(item: Any) -> bool:
-    """Inbound image rows use items=[] or a non-LLM marker and must not replay."""
+    """Keep Responses API items. Legacy rows with items=[] contribute nothing."""
     if not isinstance(item, dict):
         return False
     if item.get("type") == "inbound_image":
@@ -297,7 +307,7 @@ async def _store_escalated_inbound(
             conversation_id=conversation.id,
             turn_role=TURN_ROLE_CUSTOMER,
             display_text=message_text,
-            items=[],
+            items=[item_customer_text(message_text)],
         )
     )
     conversation.updated_at = datetime.now(timezone.utc)
@@ -339,7 +349,7 @@ async def traiter_message_entrant(
         .where(Message.conversation_id == conversation.id)
         .order_by(Message.created_at, Message.id)
     )
-    prior_items = history_items_from_messages(list(history.scalars().all()))
+    prior_items = prior_items_for_agent(list(history.scalars().all()))
 
     customer_item = {"role": "user", "content": message_text}
     db.add(
