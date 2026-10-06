@@ -26,6 +26,17 @@ class Settings(BaseSettings):
     # or voyage-4-large are drop-in upgrades (same embedding space, same
     # 1024-dim default) if search relevance needs it later.
     voyage_model: str = "voyage-4-lite"
+    # Image embeddings are a different space from voyage-4-lite. They live
+    # in Product.image_embedding, never mixed with Product.embedding.
+    # voyage-multimodal-3.5 is Voyage's current multimodal model (1024-d
+    # default; 256/512/2048 also offered). Docs:
+    # https://docs.voyageai.com/docs/multimodal-embeddings
+    voyage_image_model: str = "voyage-multimodal-3.5"
+    # Cosine-distance cutoffs for classify_image_match. Placeholders to be
+    # tuned on real customer photos — synthetic variants are not enough.
+    image_match_strong_distance: float = 0.20
+    image_match_possible_distance: float = 0.45
+    image_match_min_margin: float = 0.08
     # First-pass RAG cosine-distance cutoff (pgvector <=> / 1 - cosine sim).
     # Measured 2026-09-08 on Boutique Awa with voyage-4-lite (lower = closer):
     #   "robe rouge pour une soirée": 0.3088 robe rouge, 0.3724 robe noire,

@@ -2,13 +2,20 @@ import asyncio
 import logging
 import unicodedata
 import uuid
+from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
+from typing import Literal
 
 from sqlalchemy import and_, delete, func, literal, literal_column, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.catalogue.embeddings import embed_documents, embed_query, product_index_text
+from app.catalogue.image_embeddings import (
+    ImageEmbeddingError,
+    embed_catalogue_image,
+    embed_query_image,
+)
 from app.catalogue.models import Product, ProductImage
 from app.core.config import settings
 from app.orders.models import Order, OrderItem, OrderStatus
@@ -327,6 +334,80 @@ async def trouver_produits_similaires(
     return list(result.scalars().all())
 
 
+@dataclass(frozen=True)
+class ImageMatch:
+    product: Product
+    distance: float
+    in_stock: bool
+
+
+async def trouver_produits_par_image(
+    db: AsyncSession,
+    merchant_id: uuid.UUID,
+    content: bytes,
+    mime: str,
+    limit: int = 3,
+) -> list[ImageMatch]:
+    """Rank this merchant's catalogue photos by cosine distance to `content`.
+
+    Only rows with `image_embedding` set and `image_embedding_model` equal
+    to the current setting are considered. Out-of-stock products are
+    included (the caller may say "rupture"). No distance threshold is
+    applied here — use `classify_image_match` for that.
+    """
+    query_embedding = await embed_query_image(content, mime)
+    distance = Product.image_embedding.cosine_distance(query_embedding)
+    stmt = (
+        select(Product, distance.label("image_distance"))
+        .where(
+            Product.merchant_id == merchant_id,
+            Product.image_embedding.is_not(None),
+            Product.image_embedding_model == settings.voyage_image_model,
+        )
+        .order_by(distance)
+        .limit(limit)
+    )
+    result = await db.execute(stmt)
+    return [
+        ImageMatch(
+            product=product,
+            distance=float(dist),
+            in_stock=product.stock_qty > 0,
+        )
+        for product, dist in result.all()
+    ]
+
+
+def classify_image_match(
+    matches: list[ImageMatch],
+) -> Literal["strong", "possible", "none"]:
+    """Bucket a ranked image search using the three settings placeholders.
+
+    Distances are cosine (pgvector `<=>`; lower is closer). The numeric
+    cutoffs are to be tuned on real customer photos.
+
+    - ``strong``: best distance ≤ `image_match_strong_distance` **and**
+      (no second candidate, or gap to second ≥ `image_match_min_margin`).
+    - ``possible``: not strong, but best distance ≤
+      `image_match_possible_distance` (a close but ambiguous pair lands
+      here).
+    - ``none``: no candidates, or best distance above the possible cutoff.
+    """
+    if not matches:
+        return "none"
+    best = matches[0].distance
+    if best > settings.image_match_possible_distance:
+        return "none"
+    second = matches[1].distance if len(matches) > 1 else None
+    gap_ok = (
+        second is None
+        or (second - best) >= settings.image_match_min_margin
+    )
+    if best <= settings.image_match_strong_distance and gap_ok:
+        return "strong"
+    return "possible"
+
+
 async def lister_categories(
     db: AsyncSession, merchant_id: uuid.UUID
 ) -> list[dict[str, str | int]]:
@@ -536,6 +617,35 @@ async def _delete_product_files(product_id: uuid.UUID) -> None:
         path.unlink(missing_ok=True)
 
 
+async def _clear_image_embedding(product: Product) -> None:
+    product.image_embedding = None
+    product.image_embedding_model = None
+
+
+async def _store_image_embedding(
+    db: AsyncSession,
+    product: Product,
+    content: bytes,
+    content_type: str,
+) -> None:
+    """Compute image_embedding after the photo row is committed.
+
+    Failures are logged (product id only) and leave both columns NULL so
+    a stale vector never survives a replaced photo.
+    """
+    try:
+        vector = await embed_catalogue_image(content, content_type)
+    except ImageEmbeddingError:
+        logger.warning(
+            "Image embedding failed for product_id=%s; columns left NULL",
+            product.id,
+        )
+        return
+    product.image_embedding = vector
+    product.image_embedding_model = settings.voyage_image_model
+    await db.commit()
+
+
 async def supprimer_produit(
     db: AsyncSession, merchant_id: uuid.UUID, product_id: uuid.UUID
 ) -> None:
@@ -644,6 +754,9 @@ async def enregistrer_photo_produit(
     else:
         image = ProductImage(product_id=product.id, url=url)
         db.add(image)
+    await _clear_image_embedding(product)
     await db.commit()
     await db.refresh(image)
+    await db.refresh(product)
+    await _store_image_embedding(db, product, content, content_type)
     return image

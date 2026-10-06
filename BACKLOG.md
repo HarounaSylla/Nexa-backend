@@ -17,6 +17,7 @@ unchecked items as optional.
 - [x] Manual relevance validation
 - [x] `lister_categories` (in-stock categories for the agent menu)
 - [x] `lister_produits_populaires` (top 10 by distinct non-cancelled orders, price DESC tie-break / cold start)
+- [x] Image embeddings (`voyage-multimodal-3.5`, 1024-d, `products.image_embedding`, Alembic `0021`) + `trouver_produits_par_image` / `classify_image_match`. **Not wired** to WhatsApp, the agent, vision, or any route (step 2).
 
 ## Jalon 2 — Orders, stock, delivery
 
@@ -122,3 +123,28 @@ These were listed in `Nexa/proofs/audit-agent-context.md` and are **not** in thi
 - Structured per-zone delivery fee
 - Multi-country readiness: per-merchant currency code/symbol instead of the hardcoded "F"/"FCFA" in `app/agent/images.py` and the frontend formatters; merchant country / default phone prefix; UI and agent language beyond French
 - Multi-country phone defaults beyond `DEFAULT_COUNTRY_CALLING_CODE=221` (per-merchant calling code, non-Senegalese local forms)
+
+## Image search (step 1 landed; step 2 not wired)
+
+Catalogue image embeddings (`voyage-multimodal-3.5`, `products.image_embedding`)
+and `trouver_produits_par_image` exist. They are **not** called from WhatsApp,
+the agent, the vision classifier, or any HTTP route yet.
+
+- Confirm Voyage data retention / privacy **before the pilot**: hosted API
+  stores inputs for training unless the org Admin opts out (zero-day retention)
+  in the dashboard Terms of Service. Catalogue photos are the merchant's own
+  files; customer inbound photos must not be sent to Voyage until that opt-out
+  is verified. https://docs.voyageai.com/docs/faq
+- HNSW (or ivfflat) index on `products.image_embedding` when catalogues grow
+  past a sequential scan (same backlog as text `products.embedding` in 0002)
+- Several photos per product (today: one file `{product_id}.{ext}`)
+- Multimodal text-to-image search (query text against image vectors — different
+  from today's image-to-image and from text RAG)
+- Cost monitoring for Voyage multimodal ($0.60 / billion pixels; 50k-pixel
+  floor, 2M-pixel ceiling; free-tier 3 RPM until a payment method is on file)
+- Tune `image_match_strong_distance` / `image_match_possible_distance` /
+  `image_match_min_margin` on real customer photos in `Nexa/proofs/image-eval/`
+  before wiring step 2
+- Step 2: agent / WhatsApp / vision classifier use of image search (thresholds
+  first)
+

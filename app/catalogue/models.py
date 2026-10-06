@@ -73,6 +73,13 @@ class Product(Base):
         server_default="0",
     )
     embedding: Mapped[list[float] | None] = mapped_column(Vector(1024), nullable=True)
+    # Separate space from `embedding` (text / voyage-4-lite). Image vectors
+    # come from voyage-multimodal-3.5 (1024-d default). No HNSW yet — sequential
+    # scan is fine for small catalogues.
+    image_embedding: Mapped[list[float] | None] = mapped_column(
+        Vector(1024), nullable=True
+    )
+    image_embedding_model: Mapped[str | None] = mapped_column(String, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),

@@ -1,7 +1,7 @@
 import uuid
 from decimal import Decimal
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from urllib.parse import quote
 
 import httpx
@@ -251,7 +251,11 @@ async def test_photo_upload_validates_and_replaces(
             await db.commit()
             product_id = product.id
 
-        with _auth(clerk_user_id):
+        with _auth(clerk_user_id), patch(
+            "app.catalogue.service.embed_catalogue_image",
+            new_callable=AsyncMock,
+            return_value=_FAKE_EMBEDDING,
+        ):
             async with await _client() as client:
                 rejected_type = await client.post(
                     f"/catalogue/products/{product_id}/photo",

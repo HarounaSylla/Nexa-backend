@@ -41,6 +41,7 @@ line, screenshot, or database check) in the Proof column.
 | P1 | Inbound-image file purge (90 days) | Not started | `uv run python scripts/purge_expired_inbound_images.py` (same job as the daily RQ `maintenance` cron). Worker must listen on `maintenance` (`uv run python scripts/run_whatsapp_worker.py`). Scheduler: `uv run python scripts/run_cron_scheduler.py`. Expect: files older than `PAYMENT_PROOF_RETENTION_DAYS` gone when the order is paid/cancelled or unmatched; `GET /images/{id}` → 410 `Image has been deleted`; row and classification remain. |
 | P1 | Agent context after human handover + inbound photo + photo_status | Passed | 2026-10-06. `pytest` **152 passed**. Live `uv run python ../proofs/proof_agent_context.py`: incident ×3 never called `obtenir_disponibilite`/`creer_commande` on the red dress; explicit “Je veux la robe rouge” got `photo_status=will_be_sent` then `already_sent_earlier`. Throwaway rows on +221770099011…015 deleted (0 leftover). Transcript §29. |
 | P1 | `rechercher_produits` survives a wrong `categorie` argument | Passed | 2026-10-06. Resolve then one unfiltered retry. Direct Awa search `"robe rouge"` with `Robes`/`robes`/`robe`/`Vêtements`/`None` all returned Robe longue rouge de soirée. Baseline HEAD (no rule 15) vs current: nominal+typos ×3 each, **6/6 found the dress on both trees**, `categorie=null` every time — the earlier `categorie="robes"` miss is pre-existing model flakiness, not rule 15. Incident ×3 still clarifying questions, no product guessed. `pytest` **158 passed**. Cleanup +221770099021 empty. §30. |
+| P1 | Catalogue image embeddings + similarity search (step 1, not wired) | Passed | 2026-10-06. Model `voyage-multimodal-3.5` 1024-d (`input_type` document vs query). Alembic `0021` upgrade/downgrade/upgrade. Boutique Awa **26/26** photos, backfill `ok=26 failed=0`, estimate **$0.01636**. Self-match rank-1 **26/26** (dist 0.055–0.100, not ~0 because query≠document). Synthetic variants rank-1 **100%** all six types. Look-alike gap min **0.26** (the two iPhone cases / two evening dresses). Negatives **0.74–0.77** (`none`). Placeholders stay `0.20 / 0.45 / 0.08`. `pytest` **168 passed**. No new route. §31. |
 
 ## RAG query / result pairs (2026-09-07, `voyage-4-lite`)
 
@@ -887,6 +888,81 @@ Throwaway `Nexa/proofs/proof_category_search.py`. Phone +221770099021. Worktree 
 - Vague “je cherche une robe de soirée”: `categorie: null`, red dress found; follow-up “oui” asked which colour/model, no order.
 
 Cleanup: 0 leftover conversations/orders for +221770099021 on Boutique Awa. `pytest` **158 passed**.
+
+## 31. Catalogue image search engine (2026-10-06, step 1 only)
+
+No route, no WhatsApp/agent/vision wiring. Vectors live in `products.image_embedding`
+(not mixed with text `products.embedding`). Sources: Voyage multimodal docs
+https://docs.voyageai.com/docs/multimodal-embeddings (current model
+`voyage-multimodal-3.5`, 1024-d default; `voyage-multimodal-3` is listed as
+older), API limits https://docs.voyageai.com/reference/multimodal-embeddings-api
+(16M pixels / 20 MB), pricing https://docs.voyageai.com/docs/pricing
+($0.60 / billion pixels, 50k floor → min $0.00003, 2M ceiling → max $0.0012).
+Installed `voyageai==0.5.0` exposes `Client.multimodal_embed`. Catalogue photos
+use `input_type='document'`; search photos use `input_type='query'`.
+
+Alembic:
+
+```
+Running upgrade 0020_deliverer_unique_phone -> 0021_product_image_embedding
+Running downgrade 0021_product_image_embedding -> 0020_deliverer_unique_phone
+Running upgrade 0020_deliverer_unique_phone -> 0021_product_image_embedding
+```
+
+`pytest` **168 passed in 25.16s** (10 new tests; Voyage stubbed, no network).
+
+Boutique Awa `37292228-b8f5-437d-b8e6-2ff81d4e249d`: **26 products, 26 local photos**.
+
+Backfill (dry-run then real):
+
+```
+products_to_embed=26
+skipped_already_current=0
+unreadable=0
+pixels_after_downscale=27262976
+estimated_cost_usd=0.01635779 (https://docs.voyageai.com/docs/pricing)
+dry_run=1 (no writes)
+
+… real run …
+ok=26
+skipped=0
+failed=0
+```
+
+Self-match (own photo as `query` against stored `document` vectors): rank 1
+**26/26**. Distance is **not** ≈0 (asymmetric input_type): min 0.0551, median
+0.0750, max 0.0998.
+
+Synthetic variants of the same 26 catalogue photos (Pillow only):
+
+| Variant | Rank 1 | Top 3 | Correct-match dist min / median / max |
+|---|---|---|---|
+| centre crop 70% | 100% | 100% | 0.0879 / 0.1365 / 0.2159 |
+| rotation 8° | 100% | 100% | 0.0636 / 0.1226 / 0.1454 |
+| brightness +25% | 100% | 100% | 0.0559 / 0.0976 / 0.4193 |
+| brightness −25% | 100% | 100% | 0.0614 / 0.0845 / 0.1252 |
+| JPEG quality 30 | 100% | 100% | 0.0553 / 0.1104 / 0.1355 |
+| TikTok-like 9:16 screenshot | 100% | 100% | 0.1606 / 0.2692 / 0.3258 |
+
+Closest look-alikes (gap to second via the same query search): iPhone cases
+0.2646, evening dresses 0.2657. Gap min 0.2646, median 0.4161.
+
+Negatives (Pillow, not catalogue): plain white 0.7507, payment-style screenshot
+0.7399, photo of text 0.7719 — all `classify_image_match=none`.
+
+`Nexa/proofs/image-eval/manifest.csv` was absent (script skipped, no failure).
+
+Placeholders in config stay `strong=0.20`, `possible=0.45`, `min_margin=0.08`.
+On this synthetic set they already separate self-match (strong) from negatives
+(none). A tighter proposal from the same data — **not** to ship until real
+photos exist — is `strong=0.16`, `possible=0.38`, `min_margin=0.12`. The
+brightness +25% outlier at 0.42 and TikTok median 0.27 show how little studio
+photos plus Pillow prove about a real WhatsApp customer photo.
+
+Cleanup: no throwaway products/files created. Lasting DB change is Alembic
+`0021` plus the 26 Awa `image_embedding` values written by the backfill.
+Throwaway measurer: `Nexa/proofs/image-search/measure_image_search.py`.
+
 
 
 

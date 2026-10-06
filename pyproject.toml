@@ -20,6 +20,7 @@ dependencies = [
     "openai",
     "langgraph",
     "voyageai",
+    "pillow",
     "pydantic-settings",
     "httpx",
     "PyJWT[crypto]",
