@@ -37,6 +37,13 @@ class Settings(BaseSettings):
     image_match_strong_distance: float = 0.20
     image_match_possible_distance: float = 0.45
     image_match_min_margin: float = 0.08
+    # Step 2b: embeddings only shortlist; a vision call decides. The three
+    # cutoffs above remain the fallback when verification is off or fails.
+    image_match_verify_with_vision: bool = True
+    image_match_retrieval_distance: float = 0.65
+    image_match_shortlist_size: int = 4
+    # Empty → use agent_model. Override to try a cheaper verifier.
+    image_verify_model: str = ""
     # Vision calls (payment-proof checks and product recognition) counted
     # per customer phone per rolling day. One count per vision call.
     max_image_analyses_per_phone_per_day: int = 10
@@ -78,6 +85,9 @@ class Settings(BaseSettings):
     # Country calling code (no +) used when a 9-digit local mobile starting
     # with 7 is entered without a country prefix (Senegal: 771234567 → +221…).
     default_country_calling_code: str = "221"
+
+    def resolve_image_verify_model(self) -> str:
+        return self.image_verify_model or self.agent_model
 
     def clerk_authorized_party_list(self) -> list[str]:
         return [

@@ -59,18 +59,26 @@ from app.proofs.models import (
     InboundImage,
 )
 from app.proofs.recognition import (
+    PROPOSAL_KIND_EXACT,
+    PROPOSAL_KIND_SIMILAR,
     RecognitionResult,
     build_product_photo_developer_item,
     persist_recognition,
     proposal_set,
+    recognise_product_photo,
 )
 from app.proofs.service import traiter_image_entrante
 from app.proofs.vision import (
     IMAGE_KIND_OTHER,
     IMAGE_KIND_PAYMENT_PROOF,
     IMAGE_KIND_PRODUCT_PHOTO,
+    VERDICT_NONE,
+    VERDICT_SAME,
+    VERDICT_SIMILAR,
     ImageAnalysis,
     ImageAnalysisError,
+    ImageVerification,
+    ImageVerificationError,
     _parse_analysis,
 )
 from app.whatsapp.service import FALLBACK_REPLY
@@ -253,6 +261,25 @@ def _search_stub(matches: list[ImageMatch]) -> AsyncMock:
     return AsyncMock(return_value=matches)
 
 
+def _fake_photos(matches: list[ImageMatch]) -> list:
+    return [(match, TINY_PNG) for match in matches]
+
+
+def _verification(
+    verdict: str = VERDICT_SAME,
+    candidate: int | None = 1,
+    model: str = "test-verifier",
+) -> AsyncMock:
+    return AsyncMock(
+        return_value=ImageVerification(
+            verdict=verdict,
+            candidate=candidate,
+            reason="stub",
+            model=model,
+        )
+    )
+
+
 @contextmanager
 def _image_patches(
     tmp_path: Path,
@@ -262,6 +289,7 @@ def _image_patches(
     graph=None,
     agent=None,
     send=None,
+    verify=None,
 ):
     patches = [
         patch("app.core.config.settings.media_dir", str(tmp_path / "media")),
@@ -278,6 +306,15 @@ def _image_patches(
     if search is not None:
         patches.append(
             patch("app.proofs.recognition.trouver_produits_par_image", search)
+        )
+        patches.append(
+            patch("app.proofs.recognition.load_candidate_photos", _fake_photos)
+        )
+        patches.append(
+            patch(
+                "app.proofs.recognition.verify_image_against_candidates",
+                verify if verify is not None else _verification(),
+            )
         )
     if graph is not None:
         patches.append(
@@ -649,6 +686,7 @@ async def _run_recognised(
     wamid: str,
     caption: str | None = None,
     graph: _CapturingGraph | None = None,
+    verify=None,
 ) -> tuple[InboundImage, _CapturingGraph]:
     vision = AsyncMock(return_value=_product_photo_analysis("A long red dress"))
     if isinstance(matches, Exception):
@@ -656,7 +694,13 @@ async def _run_recognised(
     else:
         search = _search_stub(matches)
     capturing = graph or _CapturingGraph()
-    with _image_patches(tmp_path, vision=vision, search=search, graph=capturing):
+    with _image_patches(
+        tmp_path,
+        vision=vision,
+        search=search,
+        graph=capturing,
+        verify=verify,
+    ):
         async with AsyncSessionLocal() as db:
             stored = await traiter_image_entrante(
                 db, merchant, PHONE, wamid, "m", "image/png", caption
@@ -682,8 +726,13 @@ async def test_recognition_persistence_strong_possible_none_error(
         assert stored.match_level == MATCH_LEVEL_STRONG
         assert stored.matched_product_id == first.id
         assert stored.match_candidates == [
-            {"product_id": str(first.id), "distance": 0.10},
-            {"product_id": str(second.id), "distance": 0.40},
+            {
+                "product_id": str(first.id),
+                "distance": 0.10,
+                "verdict": "same",
+                "verifier": "test-verifier",
+            },
+            {"product_id": str(second.id), "distance": 0.40, "verdict": "none"},
         ]
 
         possible_matches = [
@@ -691,25 +740,15 @@ async def test_recognition_persistence_strong_possible_none_error(
             ImageMatch(product=second, distance=0.40, in_stock=True),
         ]
         possible, _ = await _run_recognised(
-            tmp_path, merchant, possible_matches, wamid="wamid.possible"
+            tmp_path,
+            merchant,
+            possible_matches,
+            wamid="wamid.possible",
+            verify=_verification(VERDICT_SIMILAR, 1),
         )
         assert possible.match_level == MATCH_LEVEL_POSSIBLE
         assert possible.matched_product_id == first.id
-
-        ambiguous_matches = [
-            ImageMatch(product=first, distance=0.25, in_stock=True),
-            ImageMatch(product=second, distance=0.28, in_stock=True),
-        ]
-        ambiguous, capturing = await _run_recognised(
-            tmp_path, merchant, ambiguous_matches, wamid="wamid.ambiguous"
-        )
-        assert ambiguous.match_level == MATCH_LEVEL_POSSIBLE
-        assert ambiguous.matched_product_id == first.id
-        developer = capturing.input_lists[0][-1]
-        assert developer["role"] == "developer"
-        assert str(first.id) in developer["content"]
-        assert str(second.id) in developer["content"]
-        assert "1. " in developer["content"] and "2. " in developer["content"]
+        assert possible.match_candidates[0]["verdict"] == "similar"
 
         none_matches = [
             ImageMatch(product=first, distance=0.70, in_stock=True),
@@ -754,7 +793,11 @@ async def test_unrecognized_notification_only_for_none_and_error(
             ImageMatch(product=second, distance=0.40, in_stock=True),
         ]
         await _run_recognised(
-            tmp_path, merchant, possible_matches, wamid="wamid.n-possible"
+            tmp_path,
+            merchant,
+            possible_matches,
+            wamid="wamid.n-possible",
+            verify=_verification(VERDICT_SIMILAR, 1),
         )
         none_matches = [ImageMatch(product=first, distance=0.80, in_stock=True)]
         await _run_recognised(tmp_path, merchant, none_matches, wamid="wamid.n-none")
@@ -928,6 +971,11 @@ async def test_worker_sends_photos_via_shared_helper_and_dedupes(
             ),
             patch("app.proofs.service.classer_image_entrante", vision),
             patch("app.proofs.recognition.trouver_produits_par_image", search),
+            patch("app.proofs.recognition.load_candidate_photos", _fake_photos),
+            patch(
+                "app.proofs.recognition.verify_image_against_candidates",
+                _verification(),
+            ),
             patch("app.agent.orchestrator._build_graph", return_value=graph),
             patch("app.proofs.service.envoyer_message_commercant", AsyncMock()),
             patch(
@@ -1011,6 +1059,11 @@ async def test_worker_skips_already_sent_product_photo(
             ),
             patch("app.proofs.service.classer_image_entrante", vision),
             patch("app.proofs.recognition.trouver_produits_par_image", search),
+            patch("app.proofs.recognition.load_candidate_photos", _fake_photos),
+            patch(
+                "app.proofs.recognition.verify_image_against_candidates",
+                _verification(),
+            ),
             patch("app.agent.orchestrator._build_graph", return_value=graph),
             patch("app.proofs.service.envoyer_message_commercant", AsyncMock()),
             patch("app.workers.whatsapp.envoyer_texte_whatsapp", send_text),
@@ -1085,6 +1138,11 @@ async def test_worker_sends_fallback_once_when_agent_turn_fails(
             ),
             patch("app.proofs.service.classer_image_entrante", vision),
             patch("app.proofs.recognition.trouver_produits_par_image", search),
+            patch("app.proofs.recognition.load_candidate_photos", _fake_photos),
+            patch(
+                "app.proofs.recognition.verify_image_against_candidates",
+                _verification(),
+            ),
             patch(
                 "app.proofs.service.traiter_photo_produit",
                 new=AsyncMock(side_effect=RuntimeError("llm down")),
@@ -1113,3 +1171,189 @@ async def test_worker_sends_fallback_once_when_agent_turn_fails(
         assert send_text.await_args.args[1] == FALLBACK_REPLY
     finally:
         await _cleanup(merchant.id)
+
+
+def test_developer_item_similar_and_out_of_stock_same() -> None:
+    similar = _match(name="Robe rouge", distance=0.20, stock_qty=8, price="25000")
+    item = build_product_photo_developer_item(
+        caption=None,
+        analysis=None,
+        result=RecognitionResult(
+            level=MATCH_LEVEL_POSSIBLE,
+            matches=[similar],
+            proposed=[similar],
+            proposal_kind=PROPOSAL_KIND_SIMILAR,
+        ),
+    )
+    text = item["content"]
+    assert "proposal_kind: similar" in text
+    assert "does NOT have exactly this item" in text
+    assert "colour or variant differs" in text
+    assert "would interest the customer" in text
+    assert "do NOT call `creer_commande`" in text
+
+    oos = _match(name="Robe rouge", distance=0.08, stock_qty=0, price="25000")
+    exact = build_product_photo_developer_item(
+        caption=None,
+        analysis=None,
+        result=RecognitionResult(
+            level=MATCH_LEVEL_STRONG,
+            matches=[oos],
+            proposed=[oos],
+            proposal_kind=PROPOSAL_KIND_EXACT,
+        ),
+    )
+    assert "stock: rupture" in exact["content"]
+    assert "mention rupture honestly" in exact["content"]
+    assert "stock: 0" not in exact["content"]
+
+
+def test_persist_recognition_writes_verdict_and_verifier() -> None:
+    image = InboundImage(
+        merchant_id=uuid.uuid4(),
+        conversation_id=uuid.uuid4(),
+        whatsapp_message_id="x",
+        mime_type="image/png",
+        classification=CLASSIFICATION_PRODUCT_PHOTO,
+        media_path="x.png",
+    )
+    first = _match(name="A", distance=0.22)
+    second = _match(name="B", distance=0.31)
+    persist_recognition(
+        image,
+        RecognitionResult(
+            level=MATCH_LEVEL_POSSIBLE,
+            matches=[first, second],
+            proposed=[second],
+            proposal_kind=PROPOSAL_KIND_SIMILAR,
+            verifier_model="gpt-test",
+            candidate_verdicts={1: VERDICT_NONE, 2: VERDICT_SIMILAR},
+        ),
+    )
+    assert image.match_level == MATCH_LEVEL_POSSIBLE
+    assert image.matched_product_id == second.product.id
+    assert image.match_candidates[0]["verdict"] == "none"
+    assert image.match_candidates[1]["verdict"] == "similar"
+    assert image.match_candidates[1]["verifier"] == "gpt-test"
+    assert "verifier" not in image.match_candidates[0]
+
+
+async def _recognise_with(
+    matches: list[ImageMatch] | Exception,
+    *,
+    verify=None,
+    verify_enabled: bool = True,
+) -> tuple:
+    search = (
+        AsyncMock(side_effect=matches)
+        if isinstance(matches, Exception)
+        else _search_stub(matches)
+    )
+    verify_fn = verify if verify is not None else _verification()
+    with (
+        patch("app.proofs.recognition.trouver_produits_par_image", search),
+        patch("app.proofs.recognition.load_candidate_photos", _fake_photos),
+        patch("app.proofs.recognition.verify_image_against_candidates", verify_fn),
+        patch.object(settings, "image_match_verify_with_vision", verify_enabled),
+    ):
+        async with AsyncSessionLocal() as db:
+            result = await recognise_product_photo(
+                db, uuid.uuid4(), TINY_PNG, "image/png", caption="hi"
+            )
+    return result, search, verify_fn
+
+
+@pytest.mark.asyncio
+async def test_empty_shortlist_is_none_without_verification() -> None:
+    far = _match(name="Far", distance=0.80)
+    result, _search, verify = await _recognise_with([far])
+    assert result.level == MATCH_LEVEL_NONE
+    assert result.proposed == []
+    verify.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_shortlist_drops_candidates_above_retrieval_distance() -> None:
+    keep = _match(name="Keep", distance=0.64)
+    drop = _match(name="Drop", distance=0.66)
+    result, _search, verify = await _recognise_with(
+        [keep, drop], verify=_verification(VERDICT_SAME, 1)
+    )
+    assert result.level == MATCH_LEVEL_STRONG
+    assert result.proposed[0].product.id == keep.product.id
+    assert len(verify.await_args.args[2]) == 1
+    assert result.matches[0].product.id == keep.product.id
+    assert all(m.distance <= settings.image_match_retrieval_distance for m in result.matches)
+
+
+@pytest.mark.asyncio
+async def test_verification_same_similar_none_and_bad_index() -> None:
+    first = _match(name="A", distance=0.30)
+    second = _match(name="B", distance=0.40)
+    matches = [first, second]
+
+    same, _, verify_same = await _recognise_with(
+        matches, verify=_verification(VERDICT_SAME, 1)
+    )
+    assert same.level == MATCH_LEVEL_STRONG
+    assert same.proposal_kind == PROPOSAL_KIND_EXACT
+    assert same.proposed == [first]
+    verify_same.assert_awaited()
+
+    similar, _, _ = await _recognise_with(
+        matches, verify=_verification(VERDICT_SIMILAR, 2)
+    )
+    assert similar.level == MATCH_LEVEL_POSSIBLE
+    assert similar.proposal_kind == PROPOSAL_KIND_SIMILAR
+    assert similar.proposed == [second]
+
+    none, _, _ = await _recognise_with(
+        matches, verify=_verification(VERDICT_NONE, None)
+    )
+    assert none.level == MATCH_LEVEL_NONE
+    assert none.proposed == []
+
+    bad, _, _ = await _recognise_with(
+        matches, verify=_verification(VERDICT_SAME, 9)
+    )
+    assert bad.level == MATCH_LEVEL_NONE
+    assert bad.proposed == []
+
+
+@pytest.mark.asyncio
+async def test_verification_failure_disabled_never_strong() -> None:
+    close = _match(name="Close", distance=0.10)
+    failed, _, verify = await _recognise_with(
+        [close],
+        verify=AsyncMock(side_effect=ImageVerificationError("timeout")),
+    )
+    assert failed.level == MATCH_LEVEL_POSSIBLE
+    assert failed.proposed == [close]
+    verify.assert_awaited()
+
+    disabled, _, verify_off = await _recognise_with(
+        [close], verify_enabled=False
+    )
+    assert disabled.level == MATCH_LEVEL_POSSIBLE
+    assert disabled.proposed == [close]
+    verify_off.assert_not_awaited()
+
+    crashed, _, _ = await _recognise_with(
+        [close],
+        verify=AsyncMock(side_effect=RuntimeError("openai down")),
+    )
+    assert crashed.level == MATCH_LEVEL_POSSIBLE
+    assert crashed.proposed == [close]
+
+
+@pytest.mark.asyncio
+async def test_disabled_verification_can_propose_two_close_candidates() -> None:
+    first = _match(name="A", distance=0.25)
+    second = _match(name="B", distance=0.28)
+    result, _, verify = await _recognise_with(
+        [first, second], verify_enabled=False
+    )
+    assert result.level == MATCH_LEVEL_POSSIBLE
+    assert result.proposed == [first, second]
+    verify.assert_not_awaited()
+

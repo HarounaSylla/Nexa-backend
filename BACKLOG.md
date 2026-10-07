@@ -114,12 +114,13 @@ These were listed in `Nexa/proofs/audit-agent-context.md` and are **not** in thi
 - Auto-return / auto-close policy for unanswered escalations
 - `other` while an order awaits a proof: still stored, no reply, no notification (backlog question unchanged)
 - At the vision/recognition cap (`max_image_analyses_per_phone_per_day`, default 10): today `not_analyzed` and **no customer reply**. Decide whether to tell the customer.
-- Several product photos in one image (vision + search assume a single main subject)
+- Several product photos in one image (classifier + search + verifier assume a single main subject)
+- Crop-to-product before embedding/verify (today the whole frame, including TikTok chrome, is embedded)
 - Customer sends several photos in a row (each is its own job/turn; no bundling)
 - Caption-only intent (text "vous avez cette robe?" without a photo) is unchanged text search — not visual search
-- Frontend: show "Produit reconnu : …" on a `product_photo` in the conversation thread (`thread-panel.tsx` currently returns null for that classification — safe, no crash)
-- Frontend: map `product_photo_unrecognized` in `notification-copy.ts` (unknown types render as the raw `item.type` string, not `data.title`)
-- Tune `image_match_strong_distance` / `image_match_possible_distance` / `image_match_min_margin` from real `inbound_images.match_candidates` (Alembic `0022`). Synthetic TikTok of Awa's red dress landed at distance 0.495 (`none` vs cutoff 0.45) even though rank-1 was the right product.
+- Frontend: show "Produit reconnu : …" on a `product_photo` in the conversation thread (`thread-panel.tsx` currently returns null for that classification — safe, no crash). Not in step 2b.
+- Frontend: map `product_photo_unrecognized` in `notification-copy.ts` (unknown types render as the raw `item.type` string, not `data.title`). Not in step 2b.
+- Tune fallback `image_match_*` cutoffs from real `inbound_images.match_candidates` (still used when verification is off or fails). Retrieval cutoff is 0.65; decision is the vision verifier.
 
 ## Preferences — later
 
@@ -132,30 +133,34 @@ These were listed in `Nexa/proofs/audit-agent-context.md` and are **not** in thi
 - Multi-country readiness: per-merchant currency code/symbol instead of the hardcoded "F"/"FCFA" in `app/agent/images.py` and the frontend formatters; merchant country / default phone prefix; UI and agent language beyond French
 - Multi-country phone defaults beyond `DEFAULT_COUNTRY_CALLING_CODE=221` (per-merchant calling code, non-Senegalese local forms)
 
-## Image search (step 2 wired)
+## Image search (step 2b: shortlist + vision verify)
 
-Catalogue image embeddings (`voyage-multimodal-3.5`, `products.image_embedding`)
-and `trouver_produits_par_image` are called from `traiter_image_entrante` when
-vision returns `product_photo` on a non-escalated conversation. The agent
-proposes from a **code-owned** set and must get a customer "oui" before
-ordering. No new HTTP route.
+Catalogue image embeddings (`voyage-multimodal-3.5`) only **shortlist**
+(`image_match_retrieval_distance=0.65`, `image_match_shortlist_size=4`).
+A second vision call (`verify_image_against_candidates`, default
+`agent_model`) decides `same` / `similar` / `none`. The agent proposes
+from a **code-owned** set and must get a customer "oui" before ordering.
+No new HTTP route. Fallback thresholds never emit `strong`.
 
 - Confirm Voyage **and OpenAI** data retention / privacy **before the pilot**:
-  customer inbound photos are now sent to both APIs (vision classifier +
-  query embedding). Voyage hosted API stores inputs for training unless the
-  org Admin opts out (zero-day retention) in the dashboard Terms of Service.
-  OpenAI vision/agent: confirm `store=False` on the vision call is enough for
-  the org's retention policy. Catalogue photos were already sent at backfill.
-  https://docs.voyageai.com/docs/faq
+  a product photo now hits classifier + query embedding + verifier (customer
+  image plus up to 4 downscaled catalogue photos). Voyage hosted API stores
+  inputs for training unless the org Admin opts out (zero-day retention).
+  OpenAI: confirm `store=False` on both vision calls is enough for the org's
+  retention policy. https://docs.voyageai.com/docs/faq
 - HNSW (or ivfflat) index on `products.image_embedding` when catalogues grow
   past a sequential scan (same backlog as text `products.embedding` in 0002)
-- Several photos per product (today: one file `{product_id}.{ext}`)
+- A second photo per product (today: one file `{product_id}.{ext}`) to
+  improve recall on awkward crops/angles
 - Multimodal text-to-image search (query text against image vectors — different
   from today's image-to-image and from text RAG)
-- Cost monitoring for Voyage multimodal ($0.60 / billion pixels; 50k-pixel
-  floor, 2M-pixel ceiling; **free-tier 3 RPM** until a payment method is on
-  file — the step-2 proof's Voyage stage hit 55.91s on one call, consistent
-  with 429 retry)
-- Tune thresholds on real customer photos using
-  `inbound_images.match_candidates` (placeholders still `0.20 / 0.45 / 0.08`)
+- Cost per product photo with verification (step 2b toy set, gpt-5.6-terra
+  at $2 / $12 per 1M from https://developers.openai.com/api/docs/models/gpt-5.6-terra):
+  verifier **~$0.006–0.012** per call (≈2.6k–5.6k input + ~100 output tokens),
+  plus the classifier call and Voyage multimodal ($0.60 / billion pixels;
+  50k-pixel floor, 2M-pixel ceiling). Free-tier Voyage **3 RPM** still
+  stretches latency (compare script: 40.3s / 39.9s / 56.5s on three rows).
+- Latency budget: classifier ~2–3 s, Voyage ~1–2 s when not rate-limited,
+  verifier ~2–5 s (pipeline red-dress: 3.12 / 1.22 / 1.79 s), then the
+  agent turn. Several products in one image and crop-to-product are not done.
 

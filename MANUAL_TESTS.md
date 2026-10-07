@@ -43,6 +43,7 @@ line, screenshot, or database check) in the Proof column.
 | P1 | `rechercher_produits` survives a wrong `categorie` argument | Passed | 2026-10-06. Resolve then one unfiltered retry. Direct Awa search `"robe rouge"` with `Robes`/`robes`/`robe`/`Vêtements`/`None` all returned Robe longue rouge de soirée. Baseline HEAD (no rule 15) vs current: nominal+typos ×3 each, **6/6 found the dress on both trees**, `categorie=null` every time — the earlier `categorie="robes"` miss is pre-existing model flakiness, not rule 15. Incident ×3 still clarifying questions, no product guessed. `pytest` **158 passed**. Cleanup +221770099021 empty. §30. |
 | P1 | Catalogue image embeddings + similarity search (step 1, not wired) | Passed | 2026-10-06. Model `voyage-multimodal-3.5` 1024-d (`input_type` document vs query). Alembic `0021` upgrade/downgrade/upgrade. Boutique Awa **26/26** photos, backfill `ok=26 failed=0`, estimate **$0.01636**. Self-match rank-1 **26/26** (dist 0.055–0.100, not ~0 because query≠document). Synthetic variants rank-1 **100%** all six types. Look-alike gap min **0.26** (the two iPhone cases / two evening dresses). Negatives **0.74–0.77** (`none`). Placeholders stay `0.20 / 0.45 / 0.08`. `pytest` **168 passed**. No new route. §31. |
 | P1 | Product photo on WhatsApp → catalogue match + agent confirm (step 2) | Passed | 2026-10-06. Alembic `0022` up/down/up. Vision three kinds; `product_photo` runs search + one agent turn; code-owned proposal; confirm before order. `pytest` **187 passed** (19 new). Live proof `Nexa/proofs/photo-recognition/run_photo_recognition.py` on Boutique Awa +221770099031…041, Meta stubbed, real vision/Voyage/agent. Cleanup leftover 0. Thresholds still too tight on a synthetic TikTok (rank-1 red dress 0.495 → `none`). §32. |
+| P1 | Product photo: embeddings shortlist + vision verify (step 2b) | Passed | 2026-10-07. Retrieval 9/9 positives in top 4 at ≤0.65. Verify decides; never `strong` without it. `pytest` **198 passed** (11 new). Compare A vs B + pipeline `Nexa/proofs/photo-recognition/run_verify_compare.py`. Cleanup leftover 0 on +221770099041…044. §33. |
 
 ## RAG query / result pairs (2026-09-07, `voyage-4-lite`)
 
@@ -1010,6 +1011,67 @@ PIL payment screenshot and a blue recolour "not sold" image.
 Frontend not in this change: unknown notification types render as raw `item.type`; a `product_photo` in the thread currently has no "Produit reconnu" label (`thread-panel.tsx` returns null).
 
 Cleanup dry-run listed 11 conversations, order n°59, 21 inbound images, 9 notifications; apply restored red-dress stock +1; leftover **0** rows for those phones on Awa.
+
+## 33. Embeddings shortlist + vision verification (2026-10-07, step 2b)
+
+Backend only. No new route. Cosine distance only **shortlists**; a vision
+call looks at the customer photo next to up to 4 catalogue photos and
+returns `same` / `similar` / `none`. Existing `image_match_*` cutoffs
+remain the fallback when verification is off or fails, and that fallback
+is **capped at `possible`** (never `strong` without a successful verify).
+
+Retrieval measurement (`measure_shortlist.py`, `trouver_produits_par_image`
+limit=6, Awa catalogue, starter set + extra step-2 TikTok canvas): **9/9**
+positives had the expected product in the top 4 at ≤0.55 / 0.65 / 0.75
+(0 missing at 0.65 → continue). NONE best distances: blue recolour 0.203
+(red dress), green sandals 0.233 (tan sandals) — they enter a 0.65
+shortlist, which is why verification is required.
+
+`pytest` **198 passed in 25.59s** (11 new: 7 in `tests/test_product_photo.py`,
+4 in `tests/test_image_verify.py`; Voyage, vision, and the LLM stubbed).
+
+Compare A (thresholds on the same shortlist) vs B (vision verify, run
+twice) on 10 `image-eval` files + `extra_step2_tiktok_robe_rouge.jpg`.
+Verifier model `gpt-5.6-terra`. List price quoted 2026-10-07 from
+https://developers.openai.com/api/docs/models/gpt-5.6-terra :
+**$2.00 / 1M input, $12.00 / 1M output**.
+
+| file | expected | A | B1 | B2 | score A | score B | voy s | ver s | tokens in+out | est. $ |
+|---|---|---|---|---|---|---|---|---|---|---|
+| tiktok_robe_noire.jpg | black dress | possible / black | strong/same / black | same | yes | yes | 1.5 | 8.2 | 4510+102 | 0.0102 |
+| tiktok_robe_rouge_zoom.jpg | red dress | none | strong/same / red | same | miss | yes | 1.9 | 4.6 | 3878+103 | 0.0090 |
+| tiktok_baskets_blanches_carre.jpg | white sneakers | none | strong/same / white | same | miss | yes | 1.2 | 4.0 | 3246+95 | 0.0076 |
+| tiktok_sac_main.jpg | camel bag | none | strong/same / camel | same | miss | yes | 40.3 | 3.5 | 3246+94 | 0.0076 |
+| tiktok_montre_or_rose.jpg | rose-gold watch | possible / watch | strong/same / watch | same | yes | yes | 7.8 | 3.8 | 2614+94 | 0.0064 |
+| angle_ceinture_wax.jpg | wax belt | strong / belt | strong/same / belt | same | yes | yes | 1.4 | 4.1 | 5584+83 | 0.0122 |
+| angle_baskets_noires.jpg | black sneakers | strong / black | strong/same / black | same | yes | yes | 39.9 | 3.9 | 5584+95 | 0.0123 |
+| angle_coque_iphone_noire.jpg | black case | strong / case | strong/same / case | same | yes | yes | 7.4 | 4.4 | 5584+93 | 0.0123 |
+| couleur_robe_bleue.jpg | NONE | possible / red | possible/similar / red | similar | acceptable-similar | acceptable-similar | 1.2 | 3.2 | 5584+102 | 0.0124 |
+| couleur_sandales_vertes.jpg | NONE | possible / tan sandals | possible/similar / tan | similar | acceptable-similar | acceptable-similar | 56.5 | 4.3 | 5584+91 | 0.0123 |
+| extra_step2_tiktok_robe_rouge.jpg | red dress | possible / red | strong/same / red | same | yes | yes | 1.0 | 5.0 | 4510+102 | 0.0102 |
+
+B was stable (run 1 = run 2 on every row). **A recall 6/9, precision 1.00,
+false-strong 0. B recall 9/9, precision 1.00, false-strong 0.** Ship **B**:
+A still misses TikTok-like frames above the 0.45 `possible` cutoff (the
+step-2 live miss) and would have proposed the red dress as a normal
+possible hit on the blue recolour. B labels that `similar` and never
+emits `strong` without a successful verification. Ten synthetic images
+plus one extra canvas prove very little about real WhatsApp photos —
+same catalogue files with Pillow crops/recolours, not customer phones.
+
+Full pipeline (`traiter_image_entrante`, Meta stubbed, real classifier /
+Voyage / verifier / agent) on +221770099041…044:
+
+| # | Setup | Result |
+|---|--------|--------|
+| 1 | Extra step-2 TikTok canvas of the red dress | `product_photo`, `strong`/`same` on `8717de24-…` at 0.246. Agent: "Je pense que c’est cette robe. C’est bien celle-ci ?" + catalogue photo. No order. vision 3.12s / Voyage 1.22s / verify 1.79s (2255+49 tok) / agent 2.70s. |
+| 2 | Blue recolour of the red dress | `possible`/`similar` on the red dress at 0.203. Developer similar rule present. Agent: "Je n’ai pas exactement ce modèle, mais j’ai une Robe longue rouge de soirée disponible. Est-ce qu’elle vous intéresse ?" + photo. No order. vision 2.01s / Voyage 8.50s / verify 1.84s (2792+50 tok) / agent 3.66s. |
+| 3 | `reel_*` owner photo | skipped — no `reel_*` file in `image-eval`. |
+| 4 | Payment-style screenshot + online order n°60 awaiting proof | `payment_proof`, ACK sent, **Voyage 0, verify 0**, no agent turn, no product proposal. |
+
+Cleanup dry-run: 3 conversations, order n°60, 6 messages, 3 inbound
+images, 2 sent photos, 2 notifications, 1 stock movement; apply restored
+red-dress stock +1; leftover **0** rows for those phones on Awa.
 
 
 

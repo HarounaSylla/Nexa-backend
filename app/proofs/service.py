@@ -351,7 +351,7 @@ async def traiter_image_entrante(
     recognition: RecognitionResult | None = None
     if classification == CLASSIFICATION_PRODUCT_PHOTO and not skip_recognition:
         recognition = await recognise_product_photo(
-            db, merchant.id, content, resolved_mime
+            db, merchant.id, content, resolved_mime, caption=caption
         )
         persist_recognition(image, recognition)
         if recognition.level in {MATCH_LEVEL_NONE, MATCH_LEVEL_ERROR}:
