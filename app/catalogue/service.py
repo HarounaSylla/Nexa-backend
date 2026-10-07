@@ -491,6 +491,24 @@ async def lister_produits_populaires(
     ]
 
 
+async def noms_produits(
+    db: AsyncSession,
+    merchant_id: uuid.UUID,
+    product_ids: list[uuid.UUID],
+) -> dict[uuid.UUID, str]:
+    """Current names for this merchant's products. Unknown or foreign ids omitted."""
+    ids = list({product_id for product_id in product_ids if product_id is not None})
+    if not ids:
+        return {}
+    result = await db.execute(
+        select(Product.id, Product.name).where(
+            Product.merchant_id == merchant_id,
+            Product.id.in_(ids),
+        )
+    )
+    return {row.id: row.name for row in result.all()}
+
+
 async def image_urls_for_products(
     db: AsyncSession, product_ids: list[uuid.UUID]
 ) -> dict[uuid.UUID, str | None]:

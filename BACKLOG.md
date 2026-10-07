@@ -118,7 +118,7 @@ These were listed in `Nexa/proofs/audit-agent-context.md` and are **not** in thi
 - Crop-to-product before embedding/verify (today the whole frame, including TikTok chrome, is embedded)
 - Customer sends several photos in a row (each is its own job/turn; no bundling)
 - Caption-only intent (text "vous avez cette robe?" without a photo) is unchanged text search — not visual search
-- Frontend: show "Produit reconnu : …" on a `product_photo` in the conversation thread (`thread-panel.tsx` currently returns null for that classification — safe, no crash). Not in step 2b.
+- Frontend: show "Produit reconnu : …" on a `product_photo` in the conversation thread (`thread-panel.tsx` currently returns null). Backend `GET /conversations/{id}/messages` now sends `match_level`, `matched_product_id`, `matched_product_name`, `match_kind`.
 - Frontend: map `product_photo_unrecognized` in `notification-copy.ts` (unknown types render as the raw `item.type` string, not `data.title`). Not in step 2b.
 - Tune fallback `image_match_*` cutoffs from real `inbound_images.match_candidates` (still used when verification is off or fails). Retrieval cutoff is 0.65; decision is the vision verifier.
 

@@ -44,6 +44,7 @@ line, screenshot, or database check) in the Proof column.
 | P1 | Catalogue image embeddings + similarity search (step 1, not wired) | Passed | 2026-10-06. Model `voyage-multimodal-3.5` 1024-d (`input_type` document vs query). Alembic `0021` upgrade/downgrade/upgrade. Boutique Awa **26/26** photos, backfill `ok=26 failed=0`, estimate **$0.01636**. Self-match rank-1 **26/26** (dist 0.055–0.100, not ~0 because query≠document). Synthetic variants rank-1 **100%** all six types. Look-alike gap min **0.26** (the two iPhone cases / two evening dresses). Negatives **0.74–0.77** (`none`). Placeholders stay `0.20 / 0.45 / 0.08`. `pytest` **168 passed**. No new route. §31. |
 | P1 | Product photo on WhatsApp → catalogue match + agent confirm (step 2) | Passed | 2026-10-06. Alembic `0022` up/down/up. Vision three kinds; `product_photo` runs search + one agent turn; code-owned proposal; confirm before order. `pytest` **187 passed** (19 new). Live proof `Nexa/proofs/photo-recognition/run_photo_recognition.py` on Boutique Awa +221770099031…041, Meta stubbed, real vision/Voyage/agent. Cleanup leftover 0. Thresholds still too tight on a synthetic TikTok (rank-1 red dress 0.495 → `none`). §32. |
 | P1 | Product photo: embeddings shortlist + vision verify (step 2b) | Passed | 2026-10-07. Retrieval 9/9 positives in top 4 at ≤0.65. Verify decides; never `strong` without it. `pytest` **198 passed** (11 new). Compare A vs B + pipeline `Nexa/proofs/photo-recognition/run_verify_compare.py`. Cleanup leftover 0 on +221770099041…044. §33. |
+| P1 | Thread images expose visual-search match (`MessageImageOut`) | Passed | 2026-10-07. `GET /conversations/{id}/messages` adds `match_level`, `matched_product_id`, `matched_product_name`, `match_kind`. `pytest` **202 passed** (4 new). Proof `Nexa/proofs/thread_image_match.py` on Awa +221770099051. Cleanup leftover 0. §34. |
 
 ## RAG query / result pairs (2026-09-07, `voyage-4-lite`)
 
@@ -1072,6 +1073,27 @@ Voyage / verifier / agent) on +221770099041…044:
 Cleanup dry-run: 3 conversations, order n°60, 6 messages, 3 inbound
 images, 2 sent photos, 2 notifications, 1 stock movement; apply restored
 red-dress stock +1; leftover **0** rows for those phones on Awa.
+
+## 34. Visual-search fields on thread images (2026-10-07)
+
+`GET /conversations/{id}/messages` now includes on each `image`:
+`match_level`, `matched_product_id`, `matched_product_name`, `match_kind`
+(`exact` / `similar`). No schema change. Names loaded in one merchant-scoped
+query. Distances, candidate lists, and the verifier model stay off the
+payload.
+
+`pytest` **202 passed in 28.64s** (4 new in `tests/test_conversation_image_match.py`).
+
+Live throwaway: `uv run python ../proofs/thread_image_match.py` on Boutique
+Awa, phone +221770099051, Clerk session stubbed as in other proofs. Three
+product-photo rows:
+
+- `strong` / `exact` → `Robe longue rouge de soirée` (`8717de24-…`)
+- `possible` / `similar` → same name
+- `none` → `matched_product_id` and name null
+
+Cleanup dry-run: 1 conversation `d1716ca6-…`, 3 messages, 3 inbound images;
+apply leftover **0**. Frontend mapping of these fields is not in this change.
 
 
 

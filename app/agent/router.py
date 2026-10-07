@@ -1,5 +1,6 @@
 import uuid
 from datetime import datetime
+from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, field_validator
@@ -18,9 +19,11 @@ from app.agent.service import (
     reprendre_par_agent,
     repondre_en_humain,
 )
+from app.proofs.models import InboundImage
 from app.proofs.service import lister_images_par_messages
 from app.auth.deps import get_current_merchant
 from app.catalogue.models import Merchant
+from app.catalogue.service import noms_produits
 from app.core.db import get_db
 from app.core.phone import InvalidPhoneNumberError, normalize_phone
 from app.orders.service import NotFoundError, phone_lookup_variants
@@ -86,6 +89,54 @@ class MessageImageOut(BaseModel):
     order_id: uuid.UUID | None
     detected_amount: str | None
     deleted: bool = False
+    match_level: str | None = None
+    matched_product_id: uuid.UUID | None = None
+    matched_product_name: str | None = None
+    match_kind: Literal["exact", "similar"] | None = None
+
+
+def _verdict_for_matched_product(image: InboundImage) -> str | None:
+    if image.matched_product_id is None:
+        return None
+    wanted = str(image.matched_product_id)
+    for row in image.match_candidates or []:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("product_id")) != wanted:
+            continue
+        verdict = row.get("verdict")
+        return verdict if isinstance(verdict, str) else None
+    return None
+
+
+def _match_kind_for_image(image: InboundImage) -> Literal["exact", "similar"] | None:
+    if image.matched_product_id is None:
+        return None
+    verdict = _verdict_for_matched_product(image)
+    if verdict == "similar":
+        return "similar"
+    if verdict == "same" or image.match_level == "strong":
+        return "exact"
+    return None
+
+
+def _message_image_out(
+    image: InboundImage, names: dict[uuid.UUID, str]
+) -> MessageImageOut:
+    product_id = image.matched_product_id
+    return MessageImageOut(
+        id=image.id,
+        classification=image.classification,
+        order_id=image.order_id,
+        detected_amount=(
+            str(image.detected_amount) if image.detected_amount is not None else None
+        ),
+        deleted=image.media_deleted_at is not None,
+        match_level=image.match_level,
+        matched_product_id=product_id,
+        matched_product_name=names.get(product_id) if product_id is not None else None,
+        match_kind=_match_kind_for_image(image),
+    )
 
 
 class MerchantMessageOut(BaseModel):
@@ -224,22 +275,21 @@ async def get_merchant_conversation_messages(
     except NotFoundError as exc:
         raise _not_found_conversation() from exc
     images = await lister_images_par_messages(db, [message.id for message in messages])
+    names = await noms_produits(
+        db,
+        merchant.id,
+        [
+            image.matched_product_id
+            for image in images.values()
+            if image.matched_product_id is not None
+        ],
+    )
     out: list[MerchantMessageOut] = []
     for message in messages:
         image = images.get(message.id)
         image_out = None
         if image is not None:
-            image_out = MessageImageOut(
-                id=image.id,
-                classification=image.classification,
-                order_id=image.order_id,
-                detected_amount=(
-                    str(image.detected_amount)
-                    if image.detected_amount is not None
-                    else None
-                ),
-                deleted=image.media_deleted_at is not None,
-            )
+            image_out = _message_image_out(image, names)
         out.append(
             MerchantMessageOut(
                 id=message.id,
