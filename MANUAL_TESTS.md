@@ -42,6 +42,7 @@ line, screenshot, or database check) in the Proof column.
 | P1 | Agent context after human handover + inbound photo + photo_status | Passed | 2026-10-06. `pytest` **152 passed**. Live `uv run python ../proofs/proof_agent_context.py`: incident ×3 never called `obtenir_disponibilite`/`creer_commande` on the red dress; explicit “Je veux la robe rouge” got `photo_status=will_be_sent` then `already_sent_earlier`. Throwaway rows on +221770099011…015 deleted (0 leftover). Transcript §29. |
 | P1 | `rechercher_produits` survives a wrong `categorie` argument | Passed | 2026-10-06. Resolve then one unfiltered retry. Direct Awa search `"robe rouge"` with `Robes`/`robes`/`robe`/`Vêtements`/`None` all returned Robe longue rouge de soirée. Baseline HEAD (no rule 15) vs current: nominal+typos ×3 each, **6/6 found the dress on both trees**, `categorie=null` every time — the earlier `categorie="robes"` miss is pre-existing model flakiness, not rule 15. Incident ×3 still clarifying questions, no product guessed. `pytest` **158 passed**. Cleanup +221770099021 empty. §30. |
 | P1 | Catalogue image embeddings + similarity search (step 1, not wired) | Passed | 2026-10-06. Model `voyage-multimodal-3.5` 1024-d (`input_type` document vs query). Alembic `0021` upgrade/downgrade/upgrade. Boutique Awa **26/26** photos, backfill `ok=26 failed=0`, estimate **$0.01636**. Self-match rank-1 **26/26** (dist 0.055–0.100, not ~0 because query≠document). Synthetic variants rank-1 **100%** all six types. Look-alike gap min **0.26** (the two iPhone cases / two evening dresses). Negatives **0.74–0.77** (`none`). Placeholders stay `0.20 / 0.45 / 0.08`. `pytest` **168 passed**. No new route. §31. |
+| P1 | Product photo on WhatsApp → catalogue match + agent confirm (step 2) | Passed | 2026-10-06. Alembic `0022` up/down/up. Vision three kinds; `product_photo` runs search + one agent turn; code-owned proposal; confirm before order. `pytest` **187 passed** (19 new). Live proof `Nexa/proofs/photo-recognition/run_photo_recognition.py` on Boutique Awa +221770099031…041, Meta stubbed, real vision/Voyage/agent. Cleanup leftover 0. Thresholds still too tight on a synthetic TikTok (rank-1 red dress 0.495 → `none`). §32. |
 
 ## RAG query / result pairs (2026-09-07, `voyage-4-lite`)
 
@@ -962,6 +963,53 @@ photos plus Pillow prove about a real WhatsApp customer photo.
 Cleanup: no throwaway products/files created. Lasting DB change is Alembic
 `0021` plus the 26 Awa `image_embedding` values written by the backfill.
 Throwaway measurer: `Nexa/proofs/image-search/measure_image_search.py`.
+
+## 32. Product photo recognition wired to WhatsApp + agent (2026-10-06, step 2)
+
+Backend only. No new route. Customer photos are classified by vision
+(`payment_proof` | `product_photo` | `other`), then a `product_photo` on a
+non-escalated thread runs `trouver_produits_par_image` and one agent turn
+(`traiter_photo_produit`) that must confirm before `creer_commande`.
+
+Alembic `0022_inbound_image_match` (`matched_product_id`, `match_level`,
+`match_candidates`):
+
+```
+Running upgrade 0021_product_image_embedding -> 0022_inbound_image_match
+Running downgrade 0022_inbound_image_match -> 0021_product_image_embedding
+Running upgrade 0021_product_image_embedding -> 0022_inbound_image_match
+```
+
+`pytest` **187 passed in 25.47s** (19 new in `tests/test_product_photo.py`;
+vision, Voyage, and the LLM stubbed).
+
+Live throwaway: `uv run python ../proofs/photo-recognition/run_photo_recognition.py`
+on Boutique Awa `37292228-…`, phones +221770099031…041. WhatsApp download/send
+replaced by local stubs (nothing to Meta). Vision, Voyage, and the agent model
+are real. `Nexa/proofs/image-eval/` had only `manifest.csv` (no image files),
+so the script built TikTok-like 9:16 canvases from Awa catalogue photos plus a
+PIL payment screenshot and a blue recolour "not sold" image.
+
+| # | Setup | Result |
+|---|--------|--------|
+| 1 | TikTok-like of Robe longue rouge de soirée | Vision `product_photo`, "A fitted red sleeveless maxi dress…". Voyage rank-1 **was** that dress (`8717de24-…`) at **0.495** → `none` (cutoff 0.45). Agent: cannot find it, shop informed, asked name/colour. No photo sent, **0 orders**. vision 9.52s / Voyage 1.80s / agent 1.36s. |
+| 2a | Then customer « oui » | Agent asked again for name/type (nothing had been proposed). **0 orders**. |
+| 2b | Fresh phone, same photo, then « non, plutôt la noire » | Photo again `none`. Agent followed the customer ("article noir") and did not invent a product. **0 orders**. |
+| 3 | TikTok-like of the black evening dress | `possible`, matched `411ff5b6-…` (the black dress) at 0.439; gap to red 0.121 **≥** `image_match_min_margin` 0.08 → proposal set size **1** (not an ambiguous pair). Agent called `obtenir_disponibilite`, sent the photo, asked "C'est bien celle-ci ?". No order. |
+| 4 | Blue recolour of the red dress ("Awa does not sell") | Still `possible` on the red dress at 0.203 — the recolour is too close to the original. Agent proposed the red dress + photo. **No** `product_photo_unrecognized` (only `none`/`error` notify). Voyage 55.91s (free-tier 429 retry). |
+| 5a | Payment-style screenshot + online order awaiting proof (n°59) | `payment_proof`, `payment_status=proof_received`, ACK sent, **no** Voyage, **no** product proposal. |
+| 5b | Same screenshot, no awaiting order | Still `payment_proof` (not a product proposal). ACK "commande à identifier" path. No agent turn. |
+| 6 | Escalated conversation | `not_analyzed`, vision **0**, Voyage **0**, no reply. |
+| 7 | Daily cap (10 analysed rows already) | `not_analyzed`, no reply. |
+| 8a | Vision forced to fail | `unknown`, no crash, no recognition, no agent reply. |
+| 8b | Voyage forced to fail | `match_level=error`, French "pas ce modèle" + shop informed, notification `product_photo_unrecognized` "Photo de produit non reconnue". No crash. |
+| 9 | Caption « Vous avez cette robe? » + same TikTok red | Caption stored and passed as untrusted data. Same `none` as (1). Agent asked for name/colour/type of robe. |
+
+**Where search/agent got it wrong:** (1)(9) the right dress was rank-1 but 0.045 above `possible` so the agent honestly said it could not find the model — thresholds need real-traffic tuning from `match_candidates`. (3) look-alikes did **not** produce a two-product proposal (gap 0.12 > 0.08). (4) a recoloured catalogue photo is not a true negative.
+
+Frontend not in this change: unknown notification types render as raw `item.type`; a `product_photo` in the thread currently has no "Produit reconnu" label (`thread-panel.tsx` returns null).
+
+Cleanup dry-run listed 11 conversations, order n°59, 21 inbound images, 9 notifications; apply restored red-dress stock +1; leftover **0** rows for those phones on Awa.
 
 
 

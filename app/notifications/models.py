@@ -16,6 +16,7 @@ class NotificationType(str, enum.Enum):
     product_out_of_stock = "product_out_of_stock"
     payment_proof_received = "payment_proof_received"
     escalated_customer_message = "escalated_customer_message"
+    product_photo_unrecognized = "product_photo_unrecognized"
 
 
 class NotificationRelatedType(str, enum.Enum):

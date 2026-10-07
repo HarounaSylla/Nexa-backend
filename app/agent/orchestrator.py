@@ -315,6 +315,60 @@ async def _store_escalated_inbound(
     await db.commit()
 
 
+async def _system_prompt_item(
+    db: AsyncSession,
+    merchant_id: uuid.UUID,
+    merchant_name: str,
+    now: datetime | None,
+) -> dict[str, str]:
+    preferences = await get_preferences(db, merchant_id)
+    zones = await lister_zones_livraison(db, merchant_id)
+    available_cities = [zone.city for zone in zones if zone.available]
+    return build_system_prompt(
+        merchant_name,
+        preferences,
+        available_cities=available_cities,
+        now=now,
+    )
+
+
+async def _invoke_agent_and_store(
+    db: AsyncSession,
+    *,
+    merchant_id: uuid.UUID,
+    conversation: Conversation,
+    input_list: list[Any],
+    persist_prefix: list[Any],
+) -> str:
+    compiled = _build_graph(db)
+    initial: AgentState = {
+        "input_list": input_list,
+        "new_items": [],
+        "last_output": [],
+        "conversation_id": str(conversation.id),
+        "merchant_id": str(merchant_id),
+        "output_text": "",
+    }
+    final_state = await compiled.ainvoke(initial, {"recursion_limit": 12})
+    new_items = list(final_state["new_items"])
+    reply = extract_assistant_text(
+        new_items, fallback=final_state.get("output_text") or ""
+    )
+    if not reply:
+        reply = "Désolé, je n'ai pas pu répondre. Un conseiller va vous aider."
+    conversation.updated_at = datetime.now(timezone.utc)
+    db.add(
+        Message(
+            conversation_id=conversation.id,
+            turn_role="agent",
+            display_text=reply,
+            items=[*persist_prefix, *new_items],
+        )
+    )
+    await db.commit()
+    return reply
+
+
 async def traiter_message_entrant(
     db: AsyncSession,
     merchant_id: uuid.UUID,
@@ -362,38 +416,46 @@ async def traiter_message_entrant(
     )
     await db.commit()
 
-    preferences = await get_preferences(db, merchant_id)
-    zones = await lister_zones_livraison(db, merchant_id)
-    available_cities = [zone.city for zone in zones if zone.available]
-    system_item = build_system_prompt(
-        merchant.name,
-        preferences,
-        available_cities=available_cities,
-        now=now,
+    system_item = await _system_prompt_item(db, merchant_id, merchant.name, now)
+    return await _invoke_agent_and_store(
+        db,
+        merchant_id=merchant_id,
+        conversation=conversation,
+        input_list=[system_item, *prior_items, customer_item],
+        persist_prefix=[],
     )
-    compiled = _build_graph(db)
-    initial: AgentState = {
-        "input_list": [system_item, *prior_items, customer_item],
-        "new_items": [],
-        "last_output": [],
-        "conversation_id": str(conversation.id),
-        "merchant_id": str(merchant_id),
-        "output_text": "",
-    }
-    final_state = await compiled.ainvoke(initial, {"recursion_limit": 12})
-    new_items = list(final_state["new_items"])
-    reply = extract_assistant_text(new_items, fallback=final_state.get("output_text") or "")
-    if not reply:
-        reply = "Désolé, je n'ai pas pu répondre. Un conseiller va vous aider."
 
-    conversation.updated_at = datetime.now(timezone.utc)
-    db.add(
-        Message(
-            conversation_id=conversation.id,
-            turn_role="agent",
-            display_text=reply,
-            items=new_items,
-        )
+
+async def traiter_photo_produit(
+    db: AsyncSession,
+    merchant_id: uuid.UUID,
+    customer_phone: str,
+    developer_item: dict[str, str],
+    now: datetime | None = None,
+) -> str:
+    """One agent turn after a recognised product photo.
+
+    The customer photo marker is already stored. No extra user item is
+    added. `developer_item` is sent to the model and persisted as the
+    first item of the agent row so the next customer message still sees
+    the proposal.
+    """
+    merchant = await db.get(Merchant, merchant_id)
+    if merchant is None:
+        raise ValueError(f"Merchant {merchant_id} was not found")
+    phone = try_normalize_phone(customer_phone)
+    conversation = await _get_or_create_conversation(db, merchant_id, phone)
+    history = await db.execute(
+        select(Message)
+        .where(Message.conversation_id == conversation.id)
+        .order_by(Message.created_at, Message.id)
     )
-    await db.commit()
-    return reply
+    prior_items = prior_items_for_agent(list(history.scalars().all()))
+    system_item = await _system_prompt_item(db, merchant_id, merchant.name, now)
+    return await _invoke_agent_and_store(
+        db,
+        merchant_id=merchant_id,
+        conversation=conversation,
+        input_list=[system_item, *prior_items, developer_item],
+        persist_prefix=[developer_item],
+    )

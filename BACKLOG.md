@@ -17,7 +17,7 @@ unchecked items as optional.
 - [x] Manual relevance validation
 - [x] `lister_categories` (in-stock categories for the agent menu)
 - [x] `lister_produits_populaires` (top 10 by distinct non-cancelled orders, price DESC tie-break / cold start)
-- [x] Image embeddings (`voyage-multimodal-3.5`, 1024-d, `products.image_embedding`, Alembic `0021`) + `trouver_produits_par_image` / `classify_image_match`. **Not wired** to WhatsApp, the agent, vision, or any route (step 2).
+- [x] Image embeddings (`voyage-multimodal-3.5`, 1024-d, `products.image_embedding`, Alembic `0021`) + `trouver_produits_par_image` / `classify_image_match`. Step 2 wires this into WhatsApp inbound photos and one agent turn (`traiter_photo_produit`).
 
 ## Jalon 2 — Orders, stock, delivery
 
@@ -56,7 +56,7 @@ TikTok comment classifier (Jalon 7) remains a separate model decision.
 - [x] WhatsApp Cloud API webhook (`GET`/`POST /whatsapp/webhook`) — RQ job on Redis, worker calls `traiter_message_entrant` once then Graph API send. Merchant routed by `merchants.whatsapp_phone_number_id` (Alembic `0009`). `POST /agent/simulate` unchanged.
 - [x] WhatsApp outbound product photos: worker uploads local files via Graph `/media` then sends `type=image` with `media_id` (not a public `link`). Cap 3 per turn. `extract_product_images` lives in `app/agent/images.py` (simulate unchanged).
 - [x] Close conversations on delivery (`confirmer_livraison`) and 48h inactivity (lazy inbound + RQ `close_stale_conversations` on `maintenance` every 15 min). Sweep preserves `updated_at` so the 15-min reopen grace does not revive a swept thread.
-- [x] WhatsApp inbound images (payment proofs) — stored privately, vision only when an order is awaiting a proof. Voice / PDF still skipped.
+- [x] WhatsApp inbound images (payment proofs **and** product photos) — stored privately. Vision runs when the daily cap is not reached, except on an escalated thread with no order awaiting proof. Voice / PDF still skipped.
 - [x] Agent sees human-handover and inbound-photo turns as replayable text markers (`app/agent/handover.py`); a developer note is injected at replay when a `[Boutique]` reply follows the last native agent turn. Tool outputs carry `photo_status` (`will_be_sent` / `already_sent_earlier` / `none`) using the same plan as the WhatsApp worker. Prompt rules 14–15. No schema change.
 
 - [x] `rechercher_produits` resolves a guessed `categorie` against stored names (case / accents / trivial singular-plural) then exact-equality filter; if that search is empty it retries once without a category (`rag_max_distance` still applies).
@@ -101,7 +101,7 @@ These were listed in `Nexa/proofs/audit-agent-context.md` and are **not** in thi
 - Deactivating a payment link without deleting it
 - WhatsApp message templates for sending after the 24 h window
 - A "Renvoyer" retry queue for failed merchant sends
-- PDF/document proofs and image questions from customers (non-proof inbound photos now leave a text marker for the agent; the model still cannot see pixels)
+- PDF/document proofs and image questions from customers (non-proof inbound photos now leave a text marker for the agent; a `product_photo` classification also runs catalogue search + one agent turn that must confirm before ordering)
 - Notification when a customer sends a photo before any link was sent (currently stored and visible in the thread only)
 - Merchant "attach this photo to an order" action for ambiguous cases
 - [x] Inbound image file retention (Alembic `0019`, 90 days after reception once unpaid/pending proofs are done; row kept, file deleted)
@@ -112,6 +112,14 @@ These were listed in `Nexa/proofs/audit-agent-context.md` and are **not** in thi
 - Real-phone test of the inbound proof flow (blocked on the WhatsApp token/webhook)
 - Customer acknowledgement when a message arrives on an escalated conversation (merchant is notified; agent stays silent; no auto-reply today)
 - Auto-return / auto-close policy for unanswered escalations
+- `other` while an order awaits a proof: still stored, no reply, no notification (backlog question unchanged)
+- At the vision/recognition cap (`max_image_analyses_per_phone_per_day`, default 10): today `not_analyzed` and **no customer reply**. Decide whether to tell the customer.
+- Several product photos in one image (vision + search assume a single main subject)
+- Customer sends several photos in a row (each is its own job/turn; no bundling)
+- Caption-only intent (text "vous avez cette robe?" without a photo) is unchanged text search — not visual search
+- Frontend: show "Produit reconnu : …" on a `product_photo` in the conversation thread (`thread-panel.tsx` currently returns null for that classification — safe, no crash)
+- Frontend: map `product_photo_unrecognized` in `notification-copy.ts` (unknown types render as the raw `item.type` string, not `data.title`)
+- Tune `image_match_strong_distance` / `image_match_possible_distance` / `image_match_min_margin` from real `inbound_images.match_candidates` (Alembic `0022`). Synthetic TikTok of Awa's red dress landed at distance 0.495 (`none` vs cutoff 0.45) even though rank-1 was the right product.
 
 ## Preferences — later
 
@@ -124,27 +132,30 @@ These were listed in `Nexa/proofs/audit-agent-context.md` and are **not** in thi
 - Multi-country readiness: per-merchant currency code/symbol instead of the hardcoded "F"/"FCFA" in `app/agent/images.py` and the frontend formatters; merchant country / default phone prefix; UI and agent language beyond French
 - Multi-country phone defaults beyond `DEFAULT_COUNTRY_CALLING_CODE=221` (per-merchant calling code, non-Senegalese local forms)
 
-## Image search (step 1 landed; step 2 not wired)
+## Image search (step 2 wired)
 
 Catalogue image embeddings (`voyage-multimodal-3.5`, `products.image_embedding`)
-and `trouver_produits_par_image` exist. They are **not** called from WhatsApp,
-the agent, the vision classifier, or any HTTP route yet.
+and `trouver_produits_par_image` are called from `traiter_image_entrante` when
+vision returns `product_photo` on a non-escalated conversation. The agent
+proposes from a **code-owned** set and must get a customer "oui" before
+ordering. No new HTTP route.
 
-- Confirm Voyage data retention / privacy **before the pilot**: hosted API
-  stores inputs for training unless the org Admin opts out (zero-day retention)
-  in the dashboard Terms of Service. Catalogue photos are the merchant's own
-  files; customer inbound photos must not be sent to Voyage until that opt-out
-  is verified. https://docs.voyageai.com/docs/faq
+- Confirm Voyage **and OpenAI** data retention / privacy **before the pilot**:
+  customer inbound photos are now sent to both APIs (vision classifier +
+  query embedding). Voyage hosted API stores inputs for training unless the
+  org Admin opts out (zero-day retention) in the dashboard Terms of Service.
+  OpenAI vision/agent: confirm `store=False` on the vision call is enough for
+  the org's retention policy. Catalogue photos were already sent at backfill.
+  https://docs.voyageai.com/docs/faq
 - HNSW (or ivfflat) index on `products.image_embedding` when catalogues grow
   past a sequential scan (same backlog as text `products.embedding` in 0002)
 - Several photos per product (today: one file `{product_id}.{ext}`)
 - Multimodal text-to-image search (query text against image vectors — different
   from today's image-to-image and from text RAG)
 - Cost monitoring for Voyage multimodal ($0.60 / billion pixels; 50k-pixel
-  floor, 2M-pixel ceiling; free-tier 3 RPM until a payment method is on file)
-- Tune `image_match_strong_distance` / `image_match_possible_distance` /
-  `image_match_min_margin` on real customer photos in `Nexa/proofs/image-eval/`
-  before wiring step 2
-- Step 2: agent / WhatsApp / vision classifier use of image search (thresholds
-  first)
+  floor, 2M-pixel ceiling; **free-tier 3 RPM** until a payment method is on
+  file — the step-2 proof's Voyage stage hit 55.91s on one call, consistent
+  with 429 retry)
+- Tune thresholds on real customer photos using
+  `inbound_images.match_candidates` (placeholders still `0.20 / 0.45 / 0.08`)
 

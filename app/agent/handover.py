@@ -74,7 +74,16 @@ def item_customer_photo(
         )
     else:
         legend = (caption or "").strip()
-        if legend:
+        if classification == "product_photo":
+            if legend:
+                clipped = legend[:_CAPTION_MAX_CHARS]
+                content = (
+                    "[Le client a envoyé une photo de produit "
+                    f'— légende : "{clipped}"]'
+                )
+            else:
+                content = "[Le client a envoyé une photo de produit]"
+        elif legend:
             clipped = legend[:_CAPTION_MAX_CHARS]
             content = f'[Le client a envoyé une photo — légende : "{clipped}"]'
         elif classification in {"not_analyzed", "other", "unknown", None}:

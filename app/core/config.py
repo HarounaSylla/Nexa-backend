@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     image_match_strong_distance: float = 0.20
     image_match_possible_distance: float = 0.45
     image_match_min_margin: float = 0.08
+    # Vision calls (payment-proof checks and product recognition) counted
+    # per customer phone per rolling day. One count per vision call.
+    max_image_analyses_per_phone_per_day: int = 10
     # First-pass RAG cosine-distance cutoff (pgvector <=> / 1 - cosine sim).
     # Measured 2026-09-08 on Boutique Awa with voyage-4-lite (lower = closer):
     #   "robe rouge pour une soirée": 0.3088 robe rouge, 0.3724 robe noire,

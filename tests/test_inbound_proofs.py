@@ -618,9 +618,9 @@ async def test_reject_bad_media_and_gate(tmp_path: Path) -> None:
                     db, merchant, PHONE, "wamid.gate", "m", "image/png", None
                 )
         assert gated is not None
-        assert gated.classification == CLASSIFICATION_NOT_ANALYZED
-        vision.assert_not_awaited()
-        send.assert_not_awaited()
+        assert gated.classification == CLASSIFICATION_PAYMENT_PROOF
+        vision.assert_awaited()
+        send.assert_awaited()
         async with AsyncSessionLocal() as db:
             for order_id in (cod.id, unpaid_online.id, paid.id, cancelled.id):
                 row = await db.get(Order, order_id)
@@ -636,7 +636,8 @@ async def test_reject_bad_media_and_gate(tmp_path: Path) -> None:
                     )
                 ).scalars().all()
             )
-            assert notes == []
+            assert notes
+            assert any("commande à identifier" in str(row.data) for row in notes)
 
         empty_phone = "+221770049900"
         with (
@@ -653,10 +654,11 @@ async def test_reject_bad_media_and_gate(tmp_path: Path) -> None:
                     db, merchant, empty_phone, "wamid.none", "m", "image/png", None
                 )
         assert none is not None
-        assert none.classification == CLASSIFICATION_NOT_ANALYZED
-        vision.assert_not_awaited()
-        send.assert_not_awaited()
+        assert none.classification == CLASSIFICATION_PAYMENT_PROOF
+        vision.assert_awaited()
+        send.assert_awaited()
 
+        vision.reset_mock()
         await _mark_link_sent(unpaid_online.id)
         with (
             patch("app.core.config.settings.media_dir", str(tmp_path / "media")),
@@ -720,7 +722,7 @@ async def test_closed_conversation_and_daily_cap(tmp_path: Path) -> None:
             )
             assert len(convs) == 1
 
-        for index in range(4):
+        for index in range(9):
             async with AsyncSessionLocal() as db:
                 db.add(
                     InboundImage(
@@ -1111,8 +1113,8 @@ async def test_proof_acceptance_window(tmp_path: Path) -> None:
         vision.reset_mock()
         outside_row = await _run(outside_phone, "wamid.win-15")
         assert outside_row is not None
-        assert outside_row.classification == CLASSIFICATION_NOT_ANALYZED
-        vision.assert_not_awaited()
+        assert outside_row.classification == CLASSIFICATION_PAYMENT_PROOF
+        vision.assert_awaited_once()
 
         async with AsyncSessionLocal() as db:
             stale = await db.get(Order, outside.id)
@@ -1120,6 +1122,7 @@ async def test_proof_acceptance_window(tmp_path: Path) -> None:
             stale.payment_link_sent_at = datetime.now(timezone.utc)
             await db.commit()
 
+        vision.reset_mock()
         refreshed = await _run(outside_phone, "wamid.win-resend")
         assert refreshed is not None
         assert refreshed.classification == CLASSIFICATION_PAYMENT_PROOF

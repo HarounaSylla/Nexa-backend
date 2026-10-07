@@ -38,6 +38,104 @@ from app.whatsapp.service import (
 logger = logging.getLogger(__name__)
 
 
+async def envoyer_reponse_whatsapp_agent(
+    customer_phone: str,
+    reply: str,
+    phone_number_id: str,
+    merchant_id: uuid.UUID,
+    message_id: str,
+) -> None:
+    """Send the agent text then product photos (shared by text and image jobs)."""
+    await envoyer_texte_whatsapp(customer_phone, reply, phone_number_id)
+
+    images = []
+    names = {}
+    descriptions = {}
+    conversation_id = None
+    already_sent: set[uuid.UUID] = set()
+    async with AsyncSessionLocal() as db:
+        last = await obtenir_dernier_message_agent(
+            db, merchant_id, customer_phone
+        )
+        if last is not None:
+            images = extract_product_images(last.items)
+            names = product_names_from_items(last.items)
+            descriptions = product_descriptions_from_items(last.items)
+            conversation_id = last.conversation_id
+            already_sent = await already_sent_product_ids(
+                db,
+                conversation_id,
+                [image.product_id for image in images],
+            )
+
+    multi_mode = len(images) > 1
+    plan = photo_delivery_plan(
+        [image.product_id for image in images],
+        already_sent,
+    )
+    if multi_mode:
+        cap_logged = False
+        for image in images:
+            description = descriptions.get(image.product_id)
+            if description:
+                await envoyer_texte_whatsapp(
+                    customer_phone, description, phone_number_id
+                )
+            status = plan.get(image.product_id)
+            if status == PHOTO_STATUS_ALREADY_SENT:
+                logger.info(
+                    "Skipping already-sent product photo product_id=%s "
+                    "conversation_id=%s message_id=%s",
+                    image.product_id,
+                    conversation_id,
+                    message_id,
+                )
+                continue
+            if status != PHOTO_STATUS_WILL_BE_SENT:
+                if not cap_logged:
+                    logger.info(
+                        "Capping WhatsApp images from %s to %s message_id=%s",
+                        len(images),
+                        MAX_WHATSAPP_IMAGES,
+                        message_id,
+                    )
+                    cap_logged = True
+                continue
+            await envoyer_image_whatsapp(
+                customer_phone,
+                image.product_id,
+                phone_number_id,
+            )
+            if conversation_id is not None:
+                async with AsyncSessionLocal() as db:
+                    await record_sent_product_image(
+                        db, conversation_id, image.product_id
+                    )
+    elif len(images) == 1:
+        image = images[0]
+        status = plan.get(image.product_id)
+        if status == PHOTO_STATUS_WILL_BE_SENT:
+            await envoyer_image_whatsapp(
+                customer_phone,
+                image.product_id,
+                phone_number_id,
+                caption=names.get(image.product_id),
+            )
+            if conversation_id is not None:
+                async with AsyncSessionLocal() as db:
+                    await record_sent_product_image(
+                        db, conversation_id, image.product_id
+                    )
+        elif status == PHOTO_STATUS_ALREADY_SENT:
+            logger.info(
+                "Skipping already-sent product photo product_id=%s "
+                "conversation_id=%s message_id=%s",
+                image.product_id,
+                conversation_id,
+                message_id,
+            )
+
+
 def process_inbound_whatsapp_text(
     message_id: str,
     customer_phone: str,
@@ -116,94 +214,13 @@ async def process_inbound_whatsapp_text_async(
         if reply is None:
             return
 
-        await envoyer_texte_whatsapp(customer_phone, reply, phone_number_id)
-
-        images = []
-        names = {}
-        descriptions = {}
-        conversation_id = None
-        already_sent: set[uuid.UUID] = set()
-        async with AsyncSessionLocal() as db:
-            last = await obtenir_dernier_message_agent(
-                db, merchant_id, customer_phone
-            )
-            if last is not None:
-                images = extract_product_images(last.items)
-                names = product_names_from_items(last.items)
-                descriptions = product_descriptions_from_items(last.items)
-                conversation_id = last.conversation_id
-                already_sent = await already_sent_product_ids(
-                    db,
-                    conversation_id,
-                    [image.product_id for image in images],
-                )
-
-        multi_mode = len(images) > 1
-        plan = photo_delivery_plan(
-            [image.product_id for image in images],
-            already_sent,
+        await envoyer_reponse_whatsapp_agent(
+            customer_phone,
+            reply,
+            phone_number_id,
+            merchant_id,
+            message_id,
         )
-        if multi_mode:
-            cap_logged = False
-            for image in images:
-                description = descriptions.get(image.product_id)
-                if description:
-                    await envoyer_texte_whatsapp(
-                        customer_phone, description, phone_number_id
-                    )
-                status = plan.get(image.product_id)
-                if status == PHOTO_STATUS_ALREADY_SENT:
-                    logger.info(
-                        "Skipping already-sent product photo product_id=%s "
-                        "conversation_id=%s message_id=%s",
-                        image.product_id,
-                        conversation_id,
-                        message_id,
-                    )
-                    continue
-                if status != PHOTO_STATUS_WILL_BE_SENT:
-                    if not cap_logged:
-                        logger.info(
-                            "Capping WhatsApp images from %s to %s message_id=%s",
-                            len(images),
-                            MAX_WHATSAPP_IMAGES,
-                            message_id,
-                        )
-                        cap_logged = True
-                    continue
-                await envoyer_image_whatsapp(
-                    customer_phone,
-                    image.product_id,
-                    phone_number_id,
-                )
-                if conversation_id is not None:
-                    async with AsyncSessionLocal() as db:
-                        await record_sent_product_image(
-                            db, conversation_id, image.product_id
-                        )
-        elif len(images) == 1:
-            image = images[0]
-            status = plan.get(image.product_id)
-            if status == PHOTO_STATUS_WILL_BE_SENT:
-                await envoyer_image_whatsapp(
-                    customer_phone,
-                    image.product_id,
-                    phone_number_id,
-                    caption=names.get(image.product_id),
-                )
-                if conversation_id is not None:
-                    async with AsyncSessionLocal() as db:
-                        await record_sent_product_image(
-                            db, conversation_id, image.product_id
-                        )
-            elif status == PHOTO_STATUS_ALREADY_SENT:
-                logger.info(
-                    "Skipping already-sent product photo product_id=%s "
-                    "conversation_id=%s message_id=%s",
-                    image.product_id,
-                    conversation_id,
-                    message_id,
-                )
     finally:
         await engine.dispose()
 
@@ -233,6 +250,17 @@ def process_inbound_whatsapp_image(
             whatsapp_message_id,
             customer_phone,
         )
+        try:
+            asyncio.run(
+                envoyer_texte_whatsapp(
+                    customer_phone, FALLBACK_REPLY, phone_number_id
+                )
+            )
+        except Exception:
+            logger.exception(
+                "WhatsApp image fallback send also failed message_id=%s",
+                whatsapp_message_id,
+            )
 
 
 async def process_inbound_whatsapp_image_async(
@@ -262,16 +290,46 @@ async def process_inbound_whatsapp_image_async(
                     phone_number_id,
                 )
                 return
+            merchant_id = merchant.id
             from app.proofs.service import traiter_image_entrante
 
-            await traiter_image_entrante(
-                db,
-                merchant,
-                customer_phone,
-                whatsapp_message_id,
-                media_id,
-                mime_type or None,
-                caption or None,
+            try:
+                stored = await traiter_image_entrante(
+                    db,
+                    merchant,
+                    customer_phone,
+                    whatsapp_message_id,
+                    media_id,
+                    mime_type or None,
+                    caption or None,
+                )
+            except Exception:
+                logger.exception(
+                    "traiter_image_entrante failed message_id=%s merchant=%s",
+                    whatsapp_message_id,
+                    merchant_id,
+                )
+                await envoyer_texte_whatsapp(
+                    customer_phone, FALLBACK_REPLY, phone_number_id
+                )
+                return
+        if stored is None:
+            return
+        if not getattr(stored, "_send_agent", False):
+            return
+        if getattr(stored, "_agent_failed", False) or not getattr(
+            stored, "_agent_reply", None
+        ):
+            await envoyer_texte_whatsapp(
+                customer_phone, FALLBACK_REPLY, phone_number_id
             )
+            return
+        await envoyer_reponse_whatsapp_agent(
+            customer_phone,
+            stored._agent_reply,
+            phone_number_id,
+            merchant_id,
+            whatsapp_message_id,
+        )
     finally:
         await engine.dispose()

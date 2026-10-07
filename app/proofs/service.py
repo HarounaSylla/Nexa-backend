@@ -1,4 +1,4 @@
-"""Inbound WhatsApp image pipeline. Never calls the sales agent."""
+"""Inbound WhatsApp image pipeline."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.handover import item_automatic_proof_ack, item_customer_photo
 from app.agent.models import Conversation, Message
-from app.agent.orchestrator import _get_or_create_conversation
+from app.agent.orchestrator import _get_or_create_conversation, traiter_photo_produit
 from app.agent.service import (
     STATUS_CLOSED,
     STATUS_ESCALATED,
@@ -37,15 +37,29 @@ from app.proofs.models import (
     CLASSIFICATION_NOT_ANALYZED,
     CLASSIFICATION_OTHER,
     CLASSIFICATION_PAYMENT_PROOF,
+    CLASSIFICATION_PRODUCT_PHOTO,
     CLASSIFICATION_UNKNOWN,
+    MATCH_LEVEL_ERROR,
+    MATCH_LEVEL_NONE,
     InboundImage,
+)
+from app.proofs.recognition import (
+    RecognitionResult,
+    build_product_photo_developer_item,
+    persist_recognition,
+    recognise_product_photo,
 )
 from app.proofs.storage import (
     RejectedMediaError,
     delete_inbound_image_file,
     save_inbound_image,
 )
-from app.proofs.vision import ImageAnalysis, ImageAnalysisError, classer_image_entrante
+from app.proofs.vision import (
+    IMAGE_KIND_PRODUCT_PHOTO,
+    ImageAnalysis,
+    ImageAnalysisError,
+    classer_image_entrante,
+)
 from app.whatsapp.service import (
     WhatsAppSendError,
     envoyer_message_commercant,
@@ -54,7 +68,7 @@ from app.whatsapp.service import (
 
 logger = logging.getLogger(__name__)
 
-MAX_IMAGE_ANALYSES_PER_PHONE_PER_DAY = 5
+MAX_IMAGE_ANALYSES_PER_PHONE_PER_DAY = 10
 ACK_TEXT = (
     "Merci, nous avons bien reçu votre photo. "
     "La boutique va vérifier votre paiement."
@@ -170,6 +184,32 @@ def _notification_copy(
     }
 
 
+async def _emit_unrecognized_product_photo(
+    db: AsyncSession,
+    *,
+    merchant_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+    phone: str,
+) -> None:
+    title = "Photo de produit non reconnue"
+    body = (
+        f"Le client {phone} a envoyé une photo de produit que le catalogue "
+        "n'a pas reconnue. Une vente est peut-être possible."
+    )
+    await emit_notification(
+        db,
+        merchant_id=merchant_id,
+        notification_type=NotificationType.product_photo_unrecognized,
+        related_type=NotificationRelatedType.conversation,
+        related_id=conversation_id,
+        data={
+            "title": title,
+            "body": body,
+            "customer_phone": phone,
+        },
+    )
+
+
 async def _choose_conversation(
     db: AsyncSession,
     merchant_id: uuid.UUID,
@@ -230,9 +270,15 @@ async def traiter_image_entrante(
     candidates = await commandes_en_attente_de_preuve(
         db, merchant.id, customer_phone
     )
+    escalated = await trouver_conversation_escaladee(
+        db, merchant.id, customer_phone
+    )
     analyses_today = await _analyses_in_last_day(db, merchant.id, customer_phone)
-    at_cap = analyses_today >= MAX_IMAGE_ANALYSES_PER_PHONE_PER_DAY
-    run_vision = bool(candidates) and not at_cap
+    at_cap = analyses_today >= settings.max_image_analyses_per_phone_per_day
+    awaiting_proof = bool(candidates)
+    run_vision = not at_cap and not (
+        escalated is not None and not awaiting_proof
+    )
 
     classification = CLASSIFICATION_NOT_ANALYZED
     detected_amount: Decimal | None = None
@@ -242,7 +288,9 @@ async def traiter_image_entrante(
             analysis = await classer_image_entrante(
                 content, resolved_mime, caption
             )
-            if analysis.is_payment_proof:
+            if analysis.image_kind == IMAGE_KIND_PRODUCT_PHOTO:
+                classification = CLASSIFICATION_PRODUCT_PHOTO
+            elif analysis.is_payment_proof:
                 classification = CLASSIFICATION_PAYMENT_PROOF
             else:
                 classification = CLASSIFICATION_OTHER
@@ -255,6 +303,7 @@ async def traiter_image_entrante(
             )
             classification = CLASSIFICATION_UNKNOWN
 
+    skip_recognition = escalated is not None
     matched: Order | None = None
     if classification in {CLASSIFICATION_PAYMENT_PROOF, CLASSIFICATION_UNKNOWN}:
         matched = choisir_commande_pour_preuve(candidates, caption)
@@ -299,6 +348,20 @@ async def traiter_image_entrante(
     )
     db.add(image)
 
+    recognition: RecognitionResult | None = None
+    if classification == CLASSIFICATION_PRODUCT_PHOTO and not skip_recognition:
+        recognition = await recognise_product_photo(
+            db, merchant.id, content, resolved_mime
+        )
+        persist_recognition(image, recognition)
+        if recognition.level in {MATCH_LEVEL_NONE, MATCH_LEVEL_ERROR}:
+            await _emit_unrecognized_product_photo(
+                db,
+                merchant_id=merchant.id,
+                conversation_id=conversation.id,
+                phone=customer_phone,
+            )
+
     if classification in {CLASSIFICATION_PAYMENT_PROOF, CLASSIFICATION_UNKNOWN}:
         related_type, data = _notification_copy(
             classification=classification,
@@ -326,6 +389,7 @@ async def traiter_image_entrante(
 
     conversation_id = conversation.id
     merchant_phone_id = merchant.whatsapp_phone_number_id
+    merchant_id = merchant.id
     await db.commit()
     await db.refresh(image)
 
@@ -354,6 +418,28 @@ async def traiter_image_entrante(
                 if conversation_row.status != STATUS_CLOSED:
                     conversation_row.updated_at = datetime.now(timezone.utc)
                 await db.commit()
+
+    if (
+        classification == CLASSIFICATION_PRODUCT_PHOTO
+        and not skip_recognition
+        and recognition is not None
+    ):
+        image._send_agent = True
+        try:
+            developer_item = build_product_photo_developer_item(
+                caption=caption,
+                analysis=analysis,
+                result=recognition,
+            )
+            image._agent_reply = await traiter_photo_produit(
+                db, merchant_id, customer_phone, developer_item
+            )
+        except Exception:
+            logger.exception(
+                "Product-photo agent turn failed message_id=%s",
+                whatsapp_message_id,
+            )
+            image._agent_failed = True
 
     return image
 

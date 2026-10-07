@@ -231,6 +231,14 @@ def test_handover_builders_are_plain_replayable_dicts() -> None:
     assert "preuve de paiement bien reçue" in auto_ack["content"]
     assert customer == {"role": "user", "content": "Okay"}
     assert photo["content"] == "[Le client a envoyé une photo (non analysée)]"
+    product_photo = item_customer_photo(classification="product_photo")
+    assert product_photo["content"] == "[Le client a envoyé une photo de produit]"
+    product_captioned = item_customer_photo(
+        classification="product_photo", caption="Vous avez cette robe?"
+    )
+    assert product_captioned["content"] == (
+        '[Le client a envoyé une photo de produit — légende : "Vous avez cette robe?"]'
+    )
     captioned = item_customer_photo(caption="la robe noire")
     assert captioned["content"] == (
         '[Le client a envoyé une photo — légende : "la robe noire"]'
@@ -405,6 +413,7 @@ def test_prompt_has_rule_15_and_photo_status_rule_14() -> None:
     assert "will_be_sent" in text
     assert "already_sent_earlier" in text
     assert "16. When the customer asks about an existing order" in text
+    assert "developer note about a visual search" in text
     assert "je vous envoie la photo" in text
     assert "vous avez déjà reçu sa photo plus haut" in text
 
@@ -549,23 +558,21 @@ async def test_photo_and_ack_writers(tmp_path: Path) -> None:
             ),
             patch("app.proofs.service.envoyer_message_commercant", send),
         ):
-            async with AsyncSessionLocal() as db:
-                merchant_row = await db.get(Merchant, merchant.id)
-                unanalysed = await traiter_image_entrante(
-                    db, merchant_row, phone, "wamid.p1", "m1", "image/png", None
-                )
-                captioned = await traiter_image_entrante(
-                    db,
-                    merchant_row,
-                    phone,
-                    "wamid.p2",
-                    "m2",
-                    "image/png",
-                    "la robe noire",
-                )
             with patch("app.proofs.service.classer_image_entrante", vision_other):
                 async with AsyncSessionLocal() as db:
                     merchant_row = await db.get(Merchant, merchant.id)
+                    unanalysed = await traiter_image_entrante(
+                        db, merchant_row, phone, "wamid.p1", "m1", "image/png", None
+                    )
+                    captioned = await traiter_image_entrante(
+                        db,
+                        merchant_row,
+                        phone,
+                        "wamid.p2",
+                        "m2",
+                        "image/png",
+                        "la robe noire",
+                    )
                     other = await traiter_image_entrante(
                         db,
                         merchant_row,
@@ -588,8 +595,8 @@ async def test_photo_and_ack_writers(tmp_path: Path) -> None:
                         f"n°{order_number}",
                     )
 
-        assert unanalysed.classification == CLASSIFICATION_NOT_ANALYZED
-        assert captioned.classification == CLASSIFICATION_NOT_ANALYZED
+        assert unanalysed.classification == CLASSIFICATION_OTHER
+        assert captioned.classification == CLASSIFICATION_OTHER
         assert other.classification == CLASSIFICATION_OTHER
         assert proof.classification == CLASSIFICATION_PAYMENT_PROOF
         async with AsyncSessionLocal() as db:

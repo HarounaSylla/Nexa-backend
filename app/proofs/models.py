@@ -3,15 +3,21 @@ from datetime import datetime
 from decimal import Decimal
 
 from sqlalchemy import DateTime, ForeignKey, Numeric, Text, UniqueConstraint, func, text
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.db import Base
 
 CLASSIFICATION_PAYMENT_PROOF = "payment_proof"
+CLASSIFICATION_PRODUCT_PHOTO = "product_photo"
 CLASSIFICATION_OTHER = "other"
 CLASSIFICATION_UNKNOWN = "unknown"
 CLASSIFICATION_NOT_ANALYZED = "not_analyzed"
+
+MATCH_LEVEL_STRONG = "strong"
+MATCH_LEVEL_POSSIBLE = "possible"
+MATCH_LEVEL_NONE = "none"
+MATCH_LEVEL_ERROR = "error"
 
 
 class InboundImage(Base):
@@ -54,6 +60,13 @@ class InboundImage(Base):
     caption: Mapped[str | None] = mapped_column(Text, nullable=True)
     classification: Mapped[str] = mapped_column(Text, nullable=False)
     detected_amount: Mapped[Decimal | None] = mapped_column(Numeric, nullable=True)
+    matched_product_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("products.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    match_level: Mapped[str | None] = mapped_column(Text, nullable=True)
+    match_candidates: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         server_default=func.now(),
