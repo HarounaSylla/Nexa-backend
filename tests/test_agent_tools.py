@@ -523,6 +523,128 @@ async def test_execute_tool_creer_commande_returns_order_number_and_links_conver
 
 
 @pytest.mark.asyncio
+async def test_execute_tool_creer_commande_two_items_returns_both_lines() -> None:
+    async with AsyncSessionLocal() as db:
+        merchant = Merchant(name=f"pytest-agent-two-items-{uuid.uuid4()}")
+        db.add(merchant)
+        await db.flush()
+        dress = Product(
+            merchant_id=merchant.id,
+            name="Robe deux lignes",
+            description="test",
+            category="tests",
+            price=Decimal("25000.00"),
+            stock_qty=5,
+        )
+        bag = Product(
+            merchant_id=merchant.id,
+            name="Sac deux lignes",
+            description="test",
+            category="tests",
+            price=Decimal("22000.00"),
+            stock_qty=4,
+        )
+        conversation = Conversation(
+            merchant_id=merchant.id,
+            customer_phone="+221770009111",
+            status="active",
+        )
+        db.add_all(
+            [
+                dress,
+                bag,
+                conversation,
+                DeliveryZone(
+                    merchant_id=merchant.id,
+                    city="Dakar",
+                    city_normalized=normalize_city("Dakar"),
+                    available=True,
+                    min_delivery_hours=24,
+                    max_delivery_hours=48,
+                ),
+            ]
+        )
+        await db.commit()
+        try:
+            raw = await execute_tool(
+                db,
+                tool_name="creer_commande",
+                tool_args={
+                    "items": [
+                        {"product_id": str(dress.id), "quantity": 1},
+                        {"product_id": str(bag.id), "quantity": 2},
+                    ],
+                    "mode_paiement": "cash_on_delivery",
+                    "adresse_livraison": "Parcelles Assainies",
+                    "ville": "Dakar",
+                },
+                merchant_id=merchant.id,
+                conversation_id=conversation.id,
+            )
+            payload = json.loads(raw)
+            assert "error" not in payload
+            assert len(payload["items"]) == 2
+            by_id = {row["product_id"]: row for row in payload["items"]}
+            assert by_id[str(dress.id)]["quantity"] == 1
+            assert Decimal(by_id[str(dress.id)]["unit_price"]) == Decimal("25000.00")
+            assert by_id[str(bag.id)]["quantity"] == 2
+            assert Decimal(by_id[str(bag.id)]["unit_price"]) == Decimal("22000.00")
+
+            stored = (
+                await db.execute(
+                    select(Order).where(Order.id == uuid.UUID(payload["order_id"]))
+                )
+            ).scalar_one()
+            lines = list(
+                (
+                    await db.execute(
+                        select(OrderItem).where(OrderItem.order_id == stored.id)
+                    )
+                ).scalars().all()
+            )
+            assert len(lines) == 2
+            await db.refresh(dress)
+            await db.refresh(bag)
+            assert dress.stock_qty == 4
+            assert bag.stock_qty == 2
+            movements = list(
+                (
+                    await db.execute(
+                        select(StockMovement).where(StockMovement.order_id == stored.id)
+                    )
+                ).scalars().all()
+            )
+            assert len(movements) == 2
+
+            looked_up = json.loads(
+                await execute_tool(
+                    db,
+                    "consulter_commande",
+                    {"numero_commande": payload["order_number"]},
+                    merchant.id,
+                    conversation.id,
+                )
+            )
+            assert looked_up["found"] is True
+            names = {row["product_name"]: row["quantity"] for row in looked_up["items"]}
+            assert names == {"Robe deux lignes": 1, "Sac deux lignes": 2}
+
+            notes = list(
+                (
+                    await db.execute(
+                        select(Notification).where(
+                            Notification.merchant_id == merchant.id
+                        )
+                    )
+                ).scalars().all()
+            )
+            assert len(notes) == 1
+            assert Decimal(notes[0].data["total"]) == Decimal("69000.00")
+        finally:
+            await _cleanup_merchant(db, merchant.id)
+
+
+@pytest.mark.asyncio
 async def test_execute_tool_consulter_commande_hides_other_customers_and_internal_ids() -> None:
     async with AsyncSessionLocal() as db:
         merchant = Merchant(name=f"pytest-agent-consulter-{uuid.uuid4()}")

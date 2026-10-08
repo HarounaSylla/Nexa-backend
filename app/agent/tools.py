@@ -1,9 +1,9 @@
 """OpenAI Responses API function-tool schemas and dispatcher.
 
-Nine socle tools: rechercher_produits, lister_categories,
+Ten socle tools: rechercher_produits, lister_categories,
 lister_produits_populaires, trouver_produits_similaires,
 obtenir_disponibilite, verifier_zone_livraison, creer_commande,
-escalader_vers_humain, consulter_commande.
+escalader_vers_humain, consulter_commande, analyser_photo_client.
 """
 
 from __future__ import annotations
@@ -252,6 +252,26 @@ TOOLS: list[dict[str, Any]] = [
                 },
             },
             "required": ["numero_commande"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
+        "type": "function",
+        "name": "analyser_photo_client",
+        "description": (
+            "Analyse the latest unanalysed customer photo of this "
+            "conversation when you cannot continue without knowing what "
+            "it shows (rule 18). Merchant and conversation come from "
+            "context — do not ask the model to supply those. Returns a "
+            "status and, for product photos, candidates without image "
+            "URLs. Call obtenir_disponibilite for any candidate you "
+            "propose so its photo can be delivered. At most once per turn."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
             "additionalProperties": False,
         },
         "strict": True,
@@ -553,5 +573,10 @@ async def _dispatch(
             db, conversation_id, str(tool_args["raison"])
         )
         return {"status": conversation.status, "raison": tool_args["raison"]}
+
+    if tool_name == "analyser_photo_client":
+        from app.proofs.service import analyser_photo_client
+
+        return await analyser_photo_client(db, merchant_id, conversation_id)
 
     raise ValueError(f"Unknown tool: {tool_name}")

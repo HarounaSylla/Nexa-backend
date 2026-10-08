@@ -448,6 +448,7 @@ def test_developer_item_wording_has_no_url_stock_or_distance() -> None:
     assert f"1. Robe rouge — {format_fcfa(Decimal('25000'))} — product_id={best.product.id} — stock: disponible" in text
     assert f"2. Robe noire — {format_fcfa(Decimal('25000'))} — product_id={second.product.id} — stock: rupture" in text
     assert "do NOT call `creer_commande`" in text
+    assert "call `obtenir_disponibilite` for each listed candidate" in text
     assert "C'est bien celui-ci ?" in text
     assert "http" not in text.lower()
     assert "/static/" not in text
@@ -467,6 +468,24 @@ def test_developer_item_wording_has_no_url_stock_or_distance() -> None:
     assert "Vision description (untrusted, may be wrong): none" in empty["content"]
     assert "Match level: none" in empty["content"]
     assert "Candidates, best first: none" in empty["content"]
+    assert "unfortunately the shop does not have this item" in empty["content"]
+    assert "Do NOT ask the customer for a name, colour or type of this photo" in empty["content"]
+    assert "ask for its name, colour or type" not in empty["content"]
+    assert "the shop has been informed" not in empty["content"]
+    assert "Do not call `obtenir_disponibilite`" in empty["content"]
+
+    err = build_product_photo_developer_item(
+        caption=None,
+        analysis=None,
+        result=RecognitionResult(level=MATCH_LEVEL_ERROR, matches=[], proposed=[]),
+    )
+    assert "Match level: error" in err["content"]
+    assert "technical failure" in err["content"]
+    assert "shop does not have this item" not in err["content"]
+    assert "shop does not have the item" in err["content"]
+    assert "Do NOT say the shop does not have the item" in err["content"]
+    assert "ask for its name, colour or type" not in err["content"]
+    assert "Do NOT ask the customer for a name, colour or type of this photo" in err["content"]
 
 
 def test_replay_helpers_accept_leading_developer_item() -> None:
@@ -707,6 +726,29 @@ async def _run_recognised(
             )
     assert stored is not None
     return stored, capturing
+
+
+@pytest.mark.asyncio
+async def test_live_photo_analysis_emits_timing_log(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    merchant, first, _second = await _seed_shop(tmp_path)
+    try:
+        matches = [ImageMatch(product=first, distance=0.10, in_stock=True)]
+        with caplog.at_level("INFO", logger="app.proofs.service"):
+            stored, _ = await _run_recognised(
+                tmp_path, merchant, matches, wamid="wamid.timing"
+            )
+        assert stored.match_level == MATCH_LEVEL_STRONG
+        assert "Photo analysis source=live" in caplog.text
+        assert "classifier_s=" in caplog.text
+        assert "voyage_s=" in caplog.text
+        assert "total_s=" in caplog.text
+        assert "level=strong" in caplog.text
+        assert TINY_PNG.hex() not in caplog.text
+        assert "/static/" not in caplog.text
+    finally:
+        await _cleanup(merchant.id)
 
 
 @pytest.mark.asyncio
@@ -1190,7 +1232,14 @@ def test_developer_item_similar_and_out_of_stock_same() -> None:
     assert "does NOT have exactly this item" in text
     assert "colour or variant differs" in text
     assert "would interest the customer" in text
+    assert "Ce n'est pas exactement ce modèle" in text
+    assert "<exact name from the candidate list>" in text
+    assert "use only the name and price listed in Candidates" in text
+    assert "Always put that candidate's exact name" in text
+    assert "robe longue noire de soirée" not in text
     assert "do NOT call `creer_commande`" in text
+    assert "call `obtenir_disponibilite` for each listed candidate" in text
+    assert "C'est bien celui-ci ?" in text
 
     oos = _match(name="Robe rouge", distance=0.08, stock_qty=0, price="25000")
     exact = build_product_photo_developer_item(
@@ -1206,6 +1255,8 @@ def test_developer_item_similar_and_out_of_stock_same() -> None:
     assert "stock: rupture" in exact["content"]
     assert "mention rupture honestly" in exact["content"]
     assert "stock: 0" not in exact["content"]
+    assert "call `obtenir_disponibilite` for each listed candidate" in exact["content"]
+    assert "C'est bien celui-ci ?" in exact["content"]
 
 
 def test_persist_recognition_writes_verdict_and_verifier() -> None:

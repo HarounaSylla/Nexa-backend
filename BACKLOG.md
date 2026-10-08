@@ -47,7 +47,7 @@ TikTok comment classifier (Jalon 7) remains a separate model decision.
 - [x] `openai` + `langgraph` dependencies; `openai_api_key` / `agent_model` settings
 - [x] RAG `rag_max_distance=0.50` (measured on Jalon 1 queries)
 - [x] `conversations` / `messages` schema (Alembic `0004_agent_conversations`)
-- [x] 9 socle tools + `execute_tool` dispatcher (domain errors as JSON): `rechercher_produits`, `lister_categories`, `lister_produits_populaires`, `trouver_produits_similaires`, `obtenir_disponibilite`, `verifier_zone_livraison`, `creer_commande`, `escalader_vers_humain`, `consulter_commande`
+- [x] 10 socle tools + `execute_tool` dispatcher (domain errors as JSON): `rechercher_produits`, `lister_categories`, `lister_produits_populaires`, `trouver_produits_similaires`, `obtenir_disponibilite`, `verifier_zone_livraison`, `creer_commande`, `escalader_vers_humain`, `consulter_commande`, `analyser_photo_client` (on-demand, latest inbound photo of this conversation, 24 h window)
 - [x] System prompt + LangGraph ReAct loop (`traiter_message_entrant`)
 - [x] Temporary `POST /agent/simulate` and message history endpoint
 - [x] Deterministic unit tests (no live OpenAI)
@@ -74,6 +74,22 @@ These were listed in `Nexa/proofs/audit-agent-context.md` and are **not** in thi
 - No history truncation; replayed `input_list` grows for the whole conversation.
 - Return the merchant's real category names in the `rechercher_produits` tool result when a guessed `categorie` is dropped, so the model can retry with an exact value.
 - Merchant-side category normalisation in the dashboard (typos / accents / casing when creating or renaming a category).
+
+## Agent cart — remaining
+
+The multi-article flow (rule 17) is prompt-only: the cart is whatever
+the model infers from replayed history. `creer_commande` already accepts
+several `items` and aggregates duplicate product ids.
+
+- Explicit cart state (confirmed product + quantity per conversation)
+  instead of relying on history replay for earlier `product_id`s
+- Order total in the agent reply from a tool result (`creer_commande`
+  currently returns lines and unit prices, not a total; rule 2 forbids
+  the model from computing one)
+- Customer wants to modify or remove an article before the order is
+  created (today: only "add another" / "that's all")
+- Ask quantity per article in one sentence when several items are
+  confirmed together ("je prends 2 robes et 1 sac")
 
 ## Jalon 4 — Dashboard
 
@@ -110,13 +126,17 @@ These were listed in `Nexa/proofs/audit-agent-context.md` and are **not** in thi
 - Delete-merchant data purge
 - 24 h template for acknowledgements
 - Real-phone test of the inbound proof flow (blocked on the WhatsApp token/webhook)
-- Customer acknowledgement when a message arrives on an escalated conversation (merchant is notified; agent stays silent; no auto-reply today)
+- Customer acknowledgement when a message arrives on an escalated conversation (merchant is notified; agent stays silent; no auto-reply today). A customer who writes again while waiting (e.g. « Etes vous toujours fermé ? ») currently gets nothing — consider one automatic acknowledgement (« Votre message est bien transmis ») without reopening the agent.
 - Auto-return / auto-close policy for unanswered escalations
 - `other` while an order awaits a proof: still stored, no reply, no notification (backlog question unchanged)
 - At the vision/recognition cap (`max_image_analyses_per_phone_per_day`, default 10): today `not_analyzed` and **no customer reply**. Decide whether to tell the customer.
 - Several product photos in one image (classifier + search + verifier assume a single main subject)
 - Crop-to-product before embedding/verify (today the whole frame, including TikTok chrome, is embedded)
 - Customer sends several photos in a row (each is its own job/turn; no bundling)
+- Several photos sent **during an escalation**: `analyser_photo_client` only looks at the latest inbound image of the conversation (last 24 h, file still present). Older unanalysed photos stay `not_analyzed`.
+- `analyser_photo_client` 24 h window: a photo older than 24 h is treated as `no_photo`. Decide whether to extend, or to tell the customer the photo expired.
+- Merchant notification wording for a visual-search `error` level (`product_photo_unrecognized` today uses the same copy as a catalogue miss). The on-demand tool never emits that notification; the live path still does.
+- Passing the customer image itself into the agent model (multimodal turn) as an alternative to the classifier + Voyage + verifier + `analyser_photo_client` tool. Today the model never sees pixels.
 - Caption-only intent (text "vous avez cette robe?" without a photo) is unchanged text search — not visual search
 - Frontend: show "Produit reconnu : …" on a `product_photo` in the conversation thread (`thread-panel.tsx` currently returns null). Backend `GET /conversations/{id}/messages` now sends `match_level`, `matched_product_id`, `matched_product_name`, `match_kind`.
 - Frontend: map `product_photo_unrecognized` in `notification-copy.ts` (unknown types render as the raw `item.type` string, not `data.title`). Not in step 2b.

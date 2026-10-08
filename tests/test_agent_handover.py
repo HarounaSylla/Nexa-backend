@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -33,6 +34,7 @@ from app.agent.images import (
 )
 from app.agent.models import Conversation, Message, SentProductImage
 from app.agent.orchestrator import (
+    _is_replayable_history_item,
     history_items_from_messages,
     prior_items_for_agent,
     traiter_message_entrant,
@@ -303,6 +305,147 @@ def test_history_replays_new_rows_ignores_legacy_empty_and_keeps_reasoning() -> 
     assert with_note[-1]["role"] == "developer"
 
 
+def test_multi_item_cart_replays_earlier_article_tool_outputs() -> None:
+    """Earlier rechercher_produits / obtenir_disponibilite outputs stay in replay.
+
+    So the agent can reuse product_ids from articles confirmed several
+    turns ago without a silent re-search — unless those items were never
+    stored (legacy empty rows). inbound_image items are still dropped.
+    """
+    dress_id = str(uuid.uuid4())
+    bag_id = str(uuid.uuid4())
+    dress_search = {
+        "type": "function_call",
+        "name": "rechercher_produits",
+        "call_id": "c-dress",
+        "arguments": json.dumps({"requete": "robe rouge"}),
+    }
+    dress_search_out = {
+        "type": "function_call_output",
+        "call_id": "c-dress",
+        "output": json.dumps(
+            {
+                "products": [
+                    {
+                        "id": dress_id,
+                        "name": "Robe longue rouge de soirée",
+                        "price": "25000.00",
+                    }
+                ]
+            }
+        ),
+    }
+    dress_avail = {
+        "type": "function_call",
+        "name": "obtenir_disponibilite",
+        "call_id": "c-dress-av",
+        "arguments": json.dumps({"produit_id": dress_id}),
+    }
+    dress_avail_out = {
+        "type": "function_call_output",
+        "call_id": "c-dress-av",
+        "output": json.dumps(
+            {
+                "product_id": dress_id,
+                "stock_status": "disponible",
+                "price": "25000.00",
+            }
+        ),
+    }
+    bag_search = {
+        "type": "function_call",
+        "name": "rechercher_produits",
+        "call_id": "c-bag",
+        "arguments": json.dumps({"requete": "sac camel"}),
+    }
+    bag_search_out = {
+        "type": "function_call_output",
+        "call_id": "c-bag",
+        "output": json.dumps(
+            {
+                "products": [
+                    {
+                        "id": bag_id,
+                        "name": "Sac à main en cuir camel",
+                        "price": "22000.00",
+                    }
+                ]
+            }
+        ),
+    }
+    history = [
+        _message(
+            "customer",
+            "Vous avez la robe rouge ?",
+            [{"role": "user", "content": "Vous avez la robe rouge ?"}],
+        ),
+        _message(
+            "agent",
+            "La robe rouge est disponible.",
+            [
+                dress_search,
+                dress_search_out,
+                dress_avail,
+                dress_avail_out,
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": "La robe rouge est disponible.",
+                },
+            ],
+        ),
+        _message(
+            "customer",
+            "Je prends 1",
+            [{"role": "user", "content": "Je prends 1"}],
+        ),
+        _message(
+            "agent",
+            "Souhaitez-vous autre chose ?",
+            [
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": (
+                        "Très bien, 1 robe longue rouge de soirée. "
+                        "Souhaitez-vous autre chose ?"
+                    ),
+                }
+            ],
+        ),
+        _message(
+            "customer",
+            "Oui un sac à main camel",
+            [{"role": "user", "content": "Oui un sac à main camel"}],
+        ),
+        _message(
+            "agent",
+            "Le sac camel.",
+            [bag_search, bag_search_out],
+        ),
+        _message(
+            "customer",
+            "photo bytes",
+            [{"type": "inbound_image", "path": "/secret.jpg"}],
+        ),
+    ]
+    assert _is_replayable_history_item(dress_search_out) is True
+    assert _is_replayable_history_item(dress_avail_out) is True
+    assert _is_replayable_history_item(bag_search_out) is True
+    assert _is_replayable_history_item({"type": "inbound_image"}) is False
+    replayed = prior_items_for_agent(history)
+    blob = json.dumps(replayed)
+    assert dress_id in blob
+    assert bag_id in blob
+    assert dress_search_out in replayed
+    assert dress_avail_out in replayed
+    assert bag_search_out in replayed
+    assert not any(
+        isinstance(item, dict) and item.get("type") == "inbound_image"
+        for item in replayed
+    )
+
+
 def test_handover_note_presence_rules() -> None:
     native = {
         "type": "message",
@@ -413,9 +556,66 @@ def test_prompt_has_rule_15_and_photo_status_rule_14() -> None:
     assert "will_be_sent" in text
     assert "already_sent_earlier" in text
     assert "16. When the customer asks about an existing order" in text
+    assert "17. Several articles in one order" in text
     assert "developer note about a visual search" in text
     assert "je vous envoie la photo" in text
     assert "vous avez déjà reçu sa photo plus haut" in text
+    assert text.index("15. Customer photos") < text.index("16. When the customer")
+    assert text.index("16. When the customer") < text.index("17. Several articles")
+    assert "follow rule 17" in text
+    assert "Match level none or error" in text
+    assert "never ask for the name, colour or type for that photo" in text
+    assert "do not ask them to complete or préciser it" in text
+    assert "18. A history marker" in text
+    assert "always state the candidate name and price" in text
+    assert "analyser_photo_client" in text
+    assert text.index("17. Several articles") < text.index("18. A history marker")
+    assert "Use analyser_photo_client only when rule 18" in text
+    numbered = re.findall(r"(?m)^(\d+)\. ", text)
+    assert numbered == [str(n) for n in range(1, 19)]
+    tail = text[text.index("15. Customer photos") :]
+    assert "Robe longue" not in tail
+    assert "Sac à main" not in tail
+    assert "or rose" not in tail
+    assert "25 000" not in tail
+    assert "25000" not in tail
+    assert "1 <article>" in text
+    assert "analyser_photo_client` tool result" in text or "analyser_photo_client tool result" in text
+
+
+def test_escalation_block_uses_warm_acknowledgement_examples() -> None:
+    old_curt = (
+        "La boutique est fermée pour le moment, un conseiller vous "
+        "répondra dès l'ouverture, demain à 9h."
+    )
+    hours_set = build_system_prompt(
+        "Boutique Test",
+        MerchantPreferencesData(opening_hours="Lundi au samedi, 9h à 19h"),
+    )["content"]
+    hours_unset = build_system_prompt(
+        "Boutique Test", MerchantPreferencesData()
+    )["content"]
+    assert old_curt not in hours_set
+    assert old_curt not in hours_unset
+    for text in (hours_set, hours_unset):
+        assert "Bien sûr," in text
+        assert "Absolument," in text
+        assert "Avec plaisir," in text
+        assert "Tout à fait," in text
+        assert "Très bien," in text
+        assert "7. Call escalader_vers_humain" in text
+        assert "Never promise a precise response time" in text or (
+            "Never promise a specific time." in text
+        )
+    assert "Bien sûr, je transmets votre demande à un conseiller." in hours_set
+    assert "Absolument, je préviens un conseiller, il vous répondra dans quelques instants." in hours_set
+    assert "quote the hours as written" in hours_set
+    assert "interpret carefully" in hours_set
+    assert "If today's weekday is not listed in those hours" in hours_set
+    assert (
+        "Bien sûr, je transmets votre demande, un conseiller vous répondra dès que possible."
+        in hours_unset
+    )
 
 
 def test_photo_delivery_plan_three_statuses() -> None:

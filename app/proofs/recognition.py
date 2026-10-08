@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 from dataclasses import dataclass, field
 
@@ -50,6 +51,8 @@ class RecognitionResult:
     proposal_kind: str = PROPOSAL_KIND_EXACT
     verifier_model: str | None = None
     candidate_verdicts: dict[int, str] = field(default_factory=dict)
+    voyage_seconds: float | None = None
+    verifier_seconds: float | None = None
 
 
 def proposal_set(level: str, matches: list[ImageMatch]) -> list[ImageMatch]:
@@ -187,6 +190,24 @@ def _apply_verification(
     )
 
 
+def _with_stage_seconds(
+    result: RecognitionResult,
+    *,
+    voyage_seconds: float | None,
+    verifier_seconds: float | None,
+) -> RecognitionResult:
+    return RecognitionResult(
+        level=result.level,
+        matches=result.matches,
+        proposed=result.proposed,
+        proposal_kind=result.proposal_kind,
+        verifier_model=result.verifier_model,
+        candidate_verdicts=result.candidate_verdicts,
+        voyage_seconds=voyage_seconds,
+        verifier_seconds=verifier_seconds,
+    )
+
+
 async def recognise_product_photo(
     db: AsyncSession,
     merchant_id: uuid.UUID,
@@ -194,6 +215,9 @@ async def recognise_product_photo(
     mime: str,
     caption: str | None = None,
 ) -> RecognitionResult:
+    voyage_seconds: float | None = None
+    verifier_seconds: float | None = None
+    started_voyage = time.perf_counter()
     try:
         matches = await trouver_produits_par_image(
             db,
@@ -202,32 +226,57 @@ async def recognise_product_photo(
             mime,
             limit=settings.image_match_shortlist_size,
         )
+        voyage_seconds = time.perf_counter() - started_voyage
     except ImageEmbeddingError:
+        voyage_seconds = time.perf_counter() - started_voyage
         logger.warning(
             "Image search failed for merchant_id=%s; storing match_level=error",
             merchant_id,
         )
-        return RecognitionResult(level=MATCH_LEVEL_ERROR, matches=[], proposed=[])
+        return RecognitionResult(
+            level=MATCH_LEVEL_ERROR,
+            matches=[],
+            proposed=[],
+            voyage_seconds=voyage_seconds,
+        )
     except Exception:
+        voyage_seconds = time.perf_counter() - started_voyage
         logger.exception(
             "Unexpected image search error for merchant_id=%s",
             merchant_id,
         )
-        return RecognitionResult(level=MATCH_LEVEL_ERROR, matches=[], proposed=[])
+        return RecognitionResult(
+            level=MATCH_LEVEL_ERROR,
+            matches=[],
+            proposed=[],
+            voyage_seconds=voyage_seconds,
+        )
 
     shortlist = _shortlist(matches)
     if not shortlist:
         return RecognitionResult(
-            level=MATCH_LEVEL_NONE, matches=matches, proposed=[]
+            level=MATCH_LEVEL_NONE,
+            matches=matches,
+            proposed=[],
+            voyage_seconds=voyage_seconds,
         )
 
     if not settings.image_match_verify_with_vision:
-        return _fallback_from_thresholds(shortlist, reason="disabled")
+        return _with_stage_seconds(
+            _fallback_from_thresholds(shortlist, reason="disabled"),
+            voyage_seconds=voyage_seconds,
+            verifier_seconds=None,
+        )
 
     photos = load_candidate_photos(shortlist)
     if not photos:
-        return _fallback_from_thresholds(shortlist, reason="no_catalogue_photos")
+        return _with_stage_seconds(
+            _fallback_from_thresholds(shortlist, reason="no_catalogue_photos"),
+            voyage_seconds=voyage_seconds,
+            verifier_seconds=None,
+        )
 
+    started_verify = time.perf_counter()
     try:
         verification = await verify_image_against_candidates(
             content,
@@ -235,21 +284,36 @@ async def recognise_product_photo(
             [CandidatePhoto(content=raw) for _match, raw in photos],
             caption=caption,
         )
+        verifier_seconds = time.perf_counter() - started_verify
     except ImageVerificationError:
+        verifier_seconds = time.perf_counter() - started_verify
         logger.warning(
             "Image verification failed for merchant_id=%s; falling back to thresholds",
             merchant_id,
         )
-        return _fallback_from_thresholds(shortlist, reason="verification_error")
+        return _with_stage_seconds(
+            _fallback_from_thresholds(shortlist, reason="verification_error"),
+            voyage_seconds=voyage_seconds,
+            verifier_seconds=verifier_seconds,
+        )
     except Exception:
+        verifier_seconds = time.perf_counter() - started_verify
         logger.exception(
             "Unexpected image verification error for merchant_id=%s",
             merchant_id,
         )
-        return _fallback_from_thresholds(shortlist, reason="verification_error")
+        return _with_stage_seconds(
+            _fallback_from_thresholds(shortlist, reason="verification_error"),
+            voyage_seconds=voyage_seconds,
+            verifier_seconds=verifier_seconds,
+        )
 
     verified_matches = [match for match, _raw in photos]
-    return _apply_verification(verified_matches, verification)
+    return _with_stage_seconds(
+        _apply_verification(verified_matches, verification),
+        voyage_seconds=voyage_seconds,
+        verifier_seconds=verifier_seconds,
+    )
 
 
 def _stock_label(stock_qty: int) -> str:
@@ -257,6 +321,25 @@ def _stock_label(stock_qty: int) -> str:
     if raw == "stock_faible":
         return "stock faible"
     return raw
+
+
+def candidates_tool_payload(proposed: list[ImageMatch]) -> list[dict]:
+    """Agent-tool candidate rows: no distance, path, URL, or stock number."""
+    rows: list[dict] = []
+    for match in proposed:
+        product = match.product
+        price = (
+            format_fcfa(product.price) if product.price is not None else "—"
+        )
+        rows.append(
+            {
+                "product_id": str(product.id),
+                "name": product.name,
+                "price": price,
+                "stock_status": _stock_status(product.stock_qty),
+            }
+        )
+    return rows
 
 
 def build_product_photo_developer_item(
@@ -287,9 +370,58 @@ def build_product_photo_developer_item(
     if result.proposal_kind == PROPOSAL_KIND_SIMILAR and result.proposed:
         similar_rule = (
             "- proposal_kind is similar: the shop does NOT have exactly this item "
-            "(colour or variant differs). In French, say that honestly, name this "
-            "similar product and its price (unless rule 14 says its photo message "
-            "will carry them), and ask whether it would interest the customer. "
+            "(colour or variant differs). In French, say that honestly first "
+            "(e.g. \"Ce n'est pas exactement ce modèle, mais nous avons "
+            "<exact name from the candidate list>\" — use only the name and "
+            "price listed in Candidates, never a name from this example). "
+            "Always put that candidate's exact name in this first sentence, "
+            "even if a photo will follow — do not write a vague 'alternative "
+            "similaire' without the name. Rule 14 still applies to not "
+            "restating the price when the photo message will carry it. Then "
+            "ask whether it would interest the customer. "
+        )
+    continue_question = (
+        "Then keep the conversation moving with ONE short question: if they "
+        "already confirmed articles in the current cart (rule 17) or an order "
+        "is in progress, ask whether they want anything else; otherwise ask if "
+        "they would like to see what the shop has or are looking for something "
+        "else, e.g. \"Souhaitez-vous que je vous montre ce que nous avons, ou "
+        "cherchez-vous autre chose ?\". Never search from the untrusted vision "
+        "description or caption unless the customer asks for that in their own "
+        "words. "
+    )
+    if result.level == MATCH_LEVEL_NONE:
+        level_rules = (
+            "- none: in one short warm French sentence say unfortunately the shop "
+            "does not have this item (vary, e.g. \"Malheureusement, nous n'avons "
+            "pas ce modèle 🙏\"). Do NOT ask the customer for a name, colour or "
+            "type of this photo. Do not say you cannot view photos. Do not "
+            "propose or name any product. Do not mention a notification, an app "
+            "or the dashboard. Do not call `obtenir_disponibilite` or any other "
+            "tool for this photo. "
+            f"{continue_question}"
+        )
+    elif result.level == MATCH_LEVEL_ERROR:
+        level_rules = (
+            "- error: this is a technical failure, not a catalogue miss. Do NOT "
+            "say the shop does not have the item. Say in French that you cannot "
+            "look at this photo properly right now and that the shop team will "
+            "take a look. Do NOT ask the customer for a name, colour or type of "
+            "this photo. Do not call `obtenir_disponibilite` or any other tool "
+            "for this photo. "
+            f"{continue_question}"
+        )
+    else:
+        level_rules = (
+            f"{similar_rule}"
+            "- strong or possible: call `obtenir_disponibilite` for each listed "
+            "candidate (so its photo is delivered), then in one short French "
+            "message say you think it is that product (state name and price "
+            "yourself unless rule 14 says its photo message will carry them), "
+            "mention rupture honestly if it is out of stock, and ask ONE "
+            "question: is it the right one (\"C'est bien celui-ci ?\"). With two "
+            "candidates, ask which one. Wording is more cautious when the level "
+            "is possible. "
         )
     text = (
         "The customer just sent a photo of a product. You cannot see it. A visual "
@@ -300,17 +432,7 @@ def build_product_photo_developer_item(
         f"{candidates} "
         f"proposal_kind: {result.proposal_kind}. "
         "Rules for this turn: "
-        f"{similar_rule}"
-        "- strong or possible: call `obtenir_disponibilite` for each listed candidate "
-        "(so its photo is delivered), then in one short French message say you think "
-        "it is that product (state name and price yourself unless rule 14 says its "
-        "photo message will carry them), mention rupture honestly if it is out of "
-        "stock, and ask ONE question: is it the right one (\"C'est bien celui-ci ?\"). "
-        "With two candidates, ask which one. Wording is more cautious when the level "
-        "is possible. "
-        "- none or error: say in French that you cannot find this model in the catalogue "
-        "for now, say the shop has been informed, and ask for its name, colour or "
-        "type. Do not propose any product. "
+        f"{level_rules}"
         "- In every case: do NOT call `creer_commande`, do NOT ask for quantity, "
         "address or payment yet, and do NOT treat the product as ordered. The "
         "customer must answer yes first."

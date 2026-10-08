@@ -1095,6 +1095,94 @@ product-photo rows:
 Cleanup dry-run: 1 conversation `d1716ca6-…`, 3 messages, 3 inbound images;
 apply leftover **0**. Frontend mapping of these fields is not in this change.
 
+## 35. Multi-article cart + unmatched product photo (2026-10-07)
+
+Backend prompt + developer note only. No schema, route, or recognition-pipeline
+change. Rule 17: after each confirmed article+qty, ask « autre chose ? »
+before address. Level `none`: say the shop does not have it, do not ask
+name/colour/type. Level `error`: technical failure wording, same continue
+question. Generic rule 15 (photo marker, no developer note) is unchanged.
+
+`pytest` **204 passed in 26.58s** (prompt rule 17, none/error developer notes,
+history replay of earlier `product_id`s, two-item `creer_commande`). Live
+throwaway: `uv run python ../proofs/agent-multi-item/run.py` on Boutique Awa,
+Meta stubbed, real model (`gpt-5.6-terra`), clock pinned to Tuesday 11h so
+hours-closed does not escalate, three runs per scenario.
+
+| Scenario | Expect | Runs ok / 3 |
+| --- | --- | --- |
+| A two articles, text | « autre chose ? » after each qty; one `creer_commande` with two lines | **3/3** |
+| B « c'est tout » in the same message | skip « autre chose ? », go to delivery details | **3/3** (run 3 first asked « c'est bien ce modèle ? », then skipped « autre chose ? ») |
+| C address volunteered early | keep it, still ask « autre chose ? » once, do not re-ask address | **3/3** after strengthening rule 17 (see below) |
+| D photo-recognised then another | « autre chose ? » after the photo article; order with two items | **3/3** |
+| E photo `none`, no order in progress | unfortunately not in shop; no name/colour/type; one continue question; notification; then « montrez-moi vos robes » works | **3/3** |
+| F photo `none` mid-order | « pas ce modèle » + « autre chose ? »; red dress kept; order with that line only | **3/3** |
+| G level `error` | do not claim the shop lacks it; no name/colour/type | **3/3** |
+| H regression | « robe ci-haut » still asks name/colour/type; vague oui; similar proposal; single-article does not loop on « autre chose ? » | **3/3** |
+
+Rule 17 volunteer-address sentence was strengthened after a failed C run
+that asked for « adresse complète aux Parcelles ». Similar developer note
+got an explicit French « pas exactement ce modèle » example after a hedge
+that only said « il s'agit plutôt de… ».
+
+Cleanup dry-run: 33 conversations, orders n°69–80, 227 messages, 15 inbound
+images, 6 sent photos; apply restored Awa stock to the pre-proof snapshot
+(red dress 3, camel bag 3, …); leftover **0**. `reel_*` variant of E:
+skipped — no `reel_*` file in `image-eval`.
+
+## 36. Escalation tone + on-demand photo analysis after hand-back (2026-10-07)
+
+Backend only. Prompt wording (warmer post-escalation acknowledgement; no
+copyable catalogue name in similar-item / rules 15–18 examples). New tool
+`analyser_photo_client` (strict, no parameters): latest inbound photo of
+this conversation, last 24 h, file still on disk. Idempotent if already a
+`product_photo` with `match_level`. Does not create a row or a message, does
+not run the payment-proof flow, ack, or `product_photo_unrecognized`.
+Payload uses `candidates` (no `image_url`) so `_attach_photo_status` /
+`extract_product_images` do not send a catalogue photo from this tool
+alone — the agent still calls `obtenir_disponibilite`. One INFO timing
+line per analysis (live path and this tool): stage seconds + level, ids
+only. Rule 18 after 17. No schema / route / frontend change.
+
+`pytest` **213 passed in 28.25s** (escalation examples, similar-item
+placeholder, analyser schema/isolation/target/idempotence/outcomes/payload
+/photo-plan/prompt 1–18/INFO log).
+
+Live throwaway:
+
+- Tone + similar item: `uv run python ../proofs/agent-escalation-tone/run.py`
+  (phones +221770099061…, Meta stubbed, real model; J also real vision/Voyage)
+- Hand-back A–H: `uv run python ../proofs/photo-after-handover/run.py`
+  (phones +221770099071…, Meta stubbed, real model + real vision/Voyage)
+- Clock: Tuesday 11h (open). Closed uses **Sunday 15h** — Awa hours are
+  `Lundi au samedi, 9h à 00h`, so Tuesday 21h is still open.
+
+| Scenario | Expect | Runs ok / 3 |
+| --- | --- | --- |
+| I shop closed | acknowledgement then closed facts; not the old curt sentence | **3/3** after weekday-not-listed sentence (see below) |
+| I shop open | acknowledgement then « dans quelques instants »; no extra promised time | **3/3** |
+| J similar (blue dress, green sandals) | « pas exactement ce modèle » + candidate name from the list, not an example | **3/3** after similar-note « always put the candidate name » |
+| A Boutique names the watch | no analysis call; propose watch + price + confirmation; « oui » → qty → « autre chose ? » | **3/3** after rule 18 always name+price (narrow-nbsp scorer) |
+| B human « oui » only | one `analyser_photo_client`; propose watch; no « je ne peux pas voir »; no order | **3/3** |
+| C no human reply | one analysis call, same proposal | **3/3** |
+| D recolour | Boutique « oui » → do not claim a hard miss; no human → similar proposal when vision is `possible` | **3/3** (see note) |
+| E horaires / other product | no analysis call; follow the customer | **3/3** |
+| F payment-style screenshot | `not_a_product_photo`; generic question; no ack; no notification | **3/3** after one StaleDataError retry |
+| G second message after proposal | no new analysis (timing line unchanged) | **3/3** |
+| H live photo + text-only hand-back | note-driven live path; text hand-back still answers | **3/3** |
+
+Wording strengthened after failed runs: (1) hours block — if today's weekday
+is not listed, the shop is closed; (2) similar developer note — never write a
+vague « alternative similaire » without the candidate name; (3) rule 18 —
+always state name and price in the confirmation sentence even if a photo
+follows. `couleur_robe_bleue` is `possible`/`similar` of the red dress, not
+`none`, so D's « unfortunately we don't have it » branch was not exercised
+by that file (agent correctly proposed the similar red dress).
+
+Cleanup: leftover **0**; Awa stock restored to the pre-proof snapshot. The
+`analyser_photo_client` payload uses `candidates` without `image_url`, so
+the worker photo plan does not send a catalogue photo from this tool alone.
+
 
 
 

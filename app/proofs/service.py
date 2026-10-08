@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -21,7 +23,8 @@ from app.agent.service import (
     notifier_message_escalade,
     trouver_conversation_escaladee,
 )
-from app.catalogue.models import Merchant
+from app.catalogue.models import Merchant, Product
+from app.core.formatting import format_fcfa
 from app.core.config import settings
 from app.core.phone import try_normalize_phone
 from app.notifications.models import NotificationRelatedType, NotificationType
@@ -41,21 +44,30 @@ from app.proofs.models import (
     CLASSIFICATION_UNKNOWN,
     MATCH_LEVEL_ERROR,
     MATCH_LEVEL_NONE,
+    MATCH_LEVEL_POSSIBLE,
+    MATCH_LEVEL_STRONG,
     InboundImage,
 )
+from app.catalogue.service import ImageMatch
 from app.proofs.recognition import (
+    PROPOSAL_KIND_EXACT,
+    PROPOSAL_KIND_SIMILAR,
     RecognitionResult,
     build_product_photo_developer_item,
+    candidates_tool_payload,
     persist_recognition,
+    proposal_set,
     recognise_product_photo,
 )
 from app.proofs.storage import (
     RejectedMediaError,
     delete_inbound_image_file,
+    read_inbound_image_file,
     save_inbound_image,
 )
 from app.proofs.vision import (
     IMAGE_KIND_PRODUCT_PHOTO,
+    VERDICT_SIMILAR,
     ImageAnalysis,
     ImageAnalysisError,
     classer_image_entrante,
@@ -69,10 +81,66 @@ from app.whatsapp.service import (
 logger = logging.getLogger(__name__)
 
 MAX_IMAGE_ANALYSES_PER_PHONE_PER_DAY = 10
+PHOTO_ANALYSE_LOOKBACK = timedelta(hours=24)
 ACK_TEXT = (
     "Merci, nous avons bien reçu votre photo. "
     "La boutique va vérifier votre paiement."
 )
+
+
+def _format_stage_seconds(value: float | None) -> str:
+    if value is None:
+        return "-"
+    return f"{value:.2f}"
+
+
+def log_photo_analysis_timing(
+    *,
+    source: str,
+    image_id: uuid.UUID,
+    merchant_id: uuid.UUID,
+    classifier_s: float | None,
+    voyage_s: float | None,
+    verifier_s: float | None,
+    total_s: float,
+    classification: str,
+    level: str | None,
+) -> None:
+    """INFO timings and counts only — never paths, bytes, or URLs."""
+    logger.info(
+        "Photo analysis source=%s image_id=%s merchant_id=%s "
+        "classifier_s=%s voyage_s=%s verifier_s=%s total_s=%.2f "
+        "classification=%s level=%s",
+        source,
+        image_id,
+        merchant_id,
+        _format_stage_seconds(classifier_s),
+        _format_stage_seconds(voyage_s),
+        _format_stage_seconds(verifier_s),
+        total_s,
+        classification,
+        level or "-",
+    )
+
+
+def _classification_from_analysis(analysis: ImageAnalysis) -> str:
+    if analysis.image_kind == IMAGE_KIND_PRODUCT_PHOTO:
+        return CLASSIFICATION_PRODUCT_PHOTO
+    if analysis.is_payment_proof:
+        return CLASSIFICATION_PAYMENT_PROOF
+    return CLASSIFICATION_OTHER
+
+
+def _product_photo_tool_payload(
+    status: str,
+    result: RecognitionResult,
+) -> dict[str, Any]:
+    return {
+        "status": status,
+        "level": result.level,
+        "proposal_kind": result.proposal_kind,
+        "candidates": candidates_tool_payload(result.proposed),
+    }
 
 
 async def lister_preuves_commande(
@@ -283,19 +351,19 @@ async def traiter_image_entrante(
     classification = CLASSIFICATION_NOT_ANALYZED
     detected_amount: Decimal | None = None
     analysis: ImageAnalysis | None = None
+    classifier_s: float | None = None
+    vision_started = time.perf_counter()
     if run_vision:
         try:
+            started_classifier = time.perf_counter()
             analysis = await classer_image_entrante(
                 content, resolved_mime, caption
             )
-            if analysis.image_kind == IMAGE_KIND_PRODUCT_PHOTO:
-                classification = CLASSIFICATION_PRODUCT_PHOTO
-            elif analysis.is_payment_proof:
-                classification = CLASSIFICATION_PAYMENT_PROOF
-            else:
-                classification = CLASSIFICATION_OTHER
+            classifier_s = time.perf_counter() - started_classifier
+            classification = _classification_from_analysis(analysis)
             detected_amount = analysis.detected_amount
         except ImageAnalysisError:
+            classifier_s = time.perf_counter() - started_classifier
             logger.warning(
                 "Vision failed message_id=%s; storing as unknown",
                 whatsapp_message_id,
@@ -361,6 +429,18 @@ async def traiter_image_entrante(
                 conversation_id=conversation.id,
                 phone=customer_phone,
             )
+    if run_vision:
+        log_photo_analysis_timing(
+            source="live",
+            image_id=image.id,
+            merchant_id=merchant.id,
+            classifier_s=classifier_s,
+            voyage_s=recognition.voyage_seconds if recognition else None,
+            verifier_s=recognition.verifier_seconds if recognition else None,
+            total_s=time.perf_counter() - vision_started,
+            classification=classification,
+            level=recognition.level if recognition else None,
+        )
 
     if classification in {CLASSIFICATION_PAYMENT_PROOF, CLASSIFICATION_UNKNOWN}:
         related_type, data = _notification_copy(
@@ -442,6 +522,230 @@ async def traiter_image_entrante(
             image._agent_failed = True
 
     return image
+
+
+async def _latest_analysable_photo(
+    db: AsyncSession,
+    merchant_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+    *,
+    now: datetime,
+) -> InboundImage | None:
+    since = now - PHOTO_ANALYSE_LOOKBACK
+    result = await db.execute(
+        select(InboundImage)
+        .where(
+            InboundImage.merchant_id == merchant_id,
+            InboundImage.conversation_id == conversation_id,
+            InboundImage.created_at >= since,
+            InboundImage.media_deleted_at.is_(None),
+            InboundImage.media_path.isnot(None),
+        )
+        .order_by(InboundImage.created_at.desc(), InboundImage.id.desc())
+        .limit(1)
+    )
+    return result.scalar_one_or_none()
+
+
+async def _products_by_ids(
+    db: AsyncSession, product_ids: list[uuid.UUID]
+) -> dict[uuid.UUID, Product]:
+    if not product_ids:
+        return {}
+    rows = await db.execute(select(Product).where(Product.id.in_(product_ids)))
+    return {row.id: row for row in rows.scalars().all()}
+
+
+async def _stored_recognition_payload(
+    db: AsyncSession, image: InboundImage
+) -> dict[str, Any]:
+    level = image.match_level or MATCH_LEVEL_NONE
+    rows = list(image.match_candidates or [])
+    kind = PROPOSAL_KIND_EXACT
+    if any(row.get("verdict") == VERDICT_SIMILAR for row in rows):
+        kind = PROPOSAL_KIND_SIMILAR
+    product_ids: list[uuid.UUID] = []
+    for row in rows:
+        raw = row.get("product_id")
+        if not raw:
+            continue
+        try:
+            product_ids.append(uuid.UUID(str(raw)))
+        except ValueError:
+            continue
+    products = await _products_by_ids(db, product_ids)
+    matches: list[ImageMatch] = []
+    for row in rows:
+        raw = row.get("product_id")
+        if not raw:
+            continue
+        try:
+            product_id = uuid.UUID(str(raw))
+        except ValueError:
+            continue
+        product = products.get(product_id)
+        if product is None:
+            continue
+        distance = float(row.get("distance") or 0.0)
+        matches.append(
+            ImageMatch(
+                product=product,
+                distance=distance,
+                in_stock=product.stock_qty > 0,
+            )
+        )
+    if kind == PROPOSAL_KIND_SIMILAR and image.matched_product_id is not None:
+        proposed = [
+            match
+            for match in matches
+            if match.product.id == image.matched_product_id
+        ]
+    elif level in {MATCH_LEVEL_STRONG, MATCH_LEVEL_POSSIBLE}:
+        proposed = proposal_set(level, matches)
+        if image.matched_product_id is not None and not proposed:
+            proposed = [
+                match
+                for match in matches
+                if match.product.id == image.matched_product_id
+            ]
+    else:
+        proposed = []
+    result = RecognitionResult(
+        level=level,
+        matches=matches,
+        proposed=proposed,
+        proposal_kind=kind,
+    )
+    return _product_photo_tool_payload("already_analysed", result)
+
+
+async def analyser_photo_client(
+    db: AsyncSession,
+    merchant_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+) -> dict[str, Any]:
+    """Analyse the latest stored customer photo of this conversation on demand.
+
+    Never raises out of the turn. Does not send acks, run payment-proof
+    matching, or emit merchant notifications.
+    """
+    try:
+        return await _analyser_photo_client_inner(
+            db, merchant_id, conversation_id
+        )
+    except Exception:
+        logger.warning(
+            "analyser_photo_client failed merchant_id=%s conversation_id=%s",
+            merchant_id,
+            conversation_id,
+            exc_info=True,
+        )
+        return {"status": "unavailable"}
+
+
+async def _analyser_photo_client_inner(
+    db: AsyncSession,
+    merchant_id: uuid.UUID,
+    conversation_id: uuid.UUID,
+) -> dict[str, Any]:
+    conversation = await db.get(Conversation, conversation_id)
+    if conversation is None or conversation.merchant_id != merchant_id:
+        return {"status": "no_photo"}
+    now = datetime.now(timezone.utc)
+    image = await _latest_analysable_photo(
+        db, merchant_id, conversation_id, now=now
+    )
+    if image is None:
+        return {"status": "no_photo"}
+    if (
+        image.classification == CLASSIFICATION_PRODUCT_PHOTO
+        and image.match_level is not None
+    ):
+        return await _stored_recognition_payload(db, image)
+    if image.classification != CLASSIFICATION_NOT_ANALYZED:
+        return {"status": "not_a_product_photo"}
+
+    analyses_today = await _analyses_in_last_day(
+        db, merchant_id, conversation.customer_phone
+    )
+    if analyses_today >= settings.max_image_analyses_per_phone_per_day:
+        return {"status": "cap_reached"}
+
+    if not image.media_path:
+        return {"status": "unavailable"}
+    try:
+        content = read_inbound_image_file(image.media_path)
+    except FileNotFoundError:
+        logger.warning(
+            "analyser_photo_client missing file image_id=%s merchant_id=%s",
+            image.id,
+            merchant_id,
+        )
+        return {"status": "unavailable"}
+
+    vision_started = time.perf_counter()
+    classifier_s: float | None = None
+    recognition: RecognitionResult | None = None
+    try:
+        started_classifier = time.perf_counter()
+        analysis = await classer_image_entrante(
+            content, image.mime_type, image.caption
+        )
+        classifier_s = time.perf_counter() - started_classifier
+    except ImageAnalysisError:
+        classifier_s = time.perf_counter() - started_classifier
+        log_photo_analysis_timing(
+            source="analyser_photo_client",
+            image_id=image.id,
+            merchant_id=merchant_id,
+            classifier_s=classifier_s,
+            voyage_s=None,
+            verifier_s=None,
+            total_s=time.perf_counter() - vision_started,
+            classification=CLASSIFICATION_UNKNOWN,
+            level=None,
+        )
+        logger.warning(
+            "analyser_photo_client vision failed image_id=%s merchant_id=%s",
+            image.id,
+            merchant_id,
+            exc_info=True,
+        )
+        return {"status": "unavailable"}
+
+    classification = _classification_from_analysis(analysis)
+    image.classification = classification
+    image.detected_amount = analysis.detected_amount
+    if classification != CLASSIFICATION_PRODUCT_PHOTO:
+        log_photo_analysis_timing(
+            source="analyser_photo_client",
+            image_id=image.id,
+            merchant_id=merchant_id,
+            classifier_s=classifier_s,
+            voyage_s=None,
+            verifier_s=None,
+            total_s=time.perf_counter() - vision_started,
+            classification=classification,
+            level=None,
+        )
+        return {"status": "not_a_product_photo"}
+
+    recognition = await recognise_product_photo(
+        db, merchant_id, content, image.mime_type, caption=image.caption
+    )
+    persist_recognition(image, recognition)
+    log_photo_analysis_timing(
+        source="analyser_photo_client",
+        image_id=image.id,
+        merchant_id=merchant_id,
+        classifier_s=classifier_s,
+        voyage_s=recognition.voyage_seconds,
+        verifier_s=recognition.verifier_seconds,
+        total_s=time.perf_counter() - vision_started,
+        classification=classification,
+        level=recognition.level,
+    )
+    return _product_photo_tool_payload("analysed", recognition)
 
 
 async def purger_images_expirees(

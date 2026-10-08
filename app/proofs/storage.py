@@ -50,6 +50,14 @@ def absolute_media_path(relative: str) -> Path:
     return path
 
 
+def read_inbound_image_file(relative: str) -> bytes:
+    """Read bytes of a stored inbound file. Never log the path or content."""
+    path = absolute_media_path(relative)
+    if not path.is_file():
+        raise FileNotFoundError(relative)
+    return path.read_bytes()
+
+
 def delete_inbound_image_file(relative: str | None) -> None:
     """Unlink a file under the private media root. Missing files are fine."""
     if not relative:
