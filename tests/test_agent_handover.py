@@ -23,6 +23,7 @@ from app.agent.handover import (
     item_customer_photo,
     item_customer_text,
     item_human_reply,
+    rewrite_outdated_quantity_skips,
 )
 from app.agent.images import (
     MAX_WHATSAPP_IMAGES,
@@ -233,6 +234,8 @@ def test_handover_builders_are_plain_replayable_dicts() -> None:
     assert "preuve de paiement bien reçue" in auto_ack["content"]
     assert customer == {"role": "user", "content": "Okay"}
     assert photo["content"] == "[Le client a envoyé une photo (non analysée)]"
+    assert "analyser_photo_client" in HANDOVER_DEVELOPER_TEXT
+    assert "does not name a product" in HANDOVER_DEVELOPER_TEXT
     product_photo = item_customer_photo(classification="product_photo")
     assert product_photo["content"] == "[Le client a envoyé une photo de produit]"
     product_captioned = item_customer_photo(
@@ -244,6 +247,12 @@ def test_handover_builders_are_plain_replayable_dicts() -> None:
     captioned = item_customer_photo(caption="la robe noire")
     assert captioned["content"] == (
         '[Le client a envoyé une photo — légende : "la robe noire"]'
+    )
+    unanalysed_captioned = item_customer_photo(
+        classification="not_analyzed", caption="Vous avez ca?"
+    )
+    assert unanalysed_captioned["content"] == (
+        '[Le client a envoyé une photo (non analysée) — légende : "Vous avez ca?"]'
     )
     long_caption = item_customer_photo(caption="x" * 250)
     assert 'légende : "' in long_caption["content"]
@@ -260,6 +269,108 @@ def test_handover_builders_are_plain_replayable_dicts() -> None:
     )
     other = item_customer_photo(classification="other")
     assert other["content"] == "[Le client a envoyé une photo (non analysée)]"
+
+
+def _qty_then_address(n: int = 1) -> dict:
+    return {
+        "role": "assistant",
+        "content": (
+            f"Je note {n} article à 9 500 F.\n\n"
+            "Pourriez-vous me communiquer votre adresse complète, "
+            "la ville et votre mode de paiement : à la livraison ou en ligne ?"
+        ),
+    }
+
+
+def test_bare_quantity_skip_is_rewritten_on_replay_only() -> None:
+    skip = _qty_then_address(1)
+    original = skip["content"]
+    user = item_customer_text("1")
+    rewritten = rewrite_outdated_quantity_skips([user, skip])
+    assert rewritten[0] is user
+    assert rewritten[1] is not skip
+    assert "Souhaitez-vous autre chose ?" in rewritten[1]["content"]
+    assert "adresse" not in rewritten[1]["content"].lower()
+    assert skip["content"] == original
+    history = [
+        _message("customer", "1", [user]),
+        _message("agent", original, [skip]),
+    ]
+    replayed = prior_items_for_agent(history)
+    assert any("Souhaitez-vous autre chose ?" in str(item.get("content")) for item in replayed)
+    assert skip["content"] == original
+    assert user["content"] == "1"
+
+
+def test_cest_tout_quantity_skip_is_not_rewritten() -> None:
+    skip = _qty_then_address(2)
+    original = skip["content"]
+    user = item_customer_text("Je prends 2, c'est tout")
+    rewritten = rewrite_outdated_quantity_skips([user, skip])
+    assert rewritten[1] is skip
+    assert rewritten[1]["content"] == original
+    assert "Pourriez-vous me communiquer votre adresse" in rewritten[1]["content"]
+
+
+def test_early_address_quantity_skip_is_not_rewritten() -> None:
+    skip = _qty_then_address(2)
+    original = skip["content"]
+    user = item_customer_text(
+        "Je veux 2 articles, livraison aux Parcelles à Dakar"
+    )
+    rewritten = rewrite_outdated_quantity_skips([user, skip])
+    assert rewritten[1] is skip
+    assert skip["content"] == original
+
+
+def test_several_articles_rewrites_only_bare_quantity_skips() -> None:
+    first = _qty_then_address(1)
+    second = _qty_then_address(1)
+    after_all = _qty_then_address(2)
+    already_ok = {
+        "role": "assistant",
+        "content": "Très bien, 1 article. Souhaitez-vous autre chose ?",
+    }
+    recap = {
+        "type": "message",
+        "role": "assistant",
+        "content": (
+            "Vous commandez 2 articles à 9 500 F.\n"
+            "La livraison est à Dakar.\n"
+            "Confirmez-vous cette commande ?"
+        ),
+    }
+    after_cest_tout = {
+        "role": "assistant",
+        "content": (
+            "Pourriez-vous me communiquer votre adresse complète, "
+            "la ville et votre mode de paiement : à la livraison ou en ligne ?"
+        ),
+    }
+    originals = [first["content"], second["content"], after_all["content"]]
+    items = [
+        item_customer_text("1"),
+        first,
+        item_customer_text("Oui un autre article"),
+        already_ok,
+        item_customer_text("1 aussi"),
+        second,
+        item_customer_text("Non c'est tout"),
+        after_all,
+        after_cest_tout,
+        recap,
+    ]
+    rewritten = rewrite_outdated_quantity_skips(items)
+    assert rewritten[1] is not first
+    assert "Souhaitez-vous autre chose ?" in rewritten[1]["content"]
+    assert rewritten[5] is not second
+    assert "Souhaitez-vous autre chose ?" in rewritten[5]["content"]
+    assert rewritten[7] is after_all
+    assert rewritten[8] is after_cest_tout
+    assert rewritten[9] is recap
+    assert first["content"] == originals[0]
+    assert second["content"] == originals[1]
+    assert after_all["content"] == originals[2]
 
 
 def test_history_replays_new_rows_ignores_legacy_empty_and_keeps_reasoning() -> None:
@@ -557,6 +668,12 @@ def test_prompt_has_rule_15_and_photo_status_rule_14() -> None:
     assert "already_sent_earlier" in text
     assert "16. When the customer asks about an existing order" in text
     assert "17. Several articles in one order" in text
+    assert (
+        "The reply to every customer message that gives or confirms an "
+        "article quantity MUST"
+    ) in text
+    assert "MUST NOT ask for address, city or payment" in text
+    assert "Do not imitate older assistant turns" in text
     assert "developer note about a visual search" in text
     assert "je vous envoie la photo" in text
     assert "vous avez déjà reçu sa photo plus haut" in text
@@ -565,8 +682,24 @@ def test_prompt_has_rule_15_and_photo_status_rule_14() -> None:
     assert "follow rule 17" in text
     assert "Match level none or error" in text
     assert "never ask for the name, colour or type for that photo" in text
-    assert "do not ask them to complete or préciser it" in text
+    assert (
+        "Delivery details already given anywhere in the CURRENT exchange"
+    ) in text
+    assert "MUST be kept and MUST NEVER be asked again" in text
+    assert "ask ONLY for what is still missing" in text
+    assert "A neighbourhood already given" in text
+    assert "Do not reuse an address, city or payment from an earlier" in text
+    assert "never ask for \"votre adresse complète\"" in text
+    assert "This rule does not require a street number or landmark" in text
     assert "18. A history marker" in text
+    assert "does **not** apply when the history contains" in text
+    assert "MUST call `analyser_photo_client`" in text
+    assert "cite only the row whose name matches" in text
+    assert "do NOT ask \"C'est bien celui-ci ?\" — the shop already named it" in text
+    assert "It IS confirmation when a `[Boutique]` message" in text
+    assert "does NOT name a product" in text
+    assert "without « de produit » is the same situation" in text
+    assert "Je ne peux pas identifier l'article à partir de la photo" in text
     assert "always state the candidate name and price" in text
     assert "analyser_photo_client" in text
     assert text.index("17. Several articles") < text.index("18. A history marker")

@@ -1130,6 +1130,62 @@ images, 6 sent photos; apply restored Awa stock to the pre-proof snapshot
 (red dress 3, camel bag 3, …); leftover **0**. `reel_*` variant of E:
 skipped — no `reel_*` file in `image-eval`.
 
+### Long history skipped « autre chose ? » (2026-10-08)
+
+Live miss: after the watch photo was proposed and the customer said
+« Oui » then « 1 », the agent asked for address/city/payment. Rule 17
+was already in the prompt. Cause: imitation of older turns (7 Oct
+order n°62 and similar) that went straight from « Je note 1 … » to
+« Pourriez-vous me communiquer votre adresse… ». Truncating history or
+dropping those skipper turns flipped the replay to « autre chose ? »
+5/5; replacing the photo-analysis path did not.
+
+Fix: rule 17 now starts with an imperative MUST (confirm + « Souhaitez-vous
+autre chose ? », MUST NOT ask address/city/payment unless they already
+said that is all; do not imitate older skipper turns). At replay,
+`rewrite_outdated_quantity_skips` copies those skipper assistant items
+and replaces the address-ask tail with « Souhaitez-vous autre chose ? »
+only when the customer turn just before them was a bare quantity /
+confirmation. Stored rows are unchanged. A matching turn after « c'est
+tout » / « ça sera tout » / « rien d'autre » / « non c'est bon » /
+« non merci » / « fin », or after a message that already gives
+address/city details, is not rewritten.
+
+Long-history throwaway: `uv run python ../proofs/agent-multi-item/run_long_qty.py`
+(phones `+221770099301`…, Meta stubbed, real model, ~150 seeded items).
+
+| Scenario | Expect | Runs ok / 5 |
+| --- | --- | --- |
+| M1 photo-recognised watch → Oui → 1 | « autre chose ? », no address | **5/5** |
+| M2 text « Je prends 1 » | « autre chose ? » | **5/5** |
+| M3 two articles then « Non c'est tout » | second « autre chose ? »; one `creer_commande` with two lines; stocks down | **5/5** |
+| M4 « Je prends 1, c'est tout, adresse Parcelles » | no « autre chose ? »; missing delivery details | **5/5** |
+| M5 early Parcelles/Dakar | « autre chose ? » once; address not asked again | **10/10** (after rule 17/9: keep given details; neighbourhood is the address; do not reuse an earlier order) |
+| M6 « Je prends 2, c'est tout » then address | address request, then recap, no second « autre chose ? » | **5/5** |
+
+M5 2026-10-08 miss: after `"non c'est tout"` the model still pasted « Pourriez-vous me communiquer votre adresse complète… » even though it had acknowledged Parcelles/Dakar — the generic rule-5 three-part template, not because the address sat in the same message as the article. A first wording that allowed a landmark after a neighbourhood scored M5 **6/10** and M6 **1/5** (it also reused Parcelles from the seeded prior order). Final wording: details already given in the **current** exchange MUST NEVER be asked again; a neighbourhood already given is the address; do not reuse an earlier order's address/city/payment.
+
+M5×10 + M3/M4/M6×5 (gpt-5.6-terra, ~150 seeded items): **168** Responses calls, **1 380 307** input tokens (of which **1 353 447** cached), **11 101** output tokens, about **$0.46**. Leftover **0**; Awa stock restored (watch 8, wax belt 13, camel bag 3).
+
+### Variant A: boutique named the watch, then « Je la prends » (2026-10-08 ~16:20)
+
+Live miss on `917c4ff8-…`: after `[Boutique] Oui, la montre femme or rose à 9 500 F` and
+`Je la prends`, the agent called `rechercher_produits({"requete":"Montre femme or rose"})`,
+which also returned the red evening dress (embedding search, `rag_max_distance` 0.50,
+no distance in the payload). The reply named only the watch and asked « C'est bien
+celle-ci ? » (rule 18 told it to confirm after a Boutique name). The worker was in
+`multi_mode` (`len(images) > 1`) and sent both product description texts; photos
+were skipped as already sent.
+
+Prompt: do not ask « C'est bien celui-ci ? » when Boutique already named the
+product; « Je la prends » then follows rule 17. Worker still announces every
+imaged product in that turn's tool outputs — not changed (awaiting a decision).
+
+Throwaway `uv run python ../proofs/variant-a-named-product/run.py`: A **0/5**
+(only because the dress stays in the search output / worker list; the reply
+itself asked quantity, not « C'est bien celle-ci ? »); B **5/5**; C **5/5**.
+44 calls, ~$0.12. Leftover **0**.
+
 ## 36. Escalation tone + on-demand photo analysis after hand-back (2026-10-07)
 
 Backend only. Prompt wording (warmer post-escalation acknowledgement; no
@@ -1182,6 +1238,54 @@ by that file (agent correctly proposed the similar red dress).
 Cleanup: leftover **0**; Awa stock restored to the pre-proof snapshot. The
 `analyser_photo_client` payload uses `candidates` without `image_url`, so
 the worker photo plan does not send a catalogue photo from this tool alone.
+
+### Caption + long history (2026-10-08)
+
+Live miss: Boutique Awa, `+16132271255`, escalated photo with caption
+« Vous avez ca? », merchant « oui », then « Je la prends ». The agent
+replied « Je ne peux pas identifier l'article à partir de la photo… »
+without calling `analyser_photo_client` (job 3.9 s, one Responses call,
+row stayed `not_analyzed`).
+
+Cause: a captioned `not_analyzed` marker was stored as
+`[Le client a envoyé une photo — légende : "…"]` **without**
+`(non analysée)`, so rule 15's generic « cannot view photos » matched
+before rule 18. The handover developer note also told the model to ask
+a clarifying question. History length and imitation of older
+« Je ne peux pas voir… » replies did **not** flip the behaviour
+(ablations). Dropping the caption from the marker did.
+
+Fix (prompt + marker, no extra override): captioned `not_analyzed`
+keeps `(non analysée)`; rule 15 does not apply when that marker is
+present and rule 18 applies; rule 18 MUST call `analyser_photo_client`
+when the latest message refers to the unanalysed photo and neither the
+customer nor `[Boutique]` names a product (a bare « oui » / « ok » /
+« d'accord » does not name one); older wording without « de produit »
+is treated as unanalysed so already-stored captioned rows still work.
+Generic « Je ne peux pas identifier l'article à partir de la photo »
+is allowed after a non-usable tool result (or when rule 18 says not to
+call).
+
+`pytest` **213 passed in 28.29s**.
+
+Long-history throwaway (copy of the real thread's shape: multi-day
+filler, earlier « Je ne peux pas voir… », earlier order; Meta stubbed,
+real model + vision/Voyage):
+`uv run python ../proofs/photo-after-handover/run_long_history.py`
+(phones `+221770099181`…).
+
+| Scenario | Expect | Runs ok / 5 |
+| --- | --- | --- |
+| B1 long history + screen photo + caption + human « oui » + « Je la prends » | one `analyser_photo_client`; propose watch (or polite generic if `none`) | **5/5** |
+| B2 same with a clean catalogue photo | same | **5/5** |
+| A human names the watch | no analysis call | **5/5** |
+| C no human reply | one analysis call | **5/5** |
+| E horaires after hand-back | no analysis call; hours answer | **5/5** |
+
+Screen-photo recognition (read-only, thresholds unchanged): classifier
+`product_photo`; level `strong` / `exact`; shortlist 1 `Montre femme or rose`
+distance 0.3307 verdict `same`. Cleanup leftover **0**; Awa watch stock
+restored to the pre-proof snapshot (8). No deviations.
 
 
 

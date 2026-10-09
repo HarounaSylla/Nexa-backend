@@ -13,7 +13,11 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agent.handover import handover_developer_item, item_customer_text
+from app.agent.handover import (
+    handover_developer_item,
+    item_customer_text,
+    rewrite_outdated_quantity_skips,
+)
 from app.agent.models import Conversation, Message
 from app.agent.prompts import build_system_prompt
 from app.agent.service import (
@@ -65,7 +69,9 @@ def history_items_from_messages(messages: list[Message]) -> list[Any]:
 
 def prior_items_for_agent(messages: list[Message]) -> list[Any]:
     """Replayable history plus at most one handover developer note."""
-    prior_items = history_items_from_messages(messages)
+    prior_items = rewrite_outdated_quantity_skips(
+        history_items_from_messages(messages)
+    )
     note = handover_developer_item(prior_items)
     if note is not None:
         prior_items.append(note)

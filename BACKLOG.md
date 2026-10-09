@@ -57,7 +57,7 @@ TikTok comment classifier (Jalon 7) remains a separate model decision.
 - [x] WhatsApp outbound product photos: worker uploads local files via Graph `/media` then sends `type=image` with `media_id` (not a public `link`). Cap 3 per turn. `extract_product_images` lives in `app/agent/images.py` (simulate unchanged).
 - [x] Close conversations on delivery (`confirmer_livraison`) and 48h inactivity (lazy inbound + RQ `close_stale_conversations` on `maintenance` every 15 min). Sweep preserves `updated_at` so the 15-min reopen grace does not revive a swept thread.
 - [x] WhatsApp inbound images (payment proofs **and** product photos) — stored privately. Vision runs when the daily cap is not reached, except on an escalated thread with no order awaiting proof. Voice / PDF still skipped.
-- [x] Agent sees human-handover and inbound-photo turns as replayable text markers (`app/agent/handover.py`); a developer note is injected at replay when a `[Boutique]` reply follows the last native agent turn. Tool outputs carry `photo_status` (`will_be_sent` / `already_sent_earlier` / `none`) using the same plan as the WhatsApp worker. Prompt rules 14–15. No schema change.
+- [x] Agent sees human-handover and inbound-photo turns as replayable text markers (`app/agent/handover.py`); a captioned `not_analyzed` photo keeps `(non analysée)` on the marker. A developer note is injected at replay when a `[Boutique]` reply follows the last native agent turn (a bare « oui » / « ok » / « d'accord » does not name a product). Tool outputs carry `photo_status` (`will_be_sent` / `already_sent_earlier` / `none`) using the same plan as the WhatsApp worker. Prompt rules 14–18. No schema change.
 
 - [x] `rechercher_produits` resolves a guessed `categorie` against stored names (case / accents / trivial singular-plural) then exact-equality filter; if that search is empty it retries once without a category (`rag_max_distance` still applies).
 
@@ -77,9 +77,14 @@ These were listed in `Nexa/proofs/audit-agent-context.md` and are **not** in thi
 
 ## Agent cart — remaining
 
-The multi-article flow (rule 17) is prompt-only: the cart is whatever
-the model infers from replayed history. `creer_commande` already accepts
-several `items` and aggregates duplicate product ids.
+The multi-article flow (rule 17) is prompt-led: the cart is whatever
+the model infers from replayed history. Older assistant turns that
+jumped from a **bare** quantity to the address are rewritten at replay
+(`rewrite_outdated_quantity_skips`) so the model does not imitate them;
+a matching turn is left alone when the customer message just before it
+already said that is all, or already gave address/city details. Stored
+rows are unchanged. `creer_commande` already accepts several `items`
+and aggregates duplicate product ids.
 
 - Explicit cart state (confirmed product + quantity per conversation)
   instead of relying on history replay for earlier `product_id`s

@@ -7,6 +7,8 @@ chat text never contains URLs.
 from __future__ import annotations
 
 import json
+import re
+import unicodedata
 import uuid
 from typing import Any, Literal
 
@@ -126,6 +128,39 @@ def product_descriptions_from_items(items: list[Any] | None) -> dict[uuid.UUID, 
                 f"{name} — {format_fcfa(price)}"
             )
     return descriptions
+
+
+def normalize_for_reply_match(text: str) -> str:
+    """Casefold, strip accents, fold punctuation and whitespace to one space."""
+    collapsed = " ".join((text or "").split())
+    decomposed = unicodedata.normalize("NFKD", collapsed)
+    without_accents = "".join(
+        char for char in decomposed if not unicodedata.combining(char)
+    )
+    no_punct = re.sub(r"[^\w\s]", " ", without_accents, flags=re.UNICODE)
+    return " ".join(no_punct.split()).casefold()
+
+
+def reply_names_product(reply: str, product_name: str) -> bool:
+    """True when the normalised full product name is in the normalised reply."""
+    needle = normalize_for_reply_match(product_name)
+    if not needle:
+        return False
+    return needle in normalize_for_reply_match(reply)
+
+
+def images_named_in_reply(
+    images: list[ProductImageRef],
+    names: dict[uuid.UUID, str],
+    reply: str,
+) -> list[ProductImageRef]:
+    """Keep tool-output order. Empty means the caller should fall back."""
+    kept: list[ProductImageRef] = []
+    for image in images:
+        name = names.get(image.product_id)
+        if name and reply_names_product(reply, name):
+            kept.append(image)
+    return kept
 
 
 def photo_delivery_plan(

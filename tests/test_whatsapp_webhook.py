@@ -3,6 +3,7 @@ import hmac
 import json
 import logging
 import uuid
+from contextlib import contextmanager
 from decimal import Decimal
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -879,5 +880,277 @@ async def test_worker_single_image_uses_caption_and_skips_resend(
             send_text_again.assert_awaited_once()
             send_image_again.assert_not_awaited()
             assert "Skipping already-sent product photo" in caplog.text
+    finally:
+        await _cleanup(merchant.id)
+
+
+def _product_search_items(
+    products: list[tuple[uuid.UUID, str, str]],
+) -> list[dict]:
+    return [
+        {
+            "type": "function_call_output",
+            "output": json.dumps(
+                {
+                    "products": [
+                        {
+                            "id": str(product_id),
+                            "name": name,
+                            "price": price,
+                            "image_url": f"/static/product_images/{product_id}.png",
+                        }
+                        for product_id, name, price in products
+                    ]
+                }
+            ),
+        }
+    ]
+
+
+async def _seed_products_and_turn(
+    merchant: Merchant,
+    customer_phone: str,
+    reply: str,
+    products: list[tuple[uuid.UUID, str, Decimal]],
+) -> None:
+    items = _product_search_items(
+        [(product_id, name, str(price)) for product_id, name, price in products]
+    )
+    async with AsyncSessionLocal() as db:
+        db.add_all(
+            [
+                Product(
+                    id=product_id,
+                    merchant_id=merchant.id,
+                    name=name,
+                    price=price,
+                    stock_qty=5,
+                )
+                for product_id, name, price in products
+            ]
+        )
+        conversation = Conversation(
+            merchant_id=merchant.id,
+            customer_phone=customer_phone,
+            status="active",
+        )
+        db.add(conversation)
+        await db.flush()
+        db.add(
+            Message(
+                conversation_id=conversation.id,
+                turn_role="agent",
+                display_text=reply,
+                items=items,
+            )
+        )
+        await db.commit()
+
+
+@contextmanager
+def _worker_send_patches(reply: str):
+    with (
+        patch("app.workers.whatsapp.claim_inbound_message", return_value=True),
+        patch(
+            "app.workers.whatsapp.traiter_message_entrant",
+            new_callable=AsyncMock,
+            return_value=reply,
+        ),
+        patch(
+            "app.workers.whatsapp.envoyer_texte_whatsapp",
+            new_callable=AsyncMock,
+        ) as send_text,
+        patch(
+            "app.workers.whatsapp.envoyer_image_whatsapp",
+            new_callable=AsyncMock,
+        ) as send_image,
+    ):
+        yield send_text, send_image
+
+
+@pytest.mark.asyncio
+async def test_worker_multi_mode_sends_only_product_named_in_reply(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    merchant = await _seed_linked_merchant()
+    watch_id = uuid.uuid4()
+    dress_id = uuid.uuid4()
+    reply = "Oui, la montre femme or rose à 9 500 F."
+    try:
+        await _seed_products_and_turn(
+            merchant,
+            "221770001310",
+            reply,
+            [
+                (watch_id, "Montre femme or rose", Decimal("9500")),
+                (dress_id, "Robe de soirée rouge", Decimal("25000")),
+            ],
+        )
+        with _worker_send_patches(reply) as (send_text, send_image):
+            with caplog.at_level(logging.INFO, logger="app.workers.whatsapp"):
+                await process_inbound_whatsapp_text_async(
+                    "wamid.named-one",
+                    "221770001310",
+                    "c'est bien celle-ci ?",
+                    merchant.whatsapp_phone_number_id or "",
+                )
+            bodies = [call.args[1] for call in send_text.await_args_list]
+            assert bodies[0] == reply
+            assert any("Montre femme or rose" in text for text in bodies)
+            assert all("Robe de soirée rouge" not in text for text in bodies)
+            sent_ids = [call.args[1] for call in send_image.await_args_list]
+            assert sent_ids == [watch_id]
+            assert "Filtering multi-product WhatsApp send from 2 to 1" in caplog.text
+    finally:
+        await _cleanup(merchant.id)
+
+
+@pytest.mark.asyncio
+async def test_worker_multi_mode_sends_both_named_products_in_tool_order() -> None:
+    merchant = await _seed_linked_merchant()
+    watch_id = uuid.uuid4()
+    dress_id = uuid.uuid4()
+    reply = (
+        "La robe de soirée rouge et la montre femme or rose sont disponibles."
+    )
+    try:
+        await _seed_products_and_turn(
+            merchant,
+            "221770001311",
+            reply,
+            [
+                (watch_id, "Montre femme or rose", Decimal("9500")),
+                (dress_id, "Robe de soirée rouge", Decimal("25000")),
+            ],
+        )
+        with _worker_send_patches(reply) as (send_text, send_image):
+            await process_inbound_whatsapp_text_async(
+                "wamid.named-both",
+                "221770001311",
+                "montrez-moi",
+                merchant.whatsapp_phone_number_id or "",
+            )
+            bodies = [call.args[1] for call in send_text.await_args_list]
+            named_order = [
+                text
+                for text in bodies
+                if "Montre femme or rose" in text or "Robe de soirée rouge" in text
+            ]
+            assert "Montre femme or rose" in named_order[0]
+            assert "Robe de soirée rouge" in named_order[1]
+            sent_ids = [call.args[1] for call in send_image.await_args_list]
+            assert sent_ids == [watch_id, dress_id]
+    finally:
+        await _cleanup(merchant.id)
+
+
+@pytest.mark.asyncio
+async def test_worker_multi_mode_fallback_sends_all_when_reply_names_none() -> None:
+    merchant = await _seed_linked_merchant()
+    watch_id = uuid.uuid4()
+    dress_id = uuid.uuid4()
+    reply = "Voici quelques articles."
+    try:
+        await _seed_products_and_turn(
+            merchant,
+            "221770001312",
+            reply,
+            [
+                (watch_id, "Montre femme or rose", Decimal("9500")),
+                (dress_id, "Robe de soirée rouge", Decimal("25000")),
+            ],
+        )
+        with _worker_send_patches(reply) as (send_text, send_image):
+            await process_inbound_whatsapp_text_async(
+                "wamid.named-none",
+                "221770001312",
+                "vous avez des robes ?",
+                merchant.whatsapp_phone_number_id or "",
+            )
+            bodies = [call.args[1] for call in send_text.await_args_list]
+            assert any("Montre femme or rose" in text for text in bodies)
+            assert any("Robe de soirée rouge" in text for text in bodies)
+            sent_ids = [call.args[1] for call in send_image.await_args_list]
+            assert sent_ids == [watch_id, dress_id]
+    finally:
+        await _cleanup(merchant.id)
+
+
+@pytest.mark.asyncio
+async def test_worker_named_products_still_capped_at_three() -> None:
+    merchant = await _seed_linked_merchant()
+    ids = [uuid.uuid4() for _ in range(4)]
+    names = [f"Article special {index}" for index in range(4)]
+    reply = "Voici " + ", ".join(names) + "."
+    try:
+        await _seed_products_and_turn(
+            merchant,
+            "221770001313",
+            reply,
+            [
+                (product_id, name, Decimal((index + 1) * 10000))
+                for index, (product_id, name) in enumerate(zip(ids, names))
+            ],
+        )
+        with _worker_send_patches(reply) as (_send_text, send_image):
+            await process_inbound_whatsapp_text_async(
+                "wamid.named-cap",
+                "221770001313",
+                "montrez-moi tout",
+                merchant.whatsapp_phone_number_id or "",
+            )
+            sent_ids = [call.args[1] for call in send_image.await_args_list]
+            assert sent_ids == ids[:3]
+    finally:
+        await _cleanup(merchant.id)
+
+
+@pytest.mark.asyncio
+async def test_worker_named_product_sends_description_when_photo_already_sent() -> None:
+    from app.agent.models import SentProductImage
+
+    merchant = await _seed_linked_merchant()
+    watch_id = uuid.uuid4()
+    dress_id = uuid.uuid4()
+    reply = (
+        "La robe de soirée rouge et la montre femme or rose sont disponibles."
+    )
+    try:
+        await _seed_products_and_turn(
+            merchant,
+            "221770001314",
+            reply,
+            [
+                (watch_id, "Montre femme or rose", Decimal("9500")),
+                (dress_id, "Robe de soirée rouge", Decimal("25000")),
+            ],
+        )
+        async with AsyncSessionLocal() as db:
+            conversation = (
+                await db.execute(
+                    select(Conversation).where(
+                        Conversation.customer_phone == "221770001314"
+                    )
+                )
+            ).scalar_one()
+            db.add(
+                SentProductImage(
+                    conversation_id=conversation.id,
+                    product_id=watch_id,
+                )
+            )
+            await db.commit()
+        with _worker_send_patches(reply) as (send_text, send_image):
+            await process_inbound_whatsapp_text_async(
+                "wamid.named-already-sent",
+                "221770001314",
+                "encore",
+                merchant.whatsapp_phone_number_id or "",
+            )
+            bodies = [call.args[1] for call in send_text.await_args_list]
+            assert any("Montre femme or rose" in text for text in bodies)
+            assert any("Robe de soirée rouge" in text for text in bodies)
+            sent_ids = [call.args[1] for call in send_image.await_args_list]
+            assert sent_ids == [dress_id]
     finally:
         await _cleanup(merchant.id)

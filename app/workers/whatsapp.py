@@ -15,6 +15,7 @@ from app.agent.images import (
     PHOTO_STATUS_ALREADY_SENT,
     PHOTO_STATUS_WILL_BE_SENT,
     extract_product_images,
+    images_named_in_reply,
     photo_delivery_plan,
     product_descriptions_from_items,
     product_names_from_items,
@@ -68,7 +69,19 @@ async def envoyer_reponse_whatsapp_agent(
                 [image.product_id for image in images],
             )
 
-    multi_mode = len(images) > 1
+    tool_image_count = len(images)
+    multi_mode = tool_image_count > 1
+    if multi_mode:
+        named = images_named_in_reply(images, names, reply)
+        if named:
+            logger.info(
+                "Filtering multi-product WhatsApp send from %s to %s "
+                "message_id=%s",
+                tool_image_count,
+                len(named),
+                message_id,
+            )
+            images = named
     plan = photo_delivery_plan(
         [image.product_id for image in images],
         already_sent,
