@@ -77,6 +77,7 @@ def _text_payload(
     customer_phone: str = "221770001300",
     body: str = "vous avez des robes ?",
     message_type: str = "text",
+    context: dict | None = None,
 ) -> dict:
     message: dict = {
         "from": customer_phone,
@@ -85,6 +86,8 @@ def _text_payload(
     }
     if message_type == "text":
         message["text"] = {"body": body}
+    if context is not None:
+        message["context"] = context
     return {
         "object": "whatsapp_business_account",
         "entry": [
@@ -183,6 +186,7 @@ async def test_webhook_post_enqueues_text_and_ignores_statuses() -> None:
                     "+221770001300",
                     "vous avez des robes ?",
                     merchant.whatsapp_phone_number_id,
+                    None,
                 )
 
                 image = await client.post(
@@ -234,6 +238,7 @@ async def test_webhook_post_enqueues_text_and_ignores_statuses() -> None:
                     "image/jpeg",
                     "n°43",
                     merchant.whatsapp_phone_number_id,
+                    None,
                 )
     finally:
         await _cleanup(merchant.id)
@@ -475,8 +480,11 @@ async def test_envoyer_texte_whatsapp_sends_e164_plus_in_to_field() -> None:
         patch.object(settings, "whatsapp_api_version", "v21.0"),
         patch("app.whatsapp.service.httpx.AsyncClient", _FakeClient),
     ):
-        await envoyer_texte_whatsapp("221770001311", "bonjour", PHONE_NUMBER_ID)
+        wamid = await envoyer_texte_whatsapp(
+            "221770001311", "bonjour", PHONE_NUMBER_ID
+        )
 
+    assert wamid == "wamid.out"
     assert len(captured) == 1
     assert captured[0]["json"]["to"] == "+221770001311"
     assert captured[0]["json"]["type"] == "text"
@@ -530,13 +538,14 @@ async def test_envoyer_image_whatsapp_uses_media_id_not_link(tmp_path: Path) -> 
         patch.object(settings, "whatsapp_api_version", "v21.0"),
         patch("app.whatsapp.service.httpx.AsyncClient", _FakeClient),
     ):
-        await envoyer_image_whatsapp(
+        wamid = await envoyer_image_whatsapp(
             "221770001305",
             product_id,
             PHONE_NUMBER_ID,
             caption="Robe rouge",
         )
 
+    assert wamid == "wamid.out"
     assert len(captured) == 2
     assert captured[0]["url"].endswith(f"/{PHONE_NUMBER_ID}/media")
     assert captured[0]["data"]["messaging_product"] == "whatsapp"
@@ -1148,9 +1157,58 @@ async def test_worker_named_product_sends_description_when_photo_already_sent() 
                 merchant.whatsapp_phone_number_id or "",
             )
             bodies = [call.args[1] for call in send_text.await_args_list]
-            assert any("Montre femme or rose" in text for text in bodies)
-            assert any("Robe de soirée rouge" in text for text in bodies)
+            assert bodies[0] == reply
+            extra = bodies[1:]
+            assert all("Montre femme or rose" not in text for text in extra)
+            assert any("Robe de soirée rouge" in text for text in extra)
             sent_ids = [call.args[1] for call in send_image.await_args_list]
             assert sent_ids == [dress_id]
+    finally:
+        await _cleanup(merchant.id)
+
+
+@pytest.mark.asyncio
+async def test_worker_named_already_sent_skips_description_and_photo() -> None:
+    from app.agent.models import SentProductImage
+
+    merchant = await _seed_linked_merchant()
+    watch_id = uuid.uuid4()
+    dress_id = uuid.uuid4()
+    reply = "La montre femme or rose est disponible à 9 500 F."
+    try:
+        await _seed_products_and_turn(
+            merchant,
+            "221770001315",
+            reply,
+            [
+                (watch_id, "Montre femme or rose", Decimal("9500")),
+                (dress_id, "Robe de soirée rouge", Decimal("25000")),
+            ],
+        )
+        async with AsyncSessionLocal() as db:
+            conversation = (
+                await db.execute(
+                    select(Conversation).where(
+                        Conversation.customer_phone == "221770001315"
+                    )
+                )
+            ).scalar_one()
+            db.add(
+                SentProductImage(
+                    conversation_id=conversation.id,
+                    product_id=watch_id,
+                )
+            )
+            await db.commit()
+        with _worker_send_patches(reply) as (send_text, send_image):
+            await process_inbound_whatsapp_text_async(
+                "wamid.named-skip-both",
+                "221770001315",
+                "encore la montre",
+                merchant.whatsapp_phone_number_id or "",
+            )
+            bodies = [call.args[1] for call in send_text.await_args_list]
+            assert bodies == [reply]
+            send_image.assert_not_awaited()
     finally:
         await _cleanup(merchant.id)

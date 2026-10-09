@@ -21,11 +21,49 @@ from app.core.phone import normalize_phone_webhook, try_normalize_phone
 
 logger = logging.getLogger(__name__)
 
+WAMID_LOG_MAX = 20
+
 FALLBACK_REPLY = (
     "Désolé, un souci technique — réessayez dans un instant."
 )
 SEEN_KEY_PREFIX = "whatsapp:seen:"
 SEEN_TTL_SECONDS = 48 * 60 * 60
+
+
+def truncate_wamid(wamid: str | None) -> str:
+    """Short id for logs. Never pass message text through here."""
+    if not wamid:
+        return ""
+    if len(wamid) <= WAMID_LOG_MAX:
+        return wamid
+    return wamid[:WAMID_LOG_MAX] + "…"
+
+
+def wamid_from_graph_payload(payload: Any) -> str | None:
+    """messages[0].id from a Graph send response. Missing/malformed → None."""
+    if not isinstance(payload, dict):
+        return None
+    messages = payload.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return None
+    first = messages[0]
+    if not isinstance(first, dict):
+        return None
+    raw = first.get("id")
+    if not raw:
+        return None
+    return str(raw)
+
+
+def context_reply_to_id(message: dict[str, Any]) -> str | None:
+    """Inbound quoted-message wamid. Ignores forwarded / referred_product."""
+    context = message.get("context")
+    if not isinstance(context, dict):
+        return None
+    raw = context.get("id")
+    if not raw:
+        return None
+    return str(raw)
 
 
 def signature_verification_enabled() -> bool:
@@ -77,7 +115,7 @@ def extract_text_messages(payload: dict[str, Any]) -> list[dict[str, str]]:
                         logger.info(
                             "Ignoring non-text WhatsApp message type=%s id=%s",
                             message_type,
-                            message.get("id"),
+                            truncate_wamid(str(message.get("id") or "")),
                         )
                     continue
                 text_obj = message.get("text") or {}
@@ -89,18 +127,20 @@ def extract_text_messages(payload: dict[str, Any]) -> list[dict[str, str]]:
                 if not message_id or not customer_phone or not body:
                     logger.warning(
                         "Skipping incomplete text message id=%s from=%s",
-                        message_id,
+                        truncate_wamid(message_id),
                         customer_phone,
                     )
                     continue
-                found.append(
-                    {
-                        "message_id": message_id,
-                        "customer_phone": normalize_phone_webhook(customer_phone),
-                        "message_text": body,
-                        "phone_number_id": phone_number_id,
-                    }
-                )
+                row = {
+                    "message_id": message_id,
+                    "customer_phone": normalize_phone_webhook(customer_phone),
+                    "message_text": body,
+                    "phone_number_id": phone_number_id,
+                }
+                reply_to = context_reply_to_id(message)
+                if reply_to:
+                    row["reply_to_message_id"] = reply_to
+                found.append(row)
     return found
 
 
@@ -137,20 +177,22 @@ def extract_image_messages(payload: dict[str, Any]) -> list[dict[str, str]]:
                 if not message_id or not customer_phone or not media_id:
                     logger.warning(
                         "Skipping incomplete image message id=%s from=%s",
-                        message.get("id"),
+                        truncate_wamid(str(message.get("id") or "")),
                         message.get("from"),
                     )
                     continue
-                found.append(
-                    {
-                        "customer_phone": normalize_phone_webhook(customer_phone),
-                        "whatsapp_message_id": message_id,
-                        "media_id": media_id,
-                        "mime_type": mime_type,
-                        "caption": caption_text,
-                        "phone_number_id": phone_number_id,
-                    }
-                )
+                row = {
+                    "customer_phone": normalize_phone_webhook(customer_phone),
+                    "whatsapp_message_id": message_id,
+                    "media_id": media_id,
+                    "mime_type": mime_type,
+                    "caption": caption_text,
+                    "phone_number_id": phone_number_id,
+                }
+                reply_to = context_reply_to_id(message)
+                if reply_to:
+                    row["reply_to_message_id"] = reply_to
+                found.append(row)
     return found
 
 
@@ -174,6 +216,7 @@ def enqueue_inbound_text(
     customer_phone: str,
     message_text: str,
     phone_number_id: str,
+    reply_to_message_id: str | None = None,
 ) -> None:
     from redis import Redis
     from rq import Queue
@@ -187,6 +230,7 @@ def enqueue_inbound_text(
         customer_phone,
         message_text,
         phone_number_id,
+        reply_to_message_id,
     )
 
 
@@ -197,6 +241,7 @@ def enqueue_inbound_image(
     mime_type: str,
     caption: str,
     phone_number_id: str,
+    reply_to_message_id: str | None = None,
 ) -> None:
     from redis import Redis
     from rq import Queue
@@ -212,6 +257,7 @@ def enqueue_inbound_image(
         mime_type,
         caption,
         phone_number_id,
+        reply_to_message_id,
     )
 
 
@@ -261,8 +307,11 @@ async def envoyer_texte_whatsapp(
     customer_phone: str,
     body: str,
     phone_number_id: str,
-) -> None:
-    """Send a text message from the given Cloud API phone number id."""
+) -> str | None:
+    """Send a text message from the given Cloud API phone number id.
+
+    Returns the Graph wamid, or None if the response omitted it.
+    """
     if not settings.whatsapp_access_token:
         raise RuntimeError("WHATSAPP_ACCESS_TOKEN is empty")
     if not phone_number_id:
@@ -295,6 +344,11 @@ async def envoyer_texte_whatsapp(
                 response.text,
             )
             raise
+        try:
+            payload = response.json()
+        except ValueError:
+            return None
+        return wamid_from_graph_payload(payload)
 
 
 GRAPH_WINDOW_CLOSED_CODE = 131047
@@ -326,13 +380,13 @@ def _graph_error_code(response: httpx.Response) -> int | None:
 
 async def envoyer_message_commercant(
     merchant: Merchant, customer_phone: str, text: str
-) -> None:
+) -> str | None:
     """Send a merchant-authored text to a customer on WhatsApp."""
     phone_number_id = (merchant.whatsapp_phone_number_id or "").strip()
     if not phone_number_id or not settings.whatsapp_access_token:
         raise WhatsAppSendError("whatsapp_not_configured")
     try:
-        await envoyer_texte_whatsapp(customer_phone, text, phone_number_id)
+        return await envoyer_texte_whatsapp(customer_phone, text, phone_number_id)
     except RuntimeError as exc:
         raise WhatsAppSendError("whatsapp_not_configured") from exc
     except httpx.HTTPStatusError as exc:
@@ -356,7 +410,7 @@ async def envoyer_image_whatsapp(
     product_id: uuid.UUID,
     phone_number_id: str,
     caption: str | None = None,
-) -> None:
+) -> str | None:
     """Upload a local product photo and send it as a WhatsApp image (media_id).
 
     Failures are logged and swallowed so a missing photo never blocks the
@@ -444,8 +498,14 @@ async def envoyer_image_whatsapp(
                     sent.status_code,
                     sent.text,
                 )
-                return
+                return None
+            try:
+                payload = sent.json()
+            except ValueError:
+                return None
+            return wamid_from_graph_payload(payload)
     except Exception:
         logger.exception(
             "WhatsApp image send failed product=%s", product_id
         )
+        return None

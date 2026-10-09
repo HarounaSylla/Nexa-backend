@@ -109,3 +109,48 @@ class SentProductImage(Base):
         server_default=func.now(),
         nullable=False,
     )
+
+
+class WhatsAppMessageRef(Base):
+    """Maps a WhatsApp wamid to a conversation turn, photo, or inbound quote."""
+
+    __tablename__ = "whatsapp_message_refs"
+    __table_args__ = (
+        UniqueConstraint(
+            "conversation_id",
+            "wamid",
+            name="uq_whatsapp_message_refs_conversation_wamid",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=text("gen_random_uuid()"),
+    )
+    conversation_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("conversations.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    wamid: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    message_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("messages.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    product_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("products.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    excerpt: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reply_to_wamid: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        nullable=False,
+    )

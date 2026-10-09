@@ -1,9 +1,10 @@
 """OpenAI Responses API function-tool schemas and dispatcher.
 
-Ten socle tools: rechercher_produits, lister_categories,
+Eleven socle tools: rechercher_produits, lister_categories,
 lister_produits_populaires, trouver_produits_similaires,
-obtenir_disponibilite, verifier_zone_livraison, creer_commande,
-escalader_vers_humain, consulter_commande, analyser_photo_client.
+obtenir_disponibilite, verifier_zone_livraison, calculer_total_commande,
+creer_commande, escalader_vers_humain, consulter_commande,
+analyser_photo_client.
 """
 
 from __future__ import annotations
@@ -40,6 +41,7 @@ from app.orders.service import (
     InsufficientStockError,
     InvalidOrderStateError,
     NotFoundError,
+    calculer_total_commande,
     consulter_commande,
     creer_commande,
     obtenir_disponibilite,
@@ -166,6 +168,38 @@ TOOLS: list[dict[str, Any]] = [
                 },
             },
             "required": ["ville"],
+            "additionalProperties": False,
+        },
+        "strict": True,
+    },
+    {
+        "type": "function",
+        "name": "calculer_total_commande",
+        "description": (
+            "Compute each cart line subtotal and the articles total from "
+            "catalogue prices (same path as creer_commande). Call once "
+            "after delivery details, before the recap. Read-only: does "
+            "not create an order. Copy articles_total_display into the "
+            "recap; do not add the delivery fee; do not compute a total "
+            "yourself. If this tool errors, send the recap without a total."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "product_id": {"type": "string"},
+                            "quantity": {"type": "integer"},
+                        },
+                        "required": ["product_id", "quantity"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            "required": ["items"],
             "additionalProperties": False,
         },
         "strict": True,
@@ -487,6 +521,17 @@ async def _dispatch(
             "min_delivery_hours": zone.min_delivery_hours,
             "max_delivery_hours": zone.max_delivery_hours,
         }
+
+    if tool_name == "calculer_total_commande":
+        raw_items = tool_args.get("items") or []
+        items = [
+            (
+                _parse_uuid(item["product_id"], "product_id"),
+                int(item["quantity"]),
+            )
+            for item in raw_items
+        ]
+        return await calculer_total_commande(db, merchant_id, items)
 
     if tool_name == "creer_commande":
         from app.agent.models import Conversation

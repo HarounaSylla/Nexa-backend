@@ -705,7 +705,29 @@ def test_prompt_has_rule_15_and_photo_status_rule_14() -> None:
     assert text.index("17. Several articles") < text.index("18. A history marker")
     assert "Use analyser_photo_client only when rule 18" in text
     numbered = re.findall(r"(?m)^(\d+)\. ", text)
-    assert numbered == [str(n) for n in range(1, 19)]
+    assert numbered == [str(n) for n in range(1, 20)]
+    assert "19. When a customer message is immediately preceded" in text
+    assert "[Le client répond à" in text
+    assert "takes precedence over" in text
+    assert "quoted catalogue photo identifies" in text
+    assert "quoted recap with a correction" in text
+    assert "calculer_total_commande" in text
+    assert "Total des articles" in text
+    assert "MUST ask which one before asking the quantity" in text
+    assert "MUST NOT guess" in text
+    assert "quantity question MUST name that article" in text
+    assert "NEVER ask « Souhaitez-vous autre chose ? » again" in text
+    assert "un autre modèle" in text
+    assert "Count how many distinct products" in text
+    assert "will_be_sent count is two or more" in text
+    assert "When the count is one" in text
+    assert "a product you do not name will not be sent" in text
+    assert "promised another model or a photo without naming it" in text
+    assert "Voici ce qu'on a, lequel vous plaît" in text
+    assert "conversation précédente" in text
+    assert "je pense qu'il s'agit de" in text
+    assert "non reconnue" in text
+    assert text.index("18. A history marker") < text.index("19. When a customer")
     tail = text[text.index("15. Customer photos") :]
     assert "Robe longue" not in tail
     assert "Sac à main" not in tail

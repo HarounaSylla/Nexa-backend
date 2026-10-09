@@ -81,6 +81,7 @@ async def receive_webhook(
             item["customer_phone"],
             item["message_text"],
             item["phone_number_id"],
+            item.get("reply_to_message_id"),
         )
     for item in extract_image_messages(payload):
         merchant = await get_merchant_by_whatsapp_phone_number_id(
@@ -100,5 +101,6 @@ async def receive_webhook(
             item["mime_type"],
             item["caption"],
             item["phone_number_id"],
+            item.get("reply_to_message_id"),
         )
     return Response(status_code=200)

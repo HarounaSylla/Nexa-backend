@@ -12,7 +12,16 @@ from typing import Any
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agent.handover import item_automatic_proof_ack, item_customer_photo
+from app.agent.handover import (
+    KIND_CUSTOMER_PHOTO,
+    KIND_SHOP_TEXT,
+    PHOTO_RECOGNITION_POSSIBLE,
+    PHOTO_RECOGNITION_RECOGNIZED,
+    PHOTO_RECOGNITION_UNANALYSED,
+    PHOTO_RECOGNITION_UNRECOGNIZED,
+    item_automatic_proof_ack,
+    item_customer_photo,
+)
 from app.agent.models import Conversation, Message
 from app.agent.orchestrator import _get_or_create_conversation, traiter_photo_produit
 from app.agent.service import (
@@ -21,6 +30,7 @@ from app.agent.service import (
     TURN_ROLE_CUSTOMER,
     TURN_ROLE_MERCHANT,
     notifier_message_escalade,
+    record_whatsapp_message_ref,
     trouver_conversation_escaladee,
 )
 from app.catalogue.models import Merchant, Product
@@ -76,11 +86,61 @@ from app.whatsapp.service import (
     WhatsAppSendError,
     envoyer_message_commercant,
     telecharger_media_whatsapp,
+    truncate_wamid,
 )
 
 logger = logging.getLogger(__name__)
 
 MAX_IMAGE_ANALYSES_PER_PHONE_PER_DAY = 10
+_SIMILAR_LEVELS = {MATCH_LEVEL_POSSIBLE, "similar", VERDICT_SIMILAR}
+
+
+async def quoted_customer_photo_recognition(
+    db: AsyncSession,
+    merchant_id: uuid.UUID,
+    wamid: str,
+) -> dict[str, Any] | None:
+    """Recognition stored for a customer-photo wamid, scoped to this merchant.
+
+    Never includes URLs, paths, or bytes. None if there is no inbound row.
+    """
+    result = await db.execute(
+        select(InboundImage).where(
+            InboundImage.whatsapp_message_id == wamid,
+            InboundImage.merchant_id == merchant_id,
+        )
+    )
+    image = result.scalar_one_or_none()
+    if image is None:
+        return None
+    if image.classification != CLASSIFICATION_PRODUCT_PHOTO:
+        return {"state": PHOTO_RECOGNITION_UNANALYSED}
+    level = (image.match_level or "").strip().lower()
+    if level in {"", MATCH_LEVEL_ERROR}:
+        return {"state": PHOTO_RECOGNITION_UNANALYSED}
+    product_id = image.matched_product_id
+    product_name = None
+    if product_id is not None:
+        product = await db.get(Product, product_id)
+        if product is None or product.merchant_id != merchant_id:
+            product_id = None
+        else:
+            product_name = product.name
+    if level == MATCH_LEVEL_NONE or not product_name:
+        return {"state": PHOTO_RECOGNITION_UNRECOGNIZED}
+    if level in _SIMILAR_LEVELS:
+        state = PHOTO_RECOGNITION_POSSIBLE
+    elif level == MATCH_LEVEL_STRONG:
+        state = PHOTO_RECOGNITION_RECOGNIZED
+    else:
+        return {"state": PHOTO_RECOGNITION_UNANALYSED}
+    return {
+        "state": state,
+        "product_id": product_id,
+        "product_name": product_name,
+    }
+
+
 PHOTO_ANALYSE_LOOKBACK = timedelta(hours=24)
 ACK_TEXT = (
     "Merci, nous avons bien reçu votre photo. "
@@ -306,6 +366,7 @@ async def traiter_image_entrante(
     media_id: str,
     mime_type: str | None,
     caption: str | None,
+    reply_to_message_id: str | None = None,
 ) -> InboundImage | None:
     existing = await _already_stored(db, whatsapp_message_id)
     if existing is not None:
@@ -393,6 +454,15 @@ async def traiter_image_entrante(
     )
     db.add(row)
     await db.flush()
+    await record_whatsapp_message_ref(
+        db,
+        conversation.id,
+        whatsapp_message_id,
+        KIND_CUSTOMER_PHOTO,
+        message_id=row.id,
+        reply_to_wamid=reply_to_message_id,
+        commit=False,
+    )
     if bump:
         conversation.updated_at = datetime.now(timezone.utc)
 
@@ -476,23 +546,34 @@ async def traiter_image_entrante(
     if classification == CLASSIFICATION_PAYMENT_PROOF:
         sender = Merchant(whatsapp_phone_number_id=merchant_phone_id)
         try:
-            await envoyer_message_commercant(sender, customer_phone, ACK_TEXT)
+            ack_wamid = await envoyer_message_commercant(
+                sender, customer_phone, ACK_TEXT
+            )
         except WhatsAppSendError:
             logger.warning(
                 "Acknowledgement send failed message_id=%s",
-                whatsapp_message_id,
+                truncate_wamid(whatsapp_message_id),
                 exc_info=True,
             )
         else:
             conversation_row = await db.get(Conversation, conversation_id)
             if conversation_row is not None:
-                db.add(
-                    Message(
-                        conversation_id=conversation_id,
-                        turn_role=TURN_ROLE_MERCHANT,
-                        display_text=ACK_TEXT,
-                        items=[item_automatic_proof_ack()],
-                    )
+                ack_row = Message(
+                    conversation_id=conversation_id,
+                    turn_role=TURN_ROLE_MERCHANT,
+                    display_text=ACK_TEXT,
+                    items=[item_automatic_proof_ack()],
+                )
+                db.add(ack_row)
+                await db.flush()
+                await record_whatsapp_message_ref(
+                    db,
+                    conversation_id,
+                    ack_wamid,
+                    KIND_SHOP_TEXT,
+                    message_id=ack_row.id,
+                    excerpt=ACK_TEXT,
+                    commit=False,
                 )
                 # A closed order thread must not gain reopen-grace from the ack.
                 if conversation_row.status != STATUS_CLOSED:

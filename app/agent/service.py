@@ -1,14 +1,20 @@
 """Agent-side helpers that are not catalogue or orders concerns."""
 
+import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import case, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.agent.handover import item_human_reply
-from app.agent.models import Conversation, Message, SentProductImage
-from app.catalogue.models import Merchant
+from app.agent.handover import (
+    KIND_CUSTOMER_PHOTO,
+    KIND_SHOP_TEXT,
+    item_human_reply,
+    quote_replay_marker,
+)
+from app.agent.models import Conversation, Message, SentProductImage, WhatsAppMessageRef
+from app.catalogue.models import Merchant, Product
 from app.notifications.service import (
     NotificationRelatedType,
     NotificationType,
@@ -16,7 +22,9 @@ from app.notifications.service import (
     has_unread_notification,
 )
 from app.orders.service import NotFoundError, phone_lookup_variants
-from app.whatsapp.service import envoyer_message_commercant
+from app.whatsapp.service import envoyer_message_commercant, truncate_wamid
+
+logger = logging.getLogger(__name__)
 
 STATUS_ACTIVE = "active"
 STATUS_ESCALATED = "escalated"
@@ -86,6 +94,157 @@ async def record_sent_product_image(
         SentProductImage(conversation_id=conversation_id, product_id=product_id)
     )
     await db.commit()
+
+
+async def record_whatsapp_message_ref(
+    db: AsyncSession,
+    conversation_id: uuid.UUID,
+    wamid: str | None,
+    kind: str,
+    *,
+    message_id: uuid.UUID | None = None,
+    product_id: uuid.UUID | None = None,
+    excerpt: str | None = None,
+    reply_to_wamid: str | None = None,
+    commit: bool = True,
+) -> None:
+    """Persist a wamid mapping. Never raises: a missing id must not break a turn."""
+    if not wamid or not conversation_id:
+        return
+    try:
+        async with db.begin_nested():
+            db.add(
+                WhatsAppMessageRef(
+                    conversation_id=conversation_id,
+                    wamid=wamid,
+                    kind=kind,
+                    message_id=message_id,
+                    product_id=product_id,
+                    excerpt=excerpt,
+                    reply_to_wamid=reply_to_wamid,
+                )
+            )
+            await db.flush()
+        if commit:
+            await db.commit()
+    except Exception:
+        logger.exception(
+            "Failed to record WhatsApp message ref wamid=%s conversation_id=%s",
+            truncate_wamid(wamid),
+            conversation_id,
+        )
+        if commit:
+            try:
+                await db.rollback()
+            except Exception:
+                logger.exception(
+                    "Rollback after WhatsApp ref persist failed conversation_id=%s",
+                    conversation_id,
+                )
+
+
+async def resolve_quote_marker(
+    db: AsyncSession,
+    conversation_id: uuid.UUID,
+    quoted_wamid: str | None,
+) -> dict[str, str] | None:
+    """Replay marker for one quoted wamid, or None if it cannot be resolved here.
+
+    Looks up the wamid across conversations of the same merchant and the
+    same customer phone. Another customer's or another merchant's row is
+    never resolved.
+    """
+    if not quoted_wamid:
+        return None
+    current = await db.get(Conversation, conversation_id)
+    if current is None:
+        return None
+    variants = phone_lookup_variants(current.customer_phone)
+    result = await db.execute(
+        select(WhatsAppMessageRef)
+        .join(Conversation, Conversation.id == WhatsAppMessageRef.conversation_id)
+        .where(
+            WhatsAppMessageRef.wamid == quoted_wamid,
+            Conversation.merchant_id == current.merchant_id,
+            Conversation.customer_phone.in_(variants),
+        )
+        .order_by(
+            case(
+                (WhatsAppMessageRef.conversation_id == conversation_id, 0),
+                else_=1,
+            ),
+            WhatsAppMessageRef.created_at.desc(),
+        )
+        .limit(1)
+    )
+    quoted = result.scalar_one_or_none()
+    if quoted is None:
+        return None
+    from_earlier = quoted.conversation_id != conversation_id
+    excerpt = quoted.excerpt
+    if not excerpt and quoted.message_id is not None:
+        message = await db.get(Message, quoted.message_id)
+        if message is not None:
+            excerpt = message.display_text
+    product_name = None
+    product_id = quoted.product_id
+    photo_recognition = None
+    if quoted.kind == KIND_CUSTOMER_PHOTO:
+        from app.proofs.service import quoted_customer_photo_recognition
+
+        recognition = await quoted_customer_photo_recognition(
+            db, current.merchant_id, quoted_wamid
+        )
+        if recognition is not None:
+            photo_recognition = recognition.get("state")
+            if recognition.get("product_name"):
+                product_name = recognition["product_name"]
+            if recognition.get("product_id") is not None:
+                product_id = recognition["product_id"]
+    elif product_id is not None:
+        product = await db.get(Product, product_id)
+        if product is not None:
+            product_name = product.name
+    return quote_replay_marker(
+        kind=quoted.kind,
+        excerpt=excerpt,
+        product_name=product_name,
+        product_id=product_id,
+        from_earlier_conversation=from_earlier,
+        photo_recognition=photo_recognition,
+    )
+
+
+async def load_quote_replay_markers(
+    db: AsyncSession,
+    conversation_id: uuid.UUID,
+    messages: list[Message],
+) -> dict[uuid.UUID, dict[str, str]]:
+    """message.id → replay marker, for customer rows that quoted a known wamid."""
+    message_ids = [row.id for row in messages]
+    if not message_ids:
+        return {}
+    inbound = list(
+        (
+            await db.execute(
+                select(WhatsAppMessageRef).where(
+                    WhatsAppMessageRef.conversation_id == conversation_id,
+                    WhatsAppMessageRef.message_id.in_(message_ids),
+                    WhatsAppMessageRef.reply_to_wamid.is_not(None),
+                )
+            )
+        ).scalars().all()
+    )
+    markers: dict[uuid.UUID, dict[str, str]] = {}
+    for ref in inbound:
+        if ref.message_id is None:
+            continue
+        marker = await resolve_quote_marker(
+            db, conversation_id, ref.reply_to_wamid
+        )
+        if marker is not None:
+            markers[ref.message_id] = marker
+    return markers
 
 
 async def fermer_conversation_si_active(
@@ -368,7 +527,7 @@ async def enregistrer_message_commercant(
     conversation_id: uuid.UUID,
     text: str,
     items: list | None = None,
-) -> None:
+) -> Message | None:
     """Persist a merchant message already delivered. Does not commit.
 
     `items` is the replayable Responses API input for the agent. Pass a
@@ -377,16 +536,17 @@ async def enregistrer_message_commercant(
     """
     conversation = await db.get(Conversation, conversation_id)
     if conversation is None:
-        return
-    db.add(
-        Message(
-            conversation_id=conversation.id,
-            turn_role=TURN_ROLE_MERCHANT,
-            display_text=text,
-            items=list(items or []),
-        )
+        return None
+    row = Message(
+        conversation_id=conversation.id,
+        turn_role=TURN_ROLE_MERCHANT,
+        display_text=text,
+        items=list(items or []),
     )
+    db.add(row)
     conversation.updated_at = datetime.now(timezone.utc)
+    await db.flush()
+    return row
 
 
 async def repondre_en_humain(
@@ -406,7 +566,7 @@ async def repondre_en_humain(
         raise ValueError("message must not be empty")
     customer_phone = conversation.customer_phone
     await db.rollback()
-    await envoyer_message_commercant(sender, customer_phone, text)
+    wamid = await envoyer_message_commercant(sender, customer_phone, text)
     conversation = await _owned_conversation(db, merchant_id, conversation_id)
     row = Message(
         conversation_id=conversation.id,
@@ -415,6 +575,16 @@ async def repondre_en_humain(
         items=[item_human_reply(text)],
     )
     db.add(row)
+    await db.flush()
+    await record_whatsapp_message_ref(
+        db,
+        conversation.id,
+        wamid,
+        KIND_SHOP_TEXT,
+        message_id=row.id,
+        excerpt=text,
+        commit=False,
+    )
     conversation.updated_at = datetime.now(timezone.utc)
     await db.commit()
     await db.refresh(row)

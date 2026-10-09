@@ -14,11 +14,23 @@ persisted as a Message row. Older assistant turns that skipped
 from __future__ import annotations
 
 import re
+import uuid
 from typing import Any
 
 PREFIX_BOUTIQUE = "[Boutique]"
 PREFIX_AUTOMATIC = "[Message automatique de la boutique]"
 PHOTO_MARKER_PREFIX = "[Le client a envoyé une photo"
+QUOTE_MARKER_PREFIX = "[Le client répond à"
+
+KIND_SHOP_TEXT = "shop_text"
+KIND_SHOP_PHOTO = "shop_photo"
+KIND_CUSTOMER_TEXT = "customer_text"
+KIND_CUSTOMER_PHOTO = "customer_photo"
+
+PHOTO_RECOGNITION_RECOGNIZED = "recognized"
+PHOTO_RECOGNITION_POSSIBLE = "possible"
+PHOTO_RECOGNITION_UNRECOGNIZED = "unrecognized"
+PHOTO_RECOGNITION_UNANALYSED = "unanalysed"
 
 HANDOVER_DEVELOPER_TEXT = (
     "A member of the shop team answered part of this conversation (see the "
@@ -35,6 +47,108 @@ HANDOVER_DEVELOPER_TEXT = (
 )
 
 _CAPTION_MAX_CHARS = 200
+_QUOTE_EXCERPT_MAX_CHARS = 200
+
+
+def trim_quote_excerpt(text: str, limit: int = _QUOTE_EXCERPT_MAX_CHARS) -> str:
+    collapsed = " ".join((text or "").split())
+    if len(collapsed) <= limit:
+        return collapsed
+    return collapsed[: limit - 1].rstrip() + "…"
+
+
+def _earlier_note(from_earlier_conversation: bool) -> str:
+    if from_earlier_conversation:
+        return " (conversation précédente)"
+    return ""
+
+
+def _customer_photo_marker_text(
+    *,
+    from_earlier_conversation: bool,
+    photo_recognition: str | None,
+    product_name: str | None,
+    product_id: uuid.UUID | None,
+) -> str:
+    name = (product_name or "").strip()
+    if from_earlier_conversation:
+        subject = "son ancienne photo (conversation précédente)"
+    else:
+        subject = "sa propre photo"
+    if photo_recognition == PHOTO_RECOGNITION_RECOGNIZED and name:
+        content = (
+            f"[Le client répond à {subject}, reconnue comme « {name} »]"
+        )
+    elif photo_recognition == PHOTO_RECOGNITION_POSSIBLE and name:
+        content = (
+            f"[Le client répond à {subject}, correspondance possible « {name} »]"
+        )
+    elif photo_recognition == PHOTO_RECOGNITION_UNRECOGNIZED:
+        content = f"[Le client répond à {subject} (non reconnue)]"
+    elif photo_recognition == PHOTO_RECOGNITION_UNANALYSED:
+        content = f"[Le client répond à {subject} (non analysée)]"
+    else:
+        content = f"[Le client répond à {subject}]"
+    if product_id is not None and photo_recognition in {
+        PHOTO_RECOGNITION_RECOGNIZED,
+        PHOTO_RECOGNITION_POSSIBLE,
+    }:
+        content += f" (product_id={product_id})"
+    return content
+
+
+def quote_replay_marker(
+    *,
+    kind: str,
+    excerpt: str | None = None,
+    product_name: str | None = None,
+    product_id: uuid.UUID | None = None,
+    from_earlier_conversation: bool = False,
+    photo_recognition: str | None = None,
+) -> dict[str, str] | None:
+    """Replay-only user item describing what the customer quoted. None if unusable."""
+    earlier = _earlier_note(from_earlier_conversation)
+    if kind == KIND_SHOP_PHOTO:
+        name = (product_name or "").strip()
+        if not name:
+            return None
+        content = (
+            "[Le client répond à la photo du produit "
+            f"« {name} » envoyée par la boutique{earlier}]"
+        )
+        if product_id is not None:
+            content += f" (product_id={product_id})"
+        return {"role": "user", "content": content}
+    if kind == KIND_CUSTOMER_PHOTO:
+        return {
+            "role": "user",
+            "content": _customer_photo_marker_text(
+                from_earlier_conversation=from_earlier_conversation,
+                photo_recognition=photo_recognition,
+                product_name=product_name,
+                product_id=product_id,
+            ),
+        }
+    clipped = trim_quote_excerpt(excerpt or "")
+    if not clipped:
+        return None
+    if kind == KIND_CUSTOMER_TEXT:
+        return {
+            "role": "user",
+            "content": (
+                "[Le client répond à son propre message"
+                f"{earlier} : « {clipped} »]"
+            ),
+        }
+    if kind == KIND_SHOP_TEXT:
+        return {
+            "role": "user",
+            "content": (
+                "[Le client répond à ce message de la boutique"
+                f"{earlier} : « {clipped} »]"
+            ),
+        }
+    return None
 
 
 def item_human_reply(text: str) -> dict[str, str]:

@@ -14,6 +14,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.handover import (
+    KIND_CUSTOMER_TEXT,
     handover_developer_item,
     item_customer_text,
     rewrite_outdated_quantity_skips,
@@ -25,7 +26,10 @@ from app.agent.service import (
     STATUS_CLOSED,
     STATUS_ESCALATED,
     TURN_ROLE_CUSTOMER,
+    load_quote_replay_markers,
     notifier_message_escalade,
+    record_whatsapp_message_ref,
+    resolve_quote_marker,
     trouver_conversation_escaladee,
     trouver_conversation_ouverte,
 )
@@ -58,19 +62,29 @@ def _get_client() -> AsyncOpenAI:
     return _client
 
 
-def history_items_from_messages(messages: list[Message]) -> list[Any]:
+def history_items_from_messages(
+    messages: list[Message],
+    quote_markers: dict[uuid.UUID, dict[str, str]] | None = None,
+) -> list[Any]:
     prior_items: list[Any] = []
+    markers = quote_markers or {}
     for message in messages:
+        marker = markers.get(message.id)
+        if marker is not None:
+            prior_items.append(marker)
         for item in message.items or []:
             if _is_replayable_history_item(item):
                 prior_items.append(item)
     return prior_items
 
 
-def prior_items_for_agent(messages: list[Message]) -> list[Any]:
+def prior_items_for_agent(
+    messages: list[Message],
+    quote_markers: dict[uuid.UUID, dict[str, str]] | None = None,
+) -> list[Any]:
     """Replayable history plus at most one handover developer note."""
     prior_items = rewrite_outdated_quantity_skips(
-        history_items_from_messages(messages)
+        history_items_from_messages(messages, quote_markers)
     )
     note = handover_developer_item(prior_items)
     if note is not None:
@@ -307,14 +321,27 @@ async def _store_escalated_inbound(
     merchant_id: uuid.UUID,
     customer_phone: str,
     message_text: str,
+    *,
+    inbound_whatsapp_message_id: str | None = None,
+    reply_to_message_id: str | None = None,
 ) -> None:
-    db.add(
-        Message(
-            conversation_id=conversation.id,
-            turn_role=TURN_ROLE_CUSTOMER,
-            display_text=message_text,
-            items=[item_customer_text(message_text)],
-        )
+    row = Message(
+        conversation_id=conversation.id,
+        turn_role=TURN_ROLE_CUSTOMER,
+        display_text=message_text,
+        items=[item_customer_text(message_text)],
+    )
+    db.add(row)
+    await db.flush()
+    await record_whatsapp_message_ref(
+        db,
+        conversation.id,
+        inbound_whatsapp_message_id,
+        KIND_CUSTOMER_TEXT,
+        message_id=row.id,
+        excerpt=message_text,
+        reply_to_wamid=reply_to_message_id,
+        commit=False,
     )
     conversation.updated_at = datetime.now(timezone.utc)
     await notifier_message_escalade(db, merchant_id, conversation, customer_phone)
@@ -381,6 +408,9 @@ async def traiter_message_entrant(
     customer_phone: str,
     message_text: str,
     now: datetime | None = None,
+    *,
+    inbound_whatsapp_message_id: str | None = None,
+    reply_to_message_id: str | None = None,
 ) -> str | None:
     """Process one inbound customer message and return the agent reply text.
 
@@ -398,7 +428,13 @@ async def traiter_message_entrant(
     escalated = await trouver_conversation_escaladee(db, merchant_id, phone)
     if escalated is not None:
         await _store_escalated_inbound(
-            db, escalated, merchant_id, phone, message_text
+            db,
+            escalated,
+            merchant_id,
+            phone,
+            message_text,
+            inbound_whatsapp_message_id=inbound_whatsapp_message_id,
+            reply_to_message_id=reply_to_message_id,
         )
         return None
 
@@ -409,25 +445,43 @@ async def traiter_message_entrant(
         .where(Message.conversation_id == conversation.id)
         .order_by(Message.created_at, Message.id)
     )
-    prior_items = prior_items_for_agent(list(history.scalars().all()))
+    history_rows = list(history.scalars().all())
+    quote_markers = await load_quote_replay_markers(
+        db, conversation.id, history_rows
+    )
+    prior_items = prior_items_for_agent(history_rows, quote_markers)
+    current_quote = await resolve_quote_marker(
+        db, conversation.id, reply_to_message_id
+    )
 
     customer_item = {"role": "user", "content": message_text}
-    db.add(
-        Message(
-            conversation_id=conversation.id,
-            turn_role="customer",
-            display_text=message_text,
-            items=[customer_item],
-        )
+    row = Message(
+        conversation_id=conversation.id,
+        turn_role="customer",
+        display_text=message_text,
+        items=[customer_item],
+    )
+    db.add(row)
+    await db.flush()
+    await record_whatsapp_message_ref(
+        db,
+        conversation.id,
+        inbound_whatsapp_message_id,
+        KIND_CUSTOMER_TEXT,
+        message_id=row.id,
+        excerpt=message_text,
+        reply_to_wamid=reply_to_message_id,
+        commit=False,
     )
     await db.commit()
 
     system_item = await _system_prompt_item(db, merchant_id, merchant.name, now)
+    quoted_prefix = [current_quote] if current_quote is not None else []
     return await _invoke_agent_and_store(
         db,
         merchant_id=merchant_id,
         conversation=conversation,
-        input_list=[system_item, *prior_items, customer_item],
+        input_list=[system_item, *prior_items, *quoted_prefix, customer_item],
         persist_prefix=[],
     )
 
@@ -456,7 +510,11 @@ async def traiter_photo_produit(
         .where(Message.conversation_id == conversation.id)
         .order_by(Message.created_at, Message.id)
     )
-    prior_items = prior_items_for_agent(list(history.scalars().all()))
+    history_rows = list(history.scalars().all())
+    quote_markers = await load_quote_replay_markers(
+        db, conversation.id, history_rows
+    )
+    prior_items = prior_items_for_agent(history_rows, quote_markers)
     system_item = await _system_prompt_item(db, merchant_id, merchant.name, now)
     return await _invoke_agent_and_store(
         db,

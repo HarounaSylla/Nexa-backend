@@ -9,15 +9,16 @@ import pytest
 from app.agent.models import Conversation, Message
 from app.agent.service import escalader_vers_humain
 from app.agent.images import extract_product_images, product_names_from_items
-from app.agent.tools import _stock_status, execute_tool
+from app.agent.tools import TOOLS, _stock_status, execute_tool
 from app.catalogue.models import Merchant, Product, ProductImage
 from app.catalogue.service import lister_produits_populaires
 from app.core.db import AsyncSessionLocal
 from app.notifications.models import Notification
 from app.merchants.service import MerchantPreferencesData, update_preferences
 from app.orders.models import DeliveryZone, Order, OrderItem, PaymentMethod, StockMovement
-from app.orders.service import creer_commande, normalize_city
+from app.orders.service import creer_commande, normalize_city, order_total
 from sqlalchemy import delete, select
+from sqlalchemy.orm import selectinload
 
 
 async def _cleanup_merchant(db, merchant_id: uuid.UUID) -> None:
@@ -853,3 +854,173 @@ async def test_execute_tool_creer_commande_rejects_unaccepted_payment_method() -
             assert dashboard.payment_method == PaymentMethod.online
         finally:
             await _cleanup_merchant(db, merchant.id)
+
+
+def test_calculer_total_commande_schema_is_strict() -> None:
+    spec = next(item for item in TOOLS if item["name"] == "calculer_total_commande")
+    assert spec["strict"] is True
+    assert spec["parameters"]["additionalProperties"] is False
+    assert spec["parameters"]["required"] == ["items"]
+    item_schema = spec["parameters"]["properties"]["items"]["items"]
+    assert item_schema["required"] == ["product_id", "quantity"]
+    assert item_schema["additionalProperties"] is False
+
+
+@pytest.mark.asyncio
+async def test_calculer_total_commande_matches_order_and_rejects_foreign() -> None:
+    async with AsyncSessionLocal() as db:
+        merchant = Merchant(name=f"pytest-total-{uuid.uuid4()}")
+        other = Merchant(name=f"pytest-total-other-{uuid.uuid4()}")
+        db.add_all([merchant, other])
+        await db.flush()
+        watch = Product(
+            merchant_id=merchant.id,
+            name="Article A test total",
+            price=Decimal("9500.00"),
+            stock_qty=8,
+        )
+        bag = Product(
+            merchant_id=merchant.id,
+            name="Article B test total",
+            price=Decimal("22000.00"),
+            stock_qty=8,
+        )
+        foreign = Product(
+            merchant_id=other.id,
+            name="Article autre boutique",
+            price=Decimal("99999.00"),
+            stock_qty=8,
+        )
+        conversation = Conversation(
+            merchant_id=merchant.id,
+            customer_phone="+221770009401",
+            status="active",
+        )
+        db.add_all(
+            [
+                watch,
+                bag,
+                foreign,
+                conversation,
+                DeliveryZone(
+                    merchant_id=merchant.id,
+                    city="Dakar",
+                    city_normalized=normalize_city("Dakar"),
+                    available=True,
+                    min_delivery_hours=24,
+                    max_delivery_hours=48,
+                ),
+            ]
+        )
+        await db.commit()
+        merchant_id = merchant.id
+        other_id = other.id
+        try:
+            raw = await execute_tool(
+                db,
+                "calculer_total_commande",
+                {
+                    "items": [
+                        {"product_id": str(watch.id), "quantity": 1},
+                        {"product_id": str(bag.id), "quantity": 1},
+                    ]
+                },
+                merchant_id,
+                conversation.id,
+            )
+            payload = json.loads(raw)
+            assert payload["status"] == "ok"
+            assert payload["articles_total"] == "31500.00"
+            assert payload["articles_total_display"] == "31 500 F"
+            by_id = {row["product_id"]: row for row in payload["lines"]}
+            assert by_id[str(watch.id)]["subtotal"] == "9500.00"
+            assert by_id[str(bag.id)]["subtotal"] == "22000.00"
+            assert by_id[str(watch.id)]["quantity"] == 1
+            qty2 = json.loads(
+                await execute_tool(
+                    db,
+                    "calculer_total_commande",
+                    {
+                        "items": [
+                            {"product_id": str(bag.id), "quantity": 2},
+                        ]
+                    },
+                    merchant_id,
+                    conversation.id,
+                )
+            )
+            assert qty2["articles_total"] == "44000.00"
+            assert qty2["lines"][0]["subtotal"] == "44000.00"
+
+            stock_before = (
+                await db.execute(select(Product.stock_qty).where(Product.id == watch.id))
+            ).scalar_one()
+            orders_before = list(
+                (
+                    await db.execute(select(Order).where(Order.merchant_id == merchant_id))
+                ).scalars().all()
+            )
+            movements_before = list(
+                (
+                    await db.execute(
+                        select(StockMovement).where(StockMovement.product_id == watch.id)
+                    )
+                ).scalars().all()
+            )
+            assert stock_before == 8
+            assert orders_before == []
+            assert movements_before == []
+
+            unknown = json.loads(
+                await execute_tool(
+                    db,
+                    "calculer_total_commande",
+                    {
+                        "items": [
+                            {"product_id": str(uuid.uuid4()), "quantity": 1},
+                        ]
+                    },
+                    merchant_id,
+                    conversation.id,
+                )
+            )
+            assert "error" in unknown
+            assert "99999" not in unknown["error"]
+            foreign_raw = json.loads(
+                await execute_tool(
+                    db,
+                    "calculer_total_commande",
+                    {
+                        "items": [
+                            {"product_id": str(foreign.id), "quantity": 1},
+                        ]
+                    },
+                    merchant_id,
+                    conversation.id,
+                )
+            )
+            assert "error" in foreign_raw
+            assert "99999" not in foreign_raw["error"]
+            assert "Article autre boutique" not in foreign_raw["error"]
+
+            created = await creer_commande(
+                db,
+                merchant_id=merchant_id,
+                customer_phone="+221770009401",
+                items=[(watch.id, 1), (bag.id, 1)],
+                payment_method=PaymentMethod.cash_on_delivery,
+                delivery_address="Parcelles",
+                ville="Dakar",
+            )
+            loaded = (
+                await db.execute(
+                    select(Order)
+                    .options(selectinload(Order.items))
+                    .where(Order.id == created.id)
+                )
+            ).scalar_one()
+            assert order_total(list(loaded.items)) == Decimal(payload["articles_total"])
+        finally:
+            await db.rollback()
+            await _cleanup_merchant(db, merchant_id)
+            await _cleanup_merchant(db, other_id)

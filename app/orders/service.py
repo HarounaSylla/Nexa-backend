@@ -93,6 +93,77 @@ def _aggregate_quantities(items: list[tuple[uuid.UUID, int]]) -> dict[uuid.UUID,
     return dict(quantities)
 
 
+def _article_line_totals(
+    products: dict[uuid.UUID, Product],
+    quantities: dict[uuid.UUID, int],
+) -> tuple[list[dict], Decimal]:
+    """Per-line subtotals and the articles total from catalogue prices.
+
+    Shared by order creation and the read-only recap tool so the two
+    cannot diverge. Does not add delivery fees.
+    """
+    lines: list[dict] = []
+    total = Decimal("0.00")
+    for product_id in sorted(quantities):
+        product = products[product_id]
+        if product.price is None:
+            raise ValueError(
+                f"Product {product_id} has no price; cannot snapshot unit_price"
+            )
+        quantity = quantities[product_id]
+        unit_price = Decimal(product.price)
+        subtotal = unit_price * quantity
+        total += subtotal
+        lines.append(
+            {
+                "product_id": product_id,
+                "quantity": quantity,
+                "unit_price": unit_price,
+                "subtotal": subtotal,
+            }
+        )
+    return lines, total
+
+
+async def calculer_total_commande(
+    db: AsyncSession,
+    merchant_id: uuid.UUID,
+    items: list[tuple[uuid.UUID, int]],
+) -> dict[str, object]:
+    """Read-only articles total for this merchant's cart, same prices as orders.
+
+    Unknown products and another merchant's products raise NotFoundError
+    with no price. Writes nothing.
+    """
+    quantities = _aggregate_quantities(items)
+    product_ids = sorted(quantities)
+    result = await db.execute(
+        select(Product).where(
+            Product.id.in_(product_ids),
+            Product.merchant_id == merchant_id,
+        )
+    )
+    found = {product.id: product for product in result.scalars().all()}
+    missing = [product_id for product_id in product_ids if product_id not in found]
+    if missing:
+        raise NotFoundError("Product was not found")
+    lines, total = _article_line_totals(found, quantities)
+    return {
+        "status": "ok",
+        "lines": [
+            {
+                "product_id": str(line["product_id"]),
+                "quantity": line["quantity"],
+                "unit_price": str(line["unit_price"]),
+                "subtotal": str(line["subtotal"]),
+            }
+            for line in lines
+        ],
+        "articles_total": str(total),
+        "articles_total_display": format_fcfa(total).replace(" FCFA", " F"),
+    }
+
+
 async def _lock_merchant(db: AsyncSession, merchant_id: uuid.UUID) -> Merchant:
     """Lock the merchant row so order_number assignment cannot collide.
 
@@ -299,19 +370,19 @@ async def creer_commande(
         db.add(order)
         await db.flush()
 
-        total = Decimal("0.00")
+        lines, total = _article_line_totals(products, quantities)
         out_of_stock: list[Product] = []
-        for product_id in product_ids:
+        for line in lines:
+            product_id = line["product_id"]
             product = products[product_id]
-            requested = quantities[product_id]
+            requested = line["quantity"]
             product.stock_qty -= requested
-            total += Decimal(product.price) * requested
             db.add(
                 OrderItem(
                     order_id=order.id,
                     product_id=product_id,
                     quantity=requested,
-                    unit_price=Decimal(product.price),
+                    unit_price=line["unit_price"],
                 )
             )
             db.add(
@@ -780,8 +851,11 @@ async def envoyer_lien_paiement(
     order_id: uuid.UUID,
     payment_link_id: uuid.UUID,
 ) -> Order:
-    from app.agent.handover import item_automatic_payment_link
-    from app.agent.service import enregistrer_message_commercant
+    from app.agent.handover import KIND_SHOP_TEXT, item_automatic_payment_link
+    from app.agent.service import (
+        enregistrer_message_commercant,
+        record_whatsapp_message_ref,
+    )
     from app.merchants.service import obtenir_lien_paiement
     from app.whatsapp.service import envoyer_message_commercant
 
@@ -820,17 +894,27 @@ async def envoyer_lien_paiement(
     )
     await db.rollback()
 
-    await envoyer_message_commercant(sender, customer_phone, text)
+    wamid = await envoyer_message_commercant(sender, customer_phone, text)
 
     order = await _owned_order(db, merchant_id, order_id)
     order.payment_link_sent_at = datetime.now(timezone.utc)
     if conversation_id is not None:
-        await enregistrer_message_commercant(
+        stored = await enregistrer_message_commercant(
             db,
             conversation_id,
             text,
             items=[item_automatic_payment_link(snapshot_label, order.order_number)],
         )
+        if stored is not None:
+            await record_whatsapp_message_ref(
+                db,
+                conversation_id,
+                wamid,
+                KIND_SHOP_TEXT,
+                message_id=stored.id,
+                excerpt=text,
+                commit=False,
+            )
     await db.commit()
 
     result = await db.execute(
