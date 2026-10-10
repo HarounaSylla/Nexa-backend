@@ -10,8 +10,16 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.agent.models import Conversation, Message
 from app.agent.orchestrator import traiter_message_entrant
 from app.agent.images import ProductImageRef, extract_product_images
+from app.agent.handover import (
+    KIND_CUSTOMER_PHOTO,
+    KIND_CUSTOMER_TEXT,
+    KIND_SHOP_PHOTO,
+    KIND_SHOP_TEXT,
+    trim_quote_excerpt,
+)
 from app.agent.service import (
     ConversationNotEscalatedError,
+    citations_pour_messages,
     lister_conversations_commercant,
     lister_messages,
     lister_messages_commercant,
@@ -95,6 +103,19 @@ class MessageImageOut(BaseModel):
     match_kind: Literal["exact", "similar"] | None = None
 
 
+class QuotedMessageOut(BaseModel):
+    kind: Literal[
+        "shop_text",
+        "shop_photo",
+        "customer_text",
+        "customer_photo",
+    ]
+    excerpt: str | None = None
+    product_name: str | None = None
+    from_earlier_conversation: bool
+    message_id: uuid.UUID | None = None
+
+
 def _verdict_for_matched_product(image: InboundImage) -> str | None:
     if image.matched_product_id is None:
         return None
@@ -118,6 +139,33 @@ def _match_kind_for_image(image: InboundImage) -> Literal["exact", "similar"] | 
     if verdict == "same" or image.match_level == "strong":
         return "exact"
     return None
+
+
+_QUOTED_KINDS = {
+    KIND_SHOP_TEXT,
+    KIND_SHOP_PHOTO,
+    KIND_CUSTOMER_TEXT,
+    KIND_CUSTOMER_PHOTO,
+}
+
+
+def _quoted_message_out(info) -> QuotedMessageOut | None:
+    if info.kind not in _QUOTED_KINDS:
+        return None
+    raw = info.excerpt
+    if info.kind in {KIND_SHOP_PHOTO, KIND_CUSTOMER_PHOTO} and not (raw or "").strip():
+        excerpt = None
+    else:
+        excerpt = trim_quote_excerpt(raw) if raw else None
+        if not excerpt:
+            excerpt = None
+    return QuotedMessageOut(
+        kind=info.kind,
+        excerpt=excerpt,
+        product_name=info.product_name,
+        from_earlier_conversation=info.from_earlier_conversation,
+        message_id=info.message_id,
+    )
 
 
 def _message_image_out(
@@ -145,6 +193,7 @@ class MerchantMessageOut(BaseModel):
     display_text: str
     created_at: datetime
     image: MessageImageOut | None = None
+    quoted: QuotedMessageOut | None = None
 
 
 class HumanReplyRequest(BaseModel):
@@ -284,12 +333,16 @@ async def get_merchant_conversation_messages(
             if image.matched_product_id is not None
         ],
     )
+    citations = await citations_pour_messages(
+        db, conversation_id, [message.id for message in messages]
+    )
     out: list[MerchantMessageOut] = []
     for message in messages:
         image = images.get(message.id)
         image_out = None
         if image is not None:
             image_out = _message_image_out(image, names)
+        quoted_info = citations.get(message.id)
         out.append(
             MerchantMessageOut(
                 id=message.id,
@@ -297,6 +350,11 @@ async def get_merchant_conversation_messages(
                 display_text=message.display_text,
                 created_at=message.created_at,
                 image=image_out,
+                quoted=(
+                    _quoted_message_out(quoted_info)
+                    if quoted_info is not None
+                    else None
+                ),
             )
         )
     return out

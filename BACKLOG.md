@@ -147,6 +147,7 @@ and aggregates duplicate product ids.
 - Passing the customer image itself into the agent model (multimodal turn) as an alternative to the classifier + Voyage + verifier + `analyser_photo_client` tool. Today the model never sees pixels.
 - Caption-only intent (text "vous avez cette robe?" without a photo) is unchanged text search — not visual search
 - Frontend: show "Produit reconnu : …" on a `product_photo` in the conversation thread (`thread-panel.tsx` currently returns null). Backend `GET /conversations/{id}/messages` now sends `match_level`, `matched_product_id`, `matched_product_name`, `match_kind`.
+- Frontend: show the quoted message ("en réponse à") from `quoted` on `GET /conversations/{id}/messages` (`QuotedMessageOut`: kind / excerpt / product_name / from_earlier_conversation / message_id). Backend already sends it.
 - Frontend: map `product_photo_unrecognized` in `notification-copy.ts` (unknown types render as the raw `item.type` string, not `data.title`). Not in step 2b.
 - Tune fallback `image_match_*` cutoffs from real `inbound_images.match_candidates` (still used when verification is off or fails). Retrieval cutoff is 0.65; decision is the vision verifier.
 

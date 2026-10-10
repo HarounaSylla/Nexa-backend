@@ -46,6 +46,7 @@ line, screenshot, or database check) in the Proof column.
 | P1 | Product photo: embeddings shortlist + vision verify (step 2b) | Passed | 2026-10-07. Retrieval 9/9 positives in top 4 at ≤0.65. Verify decides; never `strong` without it. `pytest` **198 passed** (11 new). Compare A vs B + pipeline `Nexa/proofs/photo-recognition/run_verify_compare.py`. Cleanup leftover 0 on +221770099041…044. §33. |
 | P1 | Thread images expose visual-search match (`MessageImageOut`) | Passed | 2026-10-07. `GET /conversations/{id}/messages` adds `match_level`, `matched_product_id`, `matched_product_name`, `match_kind`. `pytest` **202 passed** (4 new). Proof `Nexa/proofs/thread_image_match.py` on Awa +221770099051. Cleanup leftover 0. §34. |
 | P1 | Burst batching: several rapid WhatsApp messages → one agent turn and one reply | Not started | Code + unit tests landed (`pytest` **266 passed**). Live phone checks in §37. Worker must be started with the scheduler. |
+| P1 | Thread messages expose the quoted WhatsApp message (`quoted`) | Not started | Code + unit tests landed (`pytest` **273 passed**). Live check in §38. |
 
 ## RAG query / result pairs (2026-09-07, `voyage-4-lite`)
 
@@ -1305,6 +1306,23 @@ default to quiet 3.0 s and max wait 10.0 s.
    reply by the max wait, not an endless delay.
 5. Confirm the worker was started with the scheduler: the log shows the
    delayed flush job (`flush_conversation`), not only inbound ingest.
+
+## 38. Quoted message on the merchant thread API
+
+`GET /conversations/{id}/messages` now includes optional `quoted` on each
+`MerchantMessageOut`: `kind` (`shop_text` / `shop_photo` / `customer_text`
+/ `customer_photo`), `excerpt` (trimmed, null for a photo without text),
+`product_name` (shop photo, or a recognised customer photo),
+`from_earlier_conversation`, `message_id` (only when the quoted row is in
+this conversation). Unresolvable or foreign wamids stay `null`. No schema
+change. Lookup is batched and scoped to the same merchant + customer
+phone as the agent marker.
+
+`pytest` **273 passed in 35.00s** (7 new in
+`tests/test_conversation_quoted_messages.py`). Throwaway:
+`uv run python ../proofs/thread_quoted_message.py` on Boutique Awa,
+phone +221770099091, Clerk stubbed. Frontend display of `quoted` is not
+in this change.
 
 
 

@@ -95,24 +95,11 @@ MAX_IMAGE_ANALYSES_PER_PHONE_PER_DAY = 10
 _SIMILAR_LEVELS = {MATCH_LEVEL_POSSIBLE, "similar", VERDICT_SIMILAR}
 
 
-async def quoted_customer_photo_recognition(
-    db: AsyncSession,
+def _recognition_from_inbound_image(
+    image: InboundImage,
+    product: Product | None,
     merchant_id: uuid.UUID,
-    wamid: str,
-) -> dict[str, Any] | None:
-    """Recognition stored for a customer-photo wamid, scoped to this merchant.
-
-    Never includes URLs, paths, or bytes. None if there is no inbound row.
-    """
-    result = await db.execute(
-        select(InboundImage).where(
-            InboundImage.whatsapp_message_id == wamid,
-            InboundImage.merchant_id == merchant_id,
-        )
-    )
-    image = result.scalar_one_or_none()
-    if image is None:
-        return None
+) -> dict[str, Any]:
     if image.classification != CLASSIFICATION_PRODUCT_PHOTO:
         return {"state": PHOTO_RECOGNITION_UNANALYSED}
     level = (image.match_level or "").strip().lower()
@@ -121,7 +108,6 @@ async def quoted_customer_photo_recognition(
     product_id = image.matched_product_id
     product_name = None
     if product_id is not None:
-        product = await db.get(Product, product_id)
         if product is None or product.merchant_id != merchant_id:
             product_id = None
         else:
@@ -139,6 +125,64 @@ async def quoted_customer_photo_recognition(
         "product_id": product_id,
         "product_name": product_name,
     }
+
+
+async def quoted_customer_photo_recognitions(
+    db: AsyncSession,
+    merchant_id: uuid.UUID,
+    wamids: list[str],
+) -> dict[str, dict[str, Any]]:
+    """Recognition for many customer-photo wamids, scoped to this merchant.
+
+    One inbound-image query and one product query. Never includes URLs,
+    paths, or bytes. Missing wamids are omitted.
+    """
+    wanted = [item for item in dict.fromkeys(wamids) if item]
+    if not wanted:
+        return {}
+    images = list(
+        (
+            await db.execute(
+                select(InboundImage).where(
+                    InboundImage.whatsapp_message_id.in_(wanted),
+                    InboundImage.merchant_id == merchant_id,
+                )
+            )
+        ).scalars().all()
+    )
+    product_ids = [
+        image.matched_product_id
+        for image in images
+        if image.matched_product_id is not None
+    ]
+    products: dict[uuid.UUID, Product] = {}
+    if product_ids:
+        rows = await db.execute(select(Product).where(Product.id.in_(product_ids)))
+        products = {row.id: row for row in rows.scalars().all()}
+    out: dict[str, dict[str, Any]] = {}
+    for image in images:
+        product = (
+            products.get(image.matched_product_id)
+            if image.matched_product_id is not None
+            else None
+        )
+        out[image.whatsapp_message_id] = _recognition_from_inbound_image(
+            image, product, merchant_id
+        )
+    return out
+
+
+async def quoted_customer_photo_recognition(
+    db: AsyncSession,
+    merchant_id: uuid.UUID,
+    wamid: str,
+) -> dict[str, Any] | None:
+    """Recognition stored for a customer-photo wamid, scoped to this merchant.
+
+    Never includes URLs, paths, or bytes. None if there is no inbound row.
+    """
+    found = await quoted_customer_photo_recognitions(db, merchant_id, [wamid])
+    return found.get(wamid)
 
 
 PHOTO_ANALYSE_LOOKBACK = timedelta(hours=24)

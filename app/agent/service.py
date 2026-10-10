@@ -2,6 +2,7 @@
 
 import logging
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import case, func, select, update
@@ -9,6 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.agent.handover import (
     KIND_CUSTOMER_PHOTO,
+    KIND_SHOP_PHOTO,
     KIND_SHOP_TEXT,
     item_human_reply,
     quote_replay_marker,
@@ -143,6 +145,172 @@ async def record_whatsapp_message_ref(
                 )
 
 
+@dataclass(frozen=True)
+class QuotedRef:
+    """Resolved target of a WhatsApp quote, scoped to merchant + customer phone."""
+
+    kind: str
+    excerpt: str | None
+    product_name: str | None
+    product_id: uuid.UUID | None
+    from_earlier_conversation: bool
+    message_id: uuid.UUID | None
+    photo_recognition: str | None
+
+
+async def lookup_quoted_refs(
+    db: AsyncSession,
+    conversation_id: uuid.UUID,
+    quoted_wamids: list[str],
+) -> dict[str, QuotedRef]:
+    """Resolve quoted wamids for one conversation in a bounded number of queries.
+
+    Same merchant + customer-phone scope and current-conversation-first
+    rule as the agent marker. Another customer's or another merchant's
+    row is never returned.
+    """
+    wanted = [item for item in dict.fromkeys(quoted_wamids) if item]
+    if not wanted:
+        return {}
+    current = await db.get(Conversation, conversation_id)
+    if current is None:
+        return {}
+    variants = phone_lookup_variants(current.customer_phone)
+    rows = list(
+        (
+            await db.execute(
+                select(WhatsAppMessageRef)
+                .join(
+                    Conversation,
+                    Conversation.id == WhatsAppMessageRef.conversation_id,
+                )
+                .where(
+                    WhatsAppMessageRef.wamid.in_(wanted),
+                    Conversation.merchant_id == current.merchant_id,
+                    Conversation.customer_phone.in_(variants),
+                )
+                .order_by(
+                    case(
+                        (WhatsAppMessageRef.conversation_id == conversation_id, 0),
+                        else_=1,
+                    ),
+                    WhatsAppMessageRef.created_at.desc(),
+                )
+            )
+        ).scalars().all()
+    )
+    chosen: dict[str, WhatsAppMessageRef] = {}
+    for row in rows:
+        if row.wamid not in chosen:
+            chosen[row.wamid] = row
+    if not chosen:
+        return {}
+
+    message_ids = [
+        row.message_id for row in chosen.values() if row.message_id is not None
+    ]
+    messages: dict[uuid.UUID, Message] = {}
+    if message_ids:
+        found = await db.execute(select(Message).where(Message.id.in_(message_ids)))
+        messages = {row.id: row for row in found.scalars().all()}
+
+    shop_product_ids = [
+        row.product_id
+        for row in chosen.values()
+        if row.kind != KIND_CUSTOMER_PHOTO and row.product_id is not None
+    ]
+    products: dict[uuid.UUID, Product] = {}
+    if shop_product_ids:
+        found = await db.execute(select(Product).where(Product.id.in_(shop_product_ids)))
+        products = {row.id: row for row in found.scalars().all()}
+
+    photo_wamids = [
+        wamid for wamid, row in chosen.items() if row.kind == KIND_CUSTOMER_PHOTO
+    ]
+    recognitions: dict[str, dict] = {}
+    if photo_wamids:
+        from app.proofs.service import quoted_customer_photo_recognitions
+
+        recognitions = await quoted_customer_photo_recognitions(
+            db, current.merchant_id, photo_wamids
+        )
+
+    resolved: dict[str, QuotedRef] = {}
+    for wamid, row in chosen.items():
+        message = messages.get(row.message_id) if row.message_id is not None else None
+        excerpt = row.excerpt
+        if not excerpt and message is not None:
+            excerpt = message.display_text
+        product_name = None
+        product_id = row.product_id
+        photo_recognition = None
+        if row.kind == KIND_CUSTOMER_PHOTO:
+            recognition = recognitions.get(wamid)
+            if recognition is not None:
+                photo_recognition = recognition.get("state")
+                if recognition.get("product_name"):
+                    product_name = recognition["product_name"]
+                if recognition.get("product_id") is not None:
+                    product_id = recognition["product_id"]
+        elif product_id is not None:
+            product = products.get(product_id)
+            if product is not None:
+                product_name = product.name
+        same_conversation = row.conversation_id == conversation_id
+        linked_id = row.message_id if same_conversation else None
+        if (
+            linked_id is not None
+            and message is not None
+            and message.conversation_id != conversation_id
+        ):
+            linked_id = None
+        resolved[wamid] = QuotedRef(
+            kind=row.kind,
+            excerpt=excerpt,
+            product_name=product_name,
+            product_id=product_id,
+            from_earlier_conversation=not same_conversation,
+            message_id=linked_id,
+            photo_recognition=photo_recognition,
+        )
+    return resolved
+
+
+async def citations_pour_messages(
+    db: AsyncSession,
+    conversation_id: uuid.UUID,
+    message_ids: list[uuid.UUID],
+) -> dict[uuid.UUID, QuotedRef]:
+    """message.id → quoted target for inbound refs that have reply_to_wamid."""
+    if not message_ids:
+        return {}
+    inbound = list(
+        (
+            await db.execute(
+                select(WhatsAppMessageRef).where(
+                    WhatsAppMessageRef.conversation_id == conversation_id,
+                    WhatsAppMessageRef.message_id.in_(message_ids),
+                    WhatsAppMessageRef.reply_to_wamid.is_not(None),
+                )
+            )
+        ).scalars().all()
+    )
+    wamids = [
+        row.reply_to_wamid
+        for row in inbound
+        if row.reply_to_wamid and row.message_id is not None
+    ]
+    targets = await lookup_quoted_refs(db, conversation_id, wamids)
+    out: dict[uuid.UUID, QuotedRef] = {}
+    for row in inbound:
+        if row.message_id is None or not row.reply_to_wamid:
+            continue
+        target = targets.get(row.reply_to_wamid)
+        if target is not None:
+            out[row.message_id] = target
+    return out
+
+
 async def resolve_quote_marker(
     db: AsyncSession,
     conversation_id: uuid.UUID,
@@ -156,62 +324,17 @@ async def resolve_quote_marker(
     """
     if not quoted_wamid:
         return None
-    current = await db.get(Conversation, conversation_id)
-    if current is None:
-        return None
-    variants = phone_lookup_variants(current.customer_phone)
-    result = await db.execute(
-        select(WhatsAppMessageRef)
-        .join(Conversation, Conversation.id == WhatsAppMessageRef.conversation_id)
-        .where(
-            WhatsAppMessageRef.wamid == quoted_wamid,
-            Conversation.merchant_id == current.merchant_id,
-            Conversation.customer_phone.in_(variants),
-        )
-        .order_by(
-            case(
-                (WhatsAppMessageRef.conversation_id == conversation_id, 0),
-                else_=1,
-            ),
-            WhatsAppMessageRef.created_at.desc(),
-        )
-        .limit(1)
-    )
-    quoted = result.scalar_one_or_none()
+    found = await lookup_quoted_refs(db, conversation_id, [quoted_wamid])
+    quoted = found.get(quoted_wamid)
     if quoted is None:
         return None
-    from_earlier = quoted.conversation_id != conversation_id
-    excerpt = quoted.excerpt
-    if not excerpt and quoted.message_id is not None:
-        message = await db.get(Message, quoted.message_id)
-        if message is not None:
-            excerpt = message.display_text
-    product_name = None
-    product_id = quoted.product_id
-    photo_recognition = None
-    if quoted.kind == KIND_CUSTOMER_PHOTO:
-        from app.proofs.service import quoted_customer_photo_recognition
-
-        recognition = await quoted_customer_photo_recognition(
-            db, current.merchant_id, quoted_wamid
-        )
-        if recognition is not None:
-            photo_recognition = recognition.get("state")
-            if recognition.get("product_name"):
-                product_name = recognition["product_name"]
-            if recognition.get("product_id") is not None:
-                product_id = recognition["product_id"]
-    elif product_id is not None:
-        product = await db.get(Product, product_id)
-        if product is not None:
-            product_name = product.name
     return quote_replay_marker(
         kind=quoted.kind,
-        excerpt=excerpt,
-        product_name=product_name,
-        product_id=product_id,
-        from_earlier_conversation=from_earlier,
-        photo_recognition=photo_recognition,
+        excerpt=quoted.excerpt,
+        product_name=quoted.product_name,
+        product_id=quoted.product_id,
+        from_earlier_conversation=quoted.from_earlier_conversation,
+        photo_recognition=quoted.photo_recognition,
     )
 
 
