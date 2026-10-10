@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Literal, TypedDict
 
@@ -402,28 +403,29 @@ async def _invoke_agent_and_store(
     return reply
 
 
-async def traiter_message_entrant(
+@dataclass
+class StoredInboundText:
+    conversation: Conversation
+    message: Message | None
+    customer_item: dict[str, Any]
+    quote_marker: dict[str, str] | None
+    prior_items: list[Any]
+    escalated: bool
+
+
+async def enregistrer_texte_entrant(
     db: AsyncSession,
     merchant_id: uuid.UUID,
     customer_phone: str,
     message_text: str,
-    now: datetime | None = None,
     *,
     inbound_whatsapp_message_id: str | None = None,
     reply_to_message_id: str | None = None,
-) -> str | None:
-    """Process one inbound customer message and return the agent reply text.
+) -> StoredInboundText:
+    """Store one inbound customer text. Does not run the agent.
 
-    Returns None when the conversation is escalated: the message is stored
-    on that thread and no WhatsApp reply should be sent.
-
-    `now` overrides the clock used in the merchant-settings prompt block.
-    Tests and proof scripts may pass it; the public simulate route does not.
+    Escalated threads are stored-and-notified exactly as today.
     """
-    merchant = await db.get(Merchant, merchant_id)
-    if merchant is None:
-        raise ValueError(f"Merchant {merchant_id} was not found")
-
     phone = try_normalize_phone(customer_phone)
     escalated = await trouver_conversation_escaladee(db, merchant_id, phone)
     if escalated is not None:
@@ -436,10 +438,16 @@ async def traiter_message_entrant(
             inbound_whatsapp_message_id=inbound_whatsapp_message_id,
             reply_to_message_id=reply_to_message_id,
         )
-        return None
+        return StoredInboundText(
+            conversation=escalated,
+            message=None,
+            customer_item=item_customer_text(message_text),
+            quote_marker=None,
+            prior_items=[],
+            escalated=True,
+        )
 
     conversation = await _get_or_create_conversation(db, merchant_id, phone)
-
     history = await db.execute(
         select(Message)
         .where(Message.conversation_id == conversation.id)
@@ -453,7 +461,6 @@ async def traiter_message_entrant(
     current_quote = await resolve_quote_marker(
         db, conversation.id, reply_to_message_id
     )
-
     customer_item = {"role": "user", "content": message_text}
     row = Message(
         conversation_id=conversation.id,
@@ -473,16 +480,147 @@ async def traiter_message_entrant(
         reply_to_wamid=reply_to_message_id,
         commit=False,
     )
+    conversation.updated_at = datetime.now(timezone.utc)
     await db.commit()
+    return StoredInboundText(
+        conversation=conversation,
+        message=row,
+        customer_item=customer_item,
+        quote_marker=current_quote,
+        prior_items=prior_items,
+        escalated=False,
+    )
+
+
+async def traiter_message_entrant(
+    db: AsyncSession,
+    merchant_id: uuid.UUID,
+    customer_phone: str,
+    message_text: str,
+    now: datetime | None = None,
+    *,
+    inbound_whatsapp_message_id: str | None = None,
+    reply_to_message_id: str | None = None,
+) -> str | None:
+    """Process one inbound customer message and return the agent reply text.
+
+    Returns None when the conversation is escalated: the message is stored
+    on that thread and no WhatsApp reply should be sent.
+
+    `now` overrides the clock used in the merchant-settings prompt block.
+    Tests and proof scripts may pass it; the public simulate route does not.
+    Unbatched: one message, one turn. WhatsApp burst flushing uses
+    `traiter_rafale_entrante` instead.
+    """
+    merchant = await db.get(Merchant, merchant_id)
+    if merchant is None:
+        raise ValueError(f"Merchant {merchant_id} was not found")
+
+    stored = await enregistrer_texte_entrant(
+        db,
+        merchant_id,
+        customer_phone,
+        message_text,
+        inbound_whatsapp_message_id=inbound_whatsapp_message_id,
+        reply_to_message_id=reply_to_message_id,
+    )
+    if stored.escalated:
+        return None
 
     system_item = await _system_prompt_item(db, merchant_id, merchant.name, now)
-    quoted_prefix = [current_quote] if current_quote is not None else []
+    quoted_prefix = [stored.quote_marker] if stored.quote_marker is not None else []
+    return await _invoke_agent_and_store(
+        db,
+        merchant_id=merchant_id,
+        conversation=stored.conversation,
+        input_list=[
+            system_item,
+            *stored.prior_items,
+            *quoted_prefix,
+            stored.customer_item,
+        ],
+        persist_prefix=[],
+    )
+
+
+async def traiter_rafale_entrante(
+    db: AsyncSession,
+    merchant_id: uuid.UUID,
+    customer_phone: str,
+    pending: list[Any],
+    now: datetime | None = None,
+) -> str | None:
+    """One agent turn over an ordered burst of already-stored inbound items.
+
+    `pending` entries are `PendingEntry` (kind/message_row_id/wamid/
+    reply_to_wamid/developer_item). History is replayed from rows before
+    the first pending message. Stored rows are never mutated.
+    """
+    merchant = await db.get(Merchant, merchant_id)
+    if merchant is None:
+        raise ValueError(f"Merchant {merchant_id} was not found")
+    if not pending:
+        return None
+    phone = try_normalize_phone(customer_phone)
+    escalated = await trouver_conversation_escaladee(db, merchant_id, phone)
+    if escalated is not None:
+        return None
+
+    conversation = await _get_or_create_conversation(db, merchant_id, phone)
+    history = await db.execute(
+        select(Message)
+        .where(Message.conversation_id == conversation.id)
+        .order_by(Message.created_at, Message.id)
+    )
+    history_rows = list(history.scalars().all())
+    by_id = {row.id: row for row in history_rows}
+    first: Message | None = None
+    for entry in pending:
+        row = by_id.get(uuid.UUID(str(entry.message_row_id)))
+        if row is not None:
+            first = row
+            break
+    if first is None:
+        return None
+
+    prior_rows = [
+        row
+        for row in history_rows
+        if (row.created_at, row.id) < (first.created_at, first.id)
+    ]
+    quote_markers = await load_quote_replay_markers(
+        db, conversation.id, prior_rows
+    )
+    prior_items = prior_items_for_agent(prior_rows, quote_markers)
+    turn_items: list[Any] = []
+    persist_prefix: list[Any] = []
+    for entry in pending:
+        row = by_id.get(uuid.UUID(str(entry.message_row_id)))
+        if row is None:
+            continue
+        marker = await resolve_quote_marker(
+            db, conversation.id, getattr(entry, "reply_to_wamid", None)
+        )
+        if marker is not None:
+            turn_items.append(marker)
+        stored_items = [
+            item
+            for item in (row.items or [])
+            if _is_replayable_history_item(item)
+        ]
+        turn_items.extend(stored_items)
+        developer_item = getattr(entry, "developer_item", None)
+        if developer_item is not None:
+            turn_items.append(developer_item)
+            persist_prefix.append(developer_item)
+
+    system_item = await _system_prompt_item(db, merchant_id, merchant.name, now)
     return await _invoke_agent_and_store(
         db,
         merchant_id=merchant_id,
         conversation=conversation,
-        input_list=[system_item, *prior_items, *quoted_prefix, customer_item],
-        persist_prefix=[],
+        input_list=[system_item, *prior_items, *turn_items],
+        persist_prefix=persist_prefix,
     )
 
 

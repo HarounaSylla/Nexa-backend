@@ -705,7 +705,7 @@ def test_prompt_has_rule_15_and_photo_status_rule_14() -> None:
     assert text.index("17. Several articles") < text.index("18. A history marker")
     assert "Use analyser_photo_client only when rule 18" in text
     numbered = re.findall(r"(?m)^(\d+)\. ", text)
-    assert numbered == [str(n) for n in range(1, 20)]
+    assert numbered == [str(n) for n in range(1, 21)]
     assert "19. When a customer message is immediately preceded" in text
     assert "[Le client répond à" in text
     assert "takes precedence over" in text
@@ -728,6 +728,13 @@ def test_prompt_has_rule_15_and_photo_status_rule_14() -> None:
     assert "je pense qu'il s'agit de" in text
     assert "non reconnue" in text
     assert text.index("18. A history marker") < text.index("19. When a customer")
+    assert "20. When the latest customer messages are several consecutive" in text
+    assert "answer all of them in ONE reply" in text
+    assert "later one wins" in text
+    assert "Never answer the first and ignore the rest" in text
+    assert "never pick one silently" in text
+    assert "one short proposal per photo" in text
+    assert text.index("19. When a customer") < text.index("20. When the latest")
     tail = text[text.index("15. Customer photos") :]
     assert "Robe longue" not in tail
     assert "Sac à main" not in tail

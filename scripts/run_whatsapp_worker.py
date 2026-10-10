@@ -2,7 +2,14 @@
 
 Requires Redis (Compose publishes it on host port 6380; REDIS_URL in `.env`).
 
+Burst batching uses RQ 2.x delayed jobs (`Queue.enqueue_in`). The worker
+MUST be started with the scheduler so those flushes run:
+
     uv run python scripts/run_whatsapp_worker.py
+
+That is `SimpleWorker(...).work(with_scheduler=True)`. Without the
+scheduler, delayed flushes stay queued and a burst is never answered
+unless a later immediate enqueue happens.
 """
 
 from __future__ import annotations
@@ -21,7 +28,7 @@ def main() -> None:
         Queue("whatsapp", connection=connection),
         Queue("maintenance", connection=connection),
     ]
-    SimpleWorker(queues, connection=connection).work()
+    SimpleWorker(queues, connection=connection).work(with_scheduler=True)
 
 
 if __name__ == "__main__":

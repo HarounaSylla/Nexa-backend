@@ -516,10 +516,14 @@ def test_replay_helpers_accept_leading_developer_item() -> None:
 
 
 def test_shared_send_helper_is_used_by_text_and_image_jobs() -> None:
+    from app.workers.whatsapp import flush_conversation_async
+
+    flush_src = inspect.getsource(flush_conversation_async)
+    assert "envoyer_reponse_whatsapp_agent" in flush_src
     text_src = inspect.getsource(process_inbound_whatsapp_text_async)
     image_src = inspect.getsource(process_inbound_whatsapp_image_async)
-    assert "envoyer_reponse_whatsapp_agent" in text_src
-    assert "envoyer_reponse_whatsapp_agent" in image_src
+    assert "register_pending" in text_src
+    assert "register_pending" in image_src
     helper_src = inspect.getsource(envoyer_reponse_whatsapp_agent)
     assert "photo_delivery_plan" in helper_src
     assert "MAX_WHATSAPP_IMAGES" in helper_src
@@ -1143,7 +1147,7 @@ async def test_worker_text_path_still_uses_shared_helper(tmp_path: Path) -> None
         with (
             patch("app.workers.whatsapp.claim_inbound_message", return_value=True),
             patch(
-                "app.workers.whatsapp.traiter_message_entrant",
+                "app.workers.whatsapp.traiter_rafale_entrante",
                 new=AsyncMock(return_value="Bonjour"),
             ),
             patch("app.workers.whatsapp.envoyer_reponse_whatsapp_agent", helper),
@@ -1186,7 +1190,7 @@ async def test_worker_sends_fallback_once_when_agent_turn_fails(
                 _verification(),
             ),
             patch(
-                "app.proofs.service.traiter_photo_produit",
+                "app.workers.whatsapp.traiter_rafale_entrante",
                 new=AsyncMock(side_effect=RuntimeError("llm down")),
             ),
             patch("app.proofs.service.envoyer_message_commercant", AsyncMock()),

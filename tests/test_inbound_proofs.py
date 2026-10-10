@@ -935,7 +935,7 @@ async def test_worker_does_not_call_sales_agent(tmp_path: Path) -> None:
         await _mark_link_sent(order.id)
         with (
             patch("app.workers.whatsapp.claim_inbound_message", return_value=True),
-            patch("app.workers.whatsapp.traiter_message_entrant") as agent,
+            patch("app.workers.whatsapp.traiter_rafale_entrante") as agent,
             patch("app.core.config.settings.media_dir", str(tmp_path / "media")),
             patch(
                 "app.proofs.service.telecharger_media_whatsapp",

@@ -367,6 +367,7 @@ async def traiter_image_entrante(
     mime_type: str | None,
     caption: str | None,
     reply_to_message_id: str | None = None,
+    defer_agent: bool = False,
 ) -> InboundImage | None:
     existing = await _already_stored(db, whatsapp_message_id)
     if existing is not None:
@@ -592,9 +593,11 @@ async def traiter_image_entrante(
                 analysis=analysis,
                 result=recognition,
             )
-            image._agent_reply = await traiter_photo_produit(
-                db, merchant_id, customer_phone, developer_item
-            )
+            image._developer_item = developer_item
+            if not defer_agent:
+                image._agent_reply = await traiter_photo_produit(
+                    db, merchant_id, customer_phone, developer_item
+                )
         except Exception:
             logger.exception(
                 "Product-photo agent turn failed message_id=%s",

@@ -1,7 +1,8 @@
-"""RQ job: one inbound WhatsApp text → existing agent → Graph API reply.
+"""RQ jobs: ingest inbound WhatsApp, then a debounced per-conversation flush.
 
-Does not touch `messages` / `conversations` itself. `traiter_message_entrant`
-owns that, same as `POST /agent/simulate`.
+Ingest stores the customer row (and payment-proof ACK) immediately. The
+agent turn runs once per burst in `flush_conversation`. Simulate and
+`traiter_message_entrant` stay unbatched.
 """
 
 from __future__ import annotations
@@ -21,12 +22,27 @@ from app.agent.images import (
     product_names_from_items,
 )
 from app.agent.handover import KIND_SHOP_PHOTO, KIND_SHOP_TEXT
-from app.agent.orchestrator import traiter_message_entrant
+from app.agent.orchestrator import (
+    enregistrer_texte_entrant,
+    traiter_rafale_entrante,
+)
 from app.agent.service import (
     already_sent_product_ids,
     obtenir_dernier_message_agent,
     record_sent_product_image,
     record_whatsapp_message_ref,
+    trouver_conversation_escaladee,
+)
+from app.whatsapp.batch import (
+    KIND_PRODUCT_PHOTO,
+    KIND_TEXT,
+    PendingEntry,
+    batch_settings,
+    flush_delay_seconds,
+    get_backend,
+    now_seconds,
+    register_pending,
+    schedule_conversation_flush,
 )
 from app.core.db import AsyncSessionLocal, engine
 from app.core.phone import try_normalize_phone
@@ -252,6 +268,34 @@ def process_inbound_whatsapp_text(
             )
 
 
+async def _schedule_after_ingest(
+    merchant_id: uuid.UUID,
+    customer_phone: str,
+    phone_number_id: str,
+    state_token: str,
+    first_arrival: float,
+) -> None:
+    quiet, max_wait = batch_settings()
+    delay = flush_delay_seconds(
+        quiet=quiet,
+        max_wait=max_wait,
+        first_arrival=first_arrival,
+        now=now_seconds(),
+    )
+    if delay <= 0:
+        await flush_conversation_async(
+            str(merchant_id), customer_phone, state_token, phone_number_id
+        )
+        return
+    schedule_conversation_flush(
+        merchant_id,
+        customer_phone,
+        state_token,
+        phone_number_id,
+        delay=delay,
+    )
+
+
 async def process_inbound_whatsapp_text_async(
     message_id: str,
     customer_phone: str,
@@ -282,7 +326,7 @@ async def process_inbound_whatsapp_text_async(
                 return
             merchant_id = merchant.id
             try:
-                reply = await traiter_message_entrant(
+                stored = await enregistrer_texte_entrant(
                     db,
                     merchant_id,
                     customer_phone,
@@ -292,7 +336,7 @@ async def process_inbound_whatsapp_text_async(
                 )
             except Exception:
                 logger.exception(
-                    "traiter_message_entrant failed message_id=%s merchant=%s",
+                    "enregistrer_texte_entrant failed message_id=%s merchant=%s",
                     truncate_wamid(message_id),
                     merchant_id,
                 )
@@ -301,15 +345,26 @@ async def process_inbound_whatsapp_text_async(
                 )
                 return
 
-        if reply is None:
+        if stored.escalated or stored.message is None:
             return
 
-        await envoyer_reponse_whatsapp_agent(
-            customer_phone,
-            reply,
-            phone_number_id,
+        state = register_pending(
             merchant_id,
-            message_id,
+            customer_phone,
+            PendingEntry(
+                kind=KIND_TEXT,
+                message_row_id=str(stored.message.id),
+                wamid=message_id,
+                reply_to_wamid=reply_to_message_id,
+            ),
+            phone_number_id=phone_number_id,
+        )
+        await _schedule_after_ingest(
+            merchant_id,
+            customer_phone,
+            phone_number_id,
+            state.token,
+            state.first_arrival,
         )
     finally:
         await engine.dispose()
@@ -396,6 +451,7 @@ async def process_inbound_whatsapp_image_async(
                     mime_type or None,
                     caption or None,
                     reply_to_message_id=reply_to_message_id,
+                    defer_agent=True,
                 )
             except Exception:
                 logger.exception(
@@ -412,18 +468,139 @@ async def process_inbound_whatsapp_image_async(
         if not getattr(stored, "_send_agent", False):
             return
         if getattr(stored, "_agent_failed", False) or not getattr(
-            stored, "_agent_reply", None
+            stored, "_developer_item", None
         ):
             await envoyer_texte_whatsapp(
                 customer_phone, FALLBACK_REPLY, phone_number_id
             )
             return
-        await envoyer_reponse_whatsapp_agent(
-            customer_phone,
-            stored._agent_reply,
-            phone_number_id,
+        if stored.message_id is None:
+            return
+        state = register_pending(
             merchant_id,
-            whatsapp_message_id,
+            customer_phone,
+            PendingEntry(
+                kind=KIND_PRODUCT_PHOTO,
+                message_row_id=str(stored.message_id),
+                wamid=whatsapp_message_id,
+                reply_to_wamid=reply_to_message_id,
+                developer_item=stored._developer_item,
+            ),
+            phone_number_id=phone_number_id,
+        )
+        await _schedule_after_ingest(
+            merchant_id,
+            customer_phone,
+            phone_number_id,
+            state.token,
+            state.first_arrival,
         )
     finally:
+        await engine.dispose()
+
+
+def flush_conversation(
+    merchant_id: str,
+    customer_phone: str,
+    token: str,
+    phone_number_id: str,
+) -> None:
+    """RQ entry: one agent turn for the pending burst of a conversation."""
+    try:
+        asyncio.run(
+            flush_conversation_async(
+                merchant_id, customer_phone, token, phone_number_id
+            )
+        )
+    except Exception:
+        logger.exception(
+            "WhatsApp flush crashed merchant=%s",
+            merchant_id,
+        )
+        try:
+            asyncio.run(
+                envoyer_texte_whatsapp(
+                    customer_phone, FALLBACK_REPLY, phone_number_id
+                )
+            )
+        except Exception:
+            logger.exception(
+                "WhatsApp flush fallback send also failed merchant=%s",
+                merchant_id,
+            )
+
+
+async def flush_conversation_async(
+    merchant_id: str,
+    customer_phone: str,
+    token: str,
+    phone_number_id: str,
+) -> None:
+    backend = get_backend()
+    merchant_uuid = uuid.UUID(str(merchant_id))
+    phone = try_normalize_phone(customer_phone)
+    quiet, max_wait = batch_settings()
+    if not backend.acquire_lock(merchant_uuid, phone):
+        logger.info("Flush lock busy merchant=%s", merchant_uuid)
+        return
+    last_wamid = token
+    try:
+        peeked = backend.peek(merchant_uuid, phone)
+        if peeked is None or not peeked.entries:
+            return
+        now = now_seconds()
+        stale = peeked.token != token
+        if stale and (now - peeked.first_arrival) < max_wait:
+            logger.info("Stale flush skipped merchant=%s", merchant_uuid)
+            return
+        async with AsyncSessionLocal() as db:
+            if await trouver_conversation_escaladee(db, merchant_uuid, phone):
+                backend.clear(merchant_uuid, phone)
+                logger.info(
+                    "Flush dropped: conversation escalated merchant=%s",
+                    merchant_uuid,
+                )
+                return
+        state = backend.take(merchant_uuid, phone)
+        if state is None or not state.entries:
+            return
+        last_wamid = next(
+            (entry.wamid for entry in reversed(state.entries) if entry.wamid),
+            token,
+        )
+        send_id = state.phone_number_id or phone_number_id
+        try:
+            async with AsyncSessionLocal() as db:
+                reply = await traiter_rafale_entrante(
+                    db, merchant_uuid, phone, state.entries
+                )
+            if reply is None:
+                return
+            await envoyer_reponse_whatsapp_agent(
+                phone, reply, send_id, merchant_uuid, last_wamid or token
+            )
+        except Exception:
+            logger.exception(
+                "Flush turn/send failed merchant=%s count=%s",
+                merchant_uuid,
+                len(state.entries),
+            )
+            await envoyer_texte_whatsapp(phone, FALLBACK_REPLY, send_id)
+    finally:
+        backend.release_lock(merchant_uuid, phone)
+        leftover = backend.peek(merchant_uuid, phone)
+        if leftover is not None and leftover.entries:
+            delay = flush_delay_seconds(
+                quiet=quiet,
+                max_wait=max_wait,
+                first_arrival=leftover.first_arrival,
+                now=now_seconds(),
+            )
+            schedule_conversation_flush(
+                merchant_uuid,
+                phone,
+                leftover.token,
+                leftover.phone_number_id or phone_number_id,
+                delay=delay,
+            )
         await engine.dispose()

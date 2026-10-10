@@ -45,6 +45,7 @@ line, screenshot, or database check) in the Proof column.
 | P1 | Product photo on WhatsApp → catalogue match + agent confirm (step 2) | Passed | 2026-10-06. Alembic `0022` up/down/up. Vision three kinds; `product_photo` runs search + one agent turn; code-owned proposal; confirm before order. `pytest` **187 passed** (19 new). Live proof `Nexa/proofs/photo-recognition/run_photo_recognition.py` on Boutique Awa +221770099031…041, Meta stubbed, real vision/Voyage/agent. Cleanup leftover 0. Thresholds still too tight on a synthetic TikTok (rank-1 red dress 0.495 → `none`). §32. |
 | P1 | Product photo: embeddings shortlist + vision verify (step 2b) | Passed | 2026-10-07. Retrieval 9/9 positives in top 4 at ≤0.65. Verify decides; never `strong` without it. `pytest` **198 passed** (11 new). Compare A vs B + pipeline `Nexa/proofs/photo-recognition/run_verify_compare.py`. Cleanup leftover 0 on +221770099041…044. §33. |
 | P1 | Thread images expose visual-search match (`MessageImageOut`) | Passed | 2026-10-07. `GET /conversations/{id}/messages` adds `match_level`, `matched_product_id`, `matched_product_name`, `match_kind`. `pytest` **202 passed** (4 new). Proof `Nexa/proofs/thread_image_match.py` on Awa +221770099051. Cleanup leftover 0. §34. |
+| P1 | Burst batching: several rapid WhatsApp messages → one agent turn and one reply | Not started | Code + unit tests landed (`pytest` **266 passed**). Live phone checks in §37. Worker must be started with the scheduler. |
 
 ## RAG query / result pairs (2026-09-07, `voyage-4-lite`)
 
@@ -1286,6 +1287,24 @@ Screen-photo recognition (read-only, thresholds unchanged): classifier
 `product_photo`; level `strong` / `exact`; shortlist 1 `Montre femme or rose`
 distance 0.3307 verdict `same`. Cleanup leftover **0**; Awa watch stock
 restored to the pre-proof snapshot (8). No deviations.
+
+## 37. Burst batching
+
+Real WhatsApp, Boutique Awa, after restarting the worker with the
+scheduler (`uv run python scripts/run_whatsapp_worker.py`). Settings
+default to quiet 3.0 s and max wait 10.0 s.
+
+1. Send one text. Expect one reply after the quiet window (about 3 s),
+   not immediately.
+2. Send three short texts in a row (« Bonjour » / « vous avez des robes ? »
+   / « et des sacs ? »). Expect **one** global reply that answers both
+   questions; worker log shows one `flush_conversation` job.
+3. Send two product photos in a row. Expect one reply that names both
+   articles and asks which one(s).
+4. Keep typing for more than 10 s (a new message every 2 s). Expect a
+   reply by the max wait, not an endless delay.
+5. Confirm the worker was started with the scheduler: the log shows the
+   delayed flush job (`flush_conversation`), not only inbound ingest.
 
 
 

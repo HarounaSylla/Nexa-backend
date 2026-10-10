@@ -67,6 +67,12 @@ class Settings(BaseSettings):
     # log a startup warning and set this before the pilot.
     whatsapp_app_secret: str | None = None
     whatsapp_api_version: str = "v21.0"
+    # Burst batching: wait this long after the last ingest of a conversation
+    # before flushing. 0 disables batching (flush immediately).
+    whatsapp_batch_quiet_seconds: float = 3.0
+    # Hard cap from the first pending ingest finish. A customer who keeps
+    # typing still gets an answer.
+    whatsapp_batch_max_wait_seconds: float = 10.0
     tiktok_client_key: str = ""
     tiktok_client_secret: str = ""
     tiktok_business_access_token: str = ""

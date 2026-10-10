@@ -309,7 +309,7 @@ async def test_worker_calls_orchestrator_once_then_sends() -> None:
                 "app.workers.whatsapp.claim_inbound_message", return_value=True
             ),
             patch(
-                "app.workers.whatsapp.traiter_message_entrant",
+                "app.workers.whatsapp.traiter_rafale_entrante",
                 new_callable=AsyncMock,
                 return_value="Oui, nous avons des robes.",
             ) as agent,
@@ -329,7 +329,9 @@ async def test_worker_calls_orchestrator_once_then_sends() -> None:
             assert args is not None
             assert args.args[1] == merchant.id
             assert args.args[2] == "+221770001301"
-            assert args.args[3] == "vous avez des robes ?"
+            pending = args.args[3]
+            assert len(pending) == 1
+            assert pending[0].kind == "text"
             send.assert_awaited_once_with(
                 "+221770001301",
                 "Oui, nous avons des robes.",
@@ -344,7 +346,7 @@ async def test_worker_skips_duplicates_and_unknown_merchant() -> None:
     with (
         patch("app.workers.whatsapp.claim_inbound_message", return_value=False),
         patch(
-            "app.workers.whatsapp.traiter_message_entrant",
+            "app.workers.whatsapp.traiter_rafale_entrante",
             new_callable=AsyncMock,
         ) as agent,
         patch(
@@ -361,7 +363,7 @@ async def test_worker_skips_duplicates_and_unknown_merchant() -> None:
     with (
         patch("app.workers.whatsapp.claim_inbound_message", return_value=True),
         patch(
-            "app.workers.whatsapp.traiter_message_entrant",
+            "app.workers.whatsapp.traiter_rafale_entrante",
             new_callable=AsyncMock,
         ) as agent,
         patch(
@@ -385,7 +387,7 @@ async def test_worker_sends_fallback_when_agent_raises() -> None:
                 "app.workers.whatsapp.claim_inbound_message", return_value=True
             ),
             patch(
-                "app.workers.whatsapp.traiter_message_entrant",
+                "app.workers.whatsapp.traiter_rafale_entrante",
                 new_callable=AsyncMock,
                 side_effect=RuntimeError("openai down"),
             ) as agent,
@@ -419,7 +421,7 @@ async def test_worker_sends_nothing_when_orchestrator_returns_none() -> None:
                 "app.workers.whatsapp.claim_inbound_message", return_value=True
             ),
             patch(
-                "app.workers.whatsapp.traiter_message_entrant",
+                "app.workers.whatsapp.traiter_rafale_entrante",
                 new_callable=AsyncMock,
                 return_value=None,
             ) as agent,
@@ -624,7 +626,7 @@ async def test_worker_sends_text_then_caps_images_at_three(caplog: pytest.LogCap
                 "app.workers.whatsapp.claim_inbound_message", return_value=True
             ),
             patch(
-                "app.workers.whatsapp.traiter_message_entrant",
+                "app.workers.whatsapp.traiter_rafale_entrante",
                 new_callable=AsyncMock,
                 return_value="Voici quelques articles.",
             ),
@@ -736,7 +738,7 @@ async def test_worker_skips_already_sent_photos_but_still_sends_description(
                 "app.workers.whatsapp.claim_inbound_message", return_value=True
             ),
             patch(
-                "app.workers.whatsapp.traiter_message_entrant",
+                "app.workers.whatsapp.traiter_rafale_entrante",
                 new_callable=AsyncMock,
                 return_value="Encore les mêmes.",
             ),
@@ -826,7 +828,7 @@ async def test_worker_single_image_uses_caption_and_skips_resend(
                 "app.workers.whatsapp.claim_inbound_message", return_value=True
             ),
             patch(
-                "app.workers.whatsapp.traiter_message_entrant",
+                "app.workers.whatsapp.traiter_rafale_entrante",
                 new_callable=AsyncMock,
                 return_value="La robe rouge.",
             ),
@@ -866,7 +868,7 @@ async def test_worker_single_image_uses_caption_and_skips_resend(
                 "app.workers.whatsapp.claim_inbound_message", return_value=True
             ),
             patch(
-                "app.workers.whatsapp.traiter_message_entrant",
+                "app.workers.whatsapp.traiter_rafale_entrante",
                 new_callable=AsyncMock,
                 return_value="Toujours la robe rouge.",
             ),
@@ -961,7 +963,7 @@ def _worker_send_patches(reply: str):
     with (
         patch("app.workers.whatsapp.claim_inbound_message", return_value=True),
         patch(
-            "app.workers.whatsapp.traiter_message_entrant",
+            "app.workers.whatsapp.traiter_rafale_entrante",
             new_callable=AsyncMock,
             return_value=reply,
         ),

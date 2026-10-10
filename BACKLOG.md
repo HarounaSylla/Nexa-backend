@@ -137,7 +137,10 @@ and aggregates duplicate product ids.
 - At the vision/recognition cap (`max_image_analyses_per_phone_per_day`, default 10): today `not_analyzed` and **no customer reply**. Decide whether to tell the customer.
 - Several product photos in one image (classifier + search + verifier assume a single main subject)
 - Crop-to-product before embedding/verify (today the whole frame, including TikTok chrome, is embedded)
-- Customer sends several photos in a row (each is its own job/turn; no bundling)
+- [x] Phase 2 burst batching: rapid inbound texts/photos wait a quiet window then share ONE agent turn and ONE reply (`traiter_rafale_entrante`). Settings `WHATSAPP_BATCH_QUIET_SECONDS` (default 3.0; 0 disables) and `WHATSAPP_BATCH_MAX_WAIT_SECONDS` (default 10.0). Worker must run with the scheduler (`uv run python scripts/run_whatsapp_worker.py` → `SimpleWorker.work(with_scheduler=True)`). Payment-proof ACK stays immediate. `/agent/simulate` stays unbatched.
+- Run exactly one WhatsApp worker (ingest ordering with several workers)
+- Per-message quoting of replies to a burst (future, optional)
+- Voice notes and stickers handling
 - Several photos sent **during an escalation**: `analyser_photo_client` only looks at the latest inbound image of the conversation (last 24 h, file still present). Older unanalysed photos stay `not_analyzed`.
 - `analyser_photo_client` 24 h window: a photo older than 24 h is treated as `no_photo`. Decide whether to extend, or to tell the customer the photo expired.
 - Merchant notification wording for a visual-search `error` level (`product_photo_unrecognized` today uses the same copy as a catalogue miss). The on-demand tool never emits that notification; the live path still does.

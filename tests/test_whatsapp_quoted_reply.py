@@ -4,6 +4,7 @@ import json
 import uuid
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -544,10 +545,10 @@ async def test_worker_text_job_old_signature_omits_reply_to() -> None:
                 "app.workers.whatsapp.claim_inbound_message", return_value=True
             ),
             patch(
-                "app.workers.whatsapp.traiter_message_entrant",
+                "app.workers.whatsapp.enregistrer_texte_entrant",
                 new_callable=AsyncMock,
-                return_value=None,
-            ) as agent,
+                return_value=SimpleNamespace(escalated=True, message=None),
+            ) as store,
         ):
             await process_inbound_whatsapp_text_async(
                 "wamid.old-sig",
@@ -555,8 +556,8 @@ async def test_worker_text_job_old_signature_omits_reply_to() -> None:
                 "oui",
                 merchant.whatsapp_phone_number_id or "",
             )
-            assert agent.await_args is not None
-            assert agent.await_args.kwargs["reply_to_message_id"] is None
+            assert store.await_args is not None
+            assert store.await_args.kwargs["reply_to_message_id"] is None
     finally:
         await _cleanup(merchant.id)
 
@@ -577,10 +578,10 @@ async def test_worker_text_job_passes_reply_to_to_orchestrator() -> None:
                 "app.workers.whatsapp.claim_inbound_message", return_value=True
             ),
             patch(
-                "app.workers.whatsapp.traiter_message_entrant",
+                "app.workers.whatsapp.enregistrer_texte_entrant",
                 new_callable=AsyncMock,
-                return_value=None,
-            ) as agent,
+                return_value=SimpleNamespace(escalated=True, message=None),
+            ) as store,
         ):
             await process_inbound_whatsapp_text_async(
                 "wamid.new-sig",
@@ -589,10 +590,10 @@ async def test_worker_text_job_passes_reply_to_to_orchestrator() -> None:
                 merchant.whatsapp_phone_number_id or "",
                 "wamid.quoted",
             )
-            assert agent.await_args is not None
-            assert agent.await_args.kwargs["reply_to_message_id"] == "wamid.quoted"
+            assert store.await_args is not None
+            assert store.await_args.kwargs["reply_to_message_id"] == "wamid.quoted"
             assert (
-                agent.await_args.kwargs["inbound_whatsapp_message_id"]
+                store.await_args.kwargs["inbound_whatsapp_message_id"]
                 == "wamid.new-sig"
             )
     finally:
