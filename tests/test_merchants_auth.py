@@ -1,14 +1,22 @@
 import uuid
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import httpx
 import pytest
 from sqlalchemy import delete
 
-from app.auth.clerk import InvalidClerkTokenError
+from app.auth.clerk import InvalidClerkTokenError, verify_clerk_session_token
 from app.catalogue.models import Merchant
+from app.core.config import settings
 from app.core.db import AsyncSessionLocal
 from app.main import app
+
+
+def _decode_claims(*, azp: str, sub: str = "user_azp_ok"):
+    key = SimpleNamespace(key="unused")
+    client = SimpleNamespace(get_signing_key_from_jwt=lambda token: key)
+    return client, {"sub": sub, "azp": azp, "exp": 1}
 
 
 async def _client() -> httpx.AsyncClient:
